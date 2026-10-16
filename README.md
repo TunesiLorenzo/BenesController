@@ -58,6 +58,30 @@ show the measured maximum and minimum. Assign each extreme to **Straight** or
 switch state changes. Keep the optical input and other switch states fixed
 during a scan.
 
+The **Crosstalk** tab can scan several switches in sequence. Select switches
+with Ctrl or Shift, choose **Arduino** or **OSA**, enter the lower and upper
+voltage limits, step, and settling time, then start the scan. Arduino readings
+are burst averages. For OSA scans, each voltage produces a full spectrum and
+the peak dBm value is used for the voltage response. Each switch gets its own
+plot tab as measurements arrive, with interactive zoom, pan, and save controls;
+OSA plots also overlay its spectra, colored by voltage. The **Export CSV
+with comment** button saves the voltage response and every acquired OSA
+spectrum in one dataset, with a comment at the top of the file. After each
+switch is measured, its voltage-board output is set to 0 V, including when a
+measurement fails. Keep the optical input and unselected switches fixed during
+the scan.
+
+Before starting a crosstalk scan, choose the input and destination in **Route
+explorer**. You can also mark the output ports connected to the **Power Meter**
+and **OSA** with separate colored rings. These port selections and the current
+switch states are saved with each scan. Enter an optional scan comment in the
+**Crosstalk** tab. The application automatically creates
+`Results/Crosstalk_scan/Port{input}-Port{output}_{dateTime}/` and saves
+`base_setting.json`, a compact `base_path.png` diagram, one PNG plot per
+measured switch, and `crosstalk_dataset.csv` with the comment. The folder uses
+the selected destination, or the currently reached output when **Trace current**
+is selected. The summary records the actual reached output separately.
+
 - Click an **input** to highlight its actual path and current output.
 - Click an **output**, or choose a destination above the diagram, to enumerate every physical path between the selected ports. Select **Trace current** to return to the actual route.
 - The route list gives the required switch states: **=** means straight; **X** means cross. Switches absent from a route may have either state.

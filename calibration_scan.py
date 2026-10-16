@@ -13,6 +13,21 @@ class ScanPoint:
     power: float
 
 
+@dataclass(frozen=True)
+class SpectrumScanPoint(ScanPoint):
+    wavelength_nm: tuple[float, ...]
+    spectrum_dbm: tuple[float, ...]
+
+
+def spectrum_scan_point(voltage: float, spectrum) -> SpectrumScanPoint:
+    wavelength, power = spectrum
+    if not wavelength or len(wavelength) != len(power):
+        raise ValueError("The OSA returned an empty or mismatched spectrum")
+    if not all(math.isfinite(value) for value in wavelength) or not all(math.isfinite(value) for value in power):
+        raise ValueError("The OSA returned non-finite spectrum values")
+    return SpectrumScanPoint(voltage, max(power), tuple(wavelength), tuple(power))
+
+
 def scan_voltages(start: float, stop: float, step: float) -> list[float]:
     values = (float(start), float(stop), float(step))
     if not all(math.isfinite(value) for value in values):
@@ -58,3 +73,63 @@ def scan_switch(controller, power_meter, name: str, voltages: list[float], settl
     finally:
         controller.drive_voltage(name, previous)
     return points
+
+
+def scan_switches(controller, power_meter, names: list[str], voltages: list[float],
+                  settle_s: float, on_point=None) -> dict[str, list[ScanPoint]]:
+    """Scan selected switches with Arduino burst averages."""
+    if not power_meter.connected:
+        raise RuntimeError("Connect the Arduino power meter before scanning")
+
+    def read_point(voltage):
+        reading = power_meter.read_current_power()
+        if not math.isfinite(reading.value):
+            raise ValueError("The power meter returned a non-finite reading")
+        return ScanPoint(voltage, reading.value)
+
+    return scan_switches_with_reader(controller, names, voltages, settle_s, read_point, on_point)
+
+
+def scan_switches_with_reader(controller, names: list[str], voltages: list[float],
+                              settle_s: float, read_point, on_point=None):
+    """Scan switches in order with a measurement reader; reset all to 0 V."""
+    if not names:
+        raise ValueError("Select at least one switch")
+    if not controller.connected or controller.settings["dry_run"]:
+        raise RuntimeError("Connect the physical voltage board before scanning")
+    if not math.isfinite(settle_s) or settle_s < 0:
+        raise ValueError("Settling time must be a nonnegative number")
+    for name in names:
+        if name not in controller.settings["mapping"]:
+            raise ValueError(f"Unknown switch: {name}")
+        if controller.settings["mapping"][name] is None:
+            raise ValueError(f"Assign a pin to {name} before scanning")
+
+    results = {}
+    reset_names = set()
+    try:
+        for name in names:
+            points = []
+            try:
+                for voltage in voltages:
+                    controller.drive_voltage(name, voltage)
+                    time.sleep(settle_s)
+                    point = read_point(voltage)
+                    points.append(point)
+                    if on_point is not None:
+                        on_point(name, len(points), len(voltages), point)
+            finally:
+                controller.drive_voltage(name, 0.0)
+                reset_names.add(name)
+            results[name] = points
+    finally:
+        reset_error = None
+        for name in names:
+            if name not in reset_names:
+                try:
+                    controller.drive_voltage(name, 0.0)
+                except Exception as error:
+                    reset_error = error
+        if reset_error is not None:
+            raise RuntimeError(f"Could not reset all selected switches to 0 V: {reset_error}") from reset_error
+    return results

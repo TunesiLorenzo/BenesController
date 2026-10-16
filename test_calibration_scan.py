@@ -2,7 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from calibration_scan import scan_switch, scan_voltages
+from calibration_scan import (scan_switch, scan_switches, scan_switches_with_reader,
+                              scan_voltages, spectrum_scan_point)
 
 
 class FakeController:
@@ -56,6 +57,37 @@ class CalibrationScanTests(unittest.TestCase):
         with self.assertRaisesRegex(OSError, "meter disconnected"):
             scan_switch(controller, FakeMeter(fail=True), "S1.1", [0, 1], 0)
         self.assertEqual(controller.sent, [0, 1, 2.75])
+
+    @patch("calibration_scan.time.sleep")
+    def test_sequential_scans_reset_each_switch_to_zero(self, _sleep):
+        controller = FakeController()
+        controller.settings["mapping"]["S1.2"] = 4
+        points = scan_switches(controller, FakeMeter(), ["S1.1", "S1.2"], [-1, 1], 0)
+        self.assertEqual(controller.sent, [-1, 1, 0, -1, 1, 0])
+        self.assertEqual([p.power for p in points["S1.2"]], [3, 4])
+
+    @patch("calibration_scan.time.sleep")
+    def test_sequential_scan_resets_active_switch_on_failure(self, _sleep):
+        controller = FakeController()
+        controller.settings["mapping"]["S1.2"] = 4
+        with self.assertRaisesRegex(OSError, "meter disconnected"):
+            scan_switches(controller, FakeMeter(fail=True), ["S1.1", "S1.2"], [-1, 1], 0)
+        self.assertEqual(controller.sent, [-1, 1, 0, 0])
+
+    @patch("calibration_scan.time.sleep")
+    def test_osa_reader_keeps_full_spectrum_and_resets_switch(self, _sleep):
+        controller = FakeController()
+        results = scan_switches_with_reader(
+            controller, ["S1.1"], [-1, 1], 0,
+            lambda voltage: spectrum_scan_point(voltage, ([1550.0, 1551.0], [-40.0, -20.0])),
+        )
+        self.assertEqual([point.power for point in results["S1.1"]], [-20.0, -20.0])
+        self.assertEqual(results["S1.1"][0].spectrum_dbm, (-40.0, -20.0))
+        self.assertEqual(controller.sent, [-1, 1, 0])
+
+    def test_osa_reader_rejects_bad_spectrum(self):
+        with self.assertRaisesRegex(ValueError, "mismatched"):
+            spectrum_scan_point(0, ([1550.0], []))
 
 
 if __name__ == "__main__":

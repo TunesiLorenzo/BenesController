@@ -4,13 +4,15 @@ import random
 import threading
 import tkinter as tk
 from datetime import datetime
+from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from network import BenesNetwork
-from calibration_scan import scan_switch, scan_voltages
+from calibration_scan import scan_switch, scan_switches, scan_switches_with_reader, scan_voltages, spectrum_scan_point
+from crosstalk_results import create_result_folder, save_scan_artifacts, scan_context
 import osa
 from power_meter import ArduinoPowerMeter
-from spectrum_export import write_spectra
+from spectrum_export import write_crosstalk_csv, write_spectra
 from voltage_controller import BenesVoltageController
 
 
@@ -20,6 +22,8 @@ WIRE = "#52647c"
 TEXT = "#e6edf7"
 ACCENT = "#53dfbb"
 COLORS = ("#53dfbb", "#ffbe69", "#78b9ff", "#ed91cf", "#b6a0ff", "#fff080")
+POWER_METER_COLOR = "#ffbe69"
+OSA_COLOR = "#78b9ff"
 
 
 class BenesApp(tk.Tk):
@@ -33,11 +37,18 @@ class BenesApp(tk.Tk):
         self.controller = BenesVoltageController(tuple(self.network.switches))
         self.power_meter = ArduinoPowerMeter()
         self.scan_settings = {}
+        self.crosstalk_running = False
+        self.crosstalk_data = {}
+        self.crosstalk_data_source = None
+        self.crosstalk_data_unit = None
+        self.crosstalk_result_folder = None
         self.source = 0
         self.destination = None
         self.routes = []
         self.selected_route = 0
         self.all_paths = tk.BooleanVar(value=True)
+        self.power_meter_output_var = tk.StringVar(value="None")
+        self.osa_output_var = tk.StringVar(value="None")
         self.port_var = tk.StringVar(value=self.controller.settings["port"])
         self.baud_var = tk.StringVar(value=str(self.controller.settings["baud"]))
         self.dry_run_var = tk.BooleanVar(value=self.controller.settings["dry_run"])
@@ -80,8 +91,10 @@ class BenesApp(tk.Tk):
         self.notebook.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         self.route_tab = ttk.Frame(self.notebook)
         self.hardware_tab = ttk.Frame(self.notebook)
+        self.crosstalk_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.route_tab, text="Route explorer")
         self.notebook.add(self.hardware_tab, text="Boards & measurement")
+        self.notebook.add(self.crosstalk_tab, text="Crosstalk")
 
         controls = ttk.Frame(self.route_tab, padding=(24, 8))
         controls.pack(fill="x")
@@ -98,6 +111,18 @@ class BenesApp(tk.Tk):
         ttk.Checkbutton(controls, text="Overlay all possible paths", variable=self.all_paths, command=self.draw).pack(side="left", padx=15)
         ttk.Button(controls, text="Reset switches", command=self.reset).pack(side="right")
         ttk.Button(controls, text="Random switches", command=self.randomize).pack(side="right", padx=8)
+
+        detector_controls = ttk.Frame(self.route_tab, padding=(24, 0, 24, 8))
+        detector_controls.pack(fill="x")
+        ttk.Label(detector_controls, text="Power Meter output", foreground=POWER_METER_COLOR).pack(side="left")
+        ttk.Combobox(detector_controls, textvariable=self.power_meter_output_var,
+                     values=("None", "1", "2", "3", "4", "5", "6"), state="readonly", width=6).pack(side="left", padx=(7, 24))
+        ttk.Label(detector_controls, text="OSA output", foreground=OSA_COLOR).pack(side="left")
+        ttk.Combobox(detector_controls, textvariable=self.osa_output_var,
+                     values=("None", "1", "2", "3", "4", "5", "6"), state="readonly", width=6).pack(side="left", padx=(7, 18))
+        ttk.Label(detector_controls, text="Colored rings mark detector ports; the selected route output remains green.").pack(side="left")
+        self.power_meter_output_var.trace_add("write", lambda *_: self.draw())
+        self.osa_output_var.trace_add("write", lambda *_: self.draw())
 
         hardware = ttk.LabelFrame(self.hardware_tab, text="Voltage controller", padding=(18, 12))
         hardware.pack(fill="x", padx=24, pady=(16, 8))
@@ -145,13 +170,48 @@ class BenesApp(tk.Tk):
         self.read_power_button.grid(row=1, column=6, sticky="w", pady=(10, 0))
         ttk.Label(arduino, textvariable=self.power_reading_var, font=("Segoe UI", 10, "bold")).grid(row=2, column=0, columnspan=8, sticky="w", pady=(12, 0))
 
+        scan_controls = ttk.LabelFrame(self.crosstalk_tab, text="Sequential switch scan", padding=18)
+        scan_controls.pack(side="left", fill="y", padx=(24, 12), pady=18)
+        ttk.Label(scan_controls, text="Select switches (Ctrl or Shift for multiple)").grid(row=0, column=0, columnspan=2, sticky="w")
+        self.crosstalk_switches = tk.Listbox(scan_controls, selectmode="extended", exportselection=False,
+                                             height=len(self.network.switches), width=18, bg=PANEL, fg=TEXT,
+                                             selectbackground="#315b78", selectforeground="white")
+        for name in self.network.switches:
+            self.crosstalk_switches.insert("end", name)
+        self.crosstalk_switches.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 14))
+        self.crosstalk_source = tk.StringVar(value="Arduino")
+        ttk.Label(scan_controls, text="Measurement").grid(row=2, column=0, sticky="w", pady=3)
+        self.crosstalk_source_box = ttk.Combobox(scan_controls, textvariable=self.crosstalk_source,
+                                                 values=("Arduino", "OSA"), state="readonly", width=12)
+        self.crosstalk_source_box.grid(row=2, column=1, sticky="w", padx=(10, 0), pady=3)
+        self.crosstalk_fields = {}
+        for row, (label, default) in enumerate((("Lower limit [V]", "-10"), ("Upper limit [V]", "10"),
+                                                 ("Step [V]", "0.5"), ("Settle [ms]", "50")), start=3):
+            ttk.Label(scan_controls, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            value = tk.StringVar(value=default)
+            ttk.Entry(scan_controls, textvariable=value, width=12).grid(row=row, column=1, sticky="w", padx=(10, 0), pady=3)
+            self.crosstalk_fields[label] = value
+        self.crosstalk_comment_var = tk.StringVar()
+        ttk.Label(scan_controls, text="Scan comment").grid(row=7, column=0, sticky="w", pady=3)
+        ttk.Entry(scan_controls, textvariable=self.crosstalk_comment_var, width=19).grid(row=7, column=1, sticky="w", padx=(10, 0), pady=3)
+        ttk.Label(scan_controls, text="Arduino: burst average. OSA: full spectrum and peak dBm. Each point is taken after settling; switches return to 0 V.", wraplength=245).grid(row=8, column=0, columnspan=2, sticky="w", pady=(12, 8))
+        self.crosstalk_button = ttk.Button(scan_controls, text="Scan selected switches", command=self.start_crosstalk_scan)
+        self.crosstalk_button.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(4, 6))
+        self.crosstalk_export_button = ttk.Button(scan_controls, text="Export CSV with comment", command=self.export_crosstalk_csv, state="disabled")
+        self.crosstalk_export_button.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        self.crosstalk_status = tk.StringVar(value="Connect the voltage board and select a measurement source.")
+        ttk.Label(scan_controls, textvariable=self.crosstalk_status, wraplength=245).grid(row=11, column=0, columnspan=2, sticky="w")
+        self.crosstalk_plot_frame = ttk.Frame(self.crosstalk_tab, padding=(0, 18, 18, 18))
+        self.crosstalk_plot_frame.pack(side="left", fill="both", expand=True)
+        ttk.Label(self.crosstalk_plot_frame, text="Power versus voltage will appear here after a scan.").pack(anchor="center", expand=True)
+
         self.status = ttk.Label(self.route_tab, font=("Segoe UI", 12, "bold"), padding=(24, 8))
         self.status.pack(fill="x")
         self.canvas = tk.Canvas(self.route_tab, bg=BG, highlightthickness=0, height=355)
         self.canvas.pack(fill="both", expand=True, padx=12)
         self.canvas.bind("<Configure>", lambda event: self.draw())
 
-        ttk.Label(self.route_tab, text="0 V is the default cross state. Click a switch to toggle it. Type a voltage in a switch field and press Enter to send it.", padding=(24, 6)).pack(anchor="w")
+        ttk.Label(self.route_tab, text="Green switches have both bar and cross voltages saved. Click a switch to toggle it. Type a voltage and press Enter to send it.", padding=(24, 6)).pack(anchor="w")
         bottom = ttk.Frame(self.route_tab, padding=(24, 4, 24, 12))
         bottom.pack(fill="x")
         left = ttk.Frame(bottom)
@@ -187,6 +247,11 @@ class BenesApp(tk.Tk):
         if self.destination < 0:
             self.destination = None
         self.refresh()
+
+    @staticmethod
+    def detector_port(variable):
+        value = variable.get()
+        return None if value == "None" else int(value) - 1
 
     def click_input(self, row):
         self.input_box.current(row)
@@ -317,6 +382,222 @@ class BenesApp(tk.Tk):
             f"(ADC mean {reading.raw_mean:.2f}, {reading.sample_count} samples)"
         )
 
+    def start_crosstalk_scan(self):
+        names = [self.crosstalk_switches.get(index) for index in self.crosstalk_switches.curselection()]
+        source = self.crosstalk_source.get()
+        try:
+            if not names:
+                raise ValueError("Select at least one switch")
+            fields = self.crosstalk_fields
+            voltages = scan_voltages(*(float(fields[key].get()) for key in
+                                       ("Lower limit [V]", "Upper limit [V]", "Step [V]")))
+            settle_ms = float(fields["Settle [ms]"].get())
+            if not 0 <= settle_ms <= 10000:
+                raise ValueError("Settling time must be between 0 and 10000 ms")
+            if not self.controller.connected or self.controller.settings["dry_run"]:
+                raise RuntimeError("Connect the physical voltage board first")
+            if source == "Arduino":
+                if not self.power_meter.connected:
+                    raise RuntimeError("Connect the Arduino power meter first")
+                if self.read_power_button.instate(["disabled"]):
+                    raise RuntimeError("Wait for the current Arduino power reading to finish")
+            elif source == "OSA":
+                if self.osa_button.instate(["disabled"]):
+                    raise RuntimeError("Wait for the current OSA trace read to finish")
+                simulate_osa = self.osa_dry_run_var.get()
+                osa_host = self.osa_host_var.get().strip()
+                osa_port = int(self.osa_port_var.get()) if not simulate_osa else 0
+                if not simulate_osa and (not osa_host or not 1 <= osa_port <= 65535):
+                    raise ValueError("Enter a valid OSA host and port in Boards & measurement")
+            else:
+                raise ValueError("Choose Arduino or OSA as the measurement source")
+            for name in names:
+                if self.controller.settings["mapping"][name] is None:
+                    raise ValueError(f"Assign a voltage-board pin to {name} first")
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk  # noqa: F401
+            from matplotlib.figure import Figure  # noqa: F401
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            messagebox.showerror("Crosstalk scan unavailable", str(error), parent=self)
+            return
+
+        response_unit = "dBm" if source == "OSA" else self.power_meter.settings["unit"]
+        output_port = self.destination if self.destination is not None else self.network.trace(self.source).rows[-1]
+        context = scan_context(
+            self.network, self.source, output_port,
+            self.detector_port(self.power_meter_output_var), self.detector_port(self.osa_output_var),
+            self.controller, names, voltages, settle_ms, source, self.crosstalk_comment_var.get().strip(),
+        )
+        try:
+            result_folder = create_result_folder(Path(__file__).resolve().parent, context)
+            save_scan_artifacts(result_folder, context, {}, source, response_unit, self.network,
+                                status="in_progress")
+        except (OSError, RuntimeError, ValueError) as error:
+            messagebox.showerror("Crosstalk results unavailable", str(error), parent=self)
+            return
+
+        self.crosstalk_running = True
+        self.crosstalk_data = {}
+        self.crosstalk_data_source = None
+        self.crosstalk_data_unit = None
+        self.crosstalk_result_folder = result_folder
+        self.crosstalk_button.configure(state="disabled")
+        self.crosstalk_export_button.configure(state="disabled")
+        self.crosstalk_switches.configure(state="disabled")
+        self.crosstalk_source_box.configure(state="disabled")
+        self.notebook.tab(self.route_tab, state="disabled")
+        self.notebook.tab(self.hardware_tab, state="disabled")
+        self.crosstalk_status.set(f"Scanning {len(names)} switch(es), {len(voltages)} points each...")
+        self.prepare_crosstalk_plots(voltages)
+        data = {}
+
+        def on_point(name, index, total, point):
+            data.setdefault(name, []).append(point)
+            self.after(0, lambda: self.add_crosstalk_point(name, point, index, total, source, response_unit))
+
+        def worker():
+            try:
+                if source == "Arduino":
+                    scan_switches(self.controller, self.power_meter, names, voltages, settle_ms / 1000, on_point)
+                else:
+                    def read_osa_point(voltage):
+                        spectrum = osa.simulated_spectrum() if simulate_osa else osa.get_spectrum(osa_host, osa_port)
+                        return spectrum_scan_point(voltage, spectrum)
+
+                    scan_switches_with_reader(self.controller, names, voltages, settle_ms / 1000,
+                                               read_osa_point, on_point)
+            except Exception as error:
+                self.after(0, lambda message=str(error): self.finish_crosstalk_scan(names, data, source, response_unit, result_folder, context, message))
+            else:
+                self.after(0, lambda: self.finish_crosstalk_scan(names, data, source, response_unit, result_folder, context))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_crosstalk_scan(self, names, data, source, response_unit, folder, context, error=None):
+        for name in names:
+            if self.controller.applied_voltages.get(name) == 0.0:
+                self.voltage_vars[name].set("0.00")
+        if data:
+            self.crosstalk_data = data
+            self.crosstalk_data_source = source
+            self.crosstalk_data_unit = response_unit
+        else:
+            for child in self.crosstalk_plot_frame.winfo_children():
+                child.destroy()
+            ttk.Label(self.crosstalk_plot_frame, text="No measurements were collected.").pack(anchor="center", expand=True)
+        self.crosstalk_status.set("Saving figures, CSV, and base path...")
+
+        def save_results():
+            try:
+                final_context = {**context, "scan_error": error} if error else context
+                save_scan_artifacts(folder, final_context, data, source, response_unit, self.network,
+                                    status="failed" if error else "complete")
+            except Exception as save_error:
+                self.after(0, lambda message=str(save_error): self.complete_crosstalk_scan(data, folder, error, message))
+            else:
+                self.after(0, lambda: self.complete_crosstalk_scan(data, folder, error))
+
+        threading.Thread(target=save_results, daemon=True).start()
+
+    def complete_crosstalk_scan(self, data, folder, scan_error=None, save_error=None):
+        self.crosstalk_running = False
+        self.crosstalk_button.configure(state="normal")
+        self.crosstalk_switches.configure(state="normal")
+        self.crosstalk_source_box.configure(state="readonly")
+        self.notebook.tab(self.route_tab, state="normal")
+        self.notebook.tab(self.hardware_tab, state="normal")
+        if data:
+            self.crosstalk_export_button.configure(state="normal")
+        if scan_error:
+            self.crosstalk_status.set(f"Scan stopped: {scan_error}. Results: {folder}")
+            messagebox.showerror("Crosstalk scan failed", scan_error, parent=self)
+        elif save_error:
+            self.crosstalk_status.set(f"Scan finished, but automatic export failed: {save_error}")
+        else:
+            self.crosstalk_status.set(f"Scan complete. Results: {folder}")
+        if save_error:
+            messagebox.showerror("Crosstalk export failed", f"{save_error}\nFolder: {folder}", parent=self)
+
+    def prepare_crosstalk_plots(self, voltages):
+        for child in self.crosstalk_plot_frame.winfo_children():
+            child.destroy()
+        self.crosstalk_plots = ttk.Notebook(self.crosstalk_plot_frame)
+        self.crosstalk_plots.pack(fill="both", expand=True)
+        self.crosstalk_plot_items = {}
+        self.crosstalk_voltage_limits = (min(voltages), max(voltages))
+
+    def add_crosstalk_point(self, name, point, index, total, source, response_unit):
+        from matplotlib import colormaps
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+        from matplotlib.cm import ScalarMappable
+        from matplotlib.colors import Normalize
+        from matplotlib.figure import Figure
+
+        plot = self.crosstalk_plot_items.get(name)
+        if plot is None:
+            tab = ttk.Frame(self.crosstalk_plots)
+            self.crosstalk_plots.add(tab, text=name)
+            self.crosstalk_plots.select(tab)
+            figure = Figure(figsize=(8, 5))
+            response = figure.add_subplot(121 if source == "OSA" else 111)
+            line, = response.plot([], [], marker=".", linewidth=1.4, color=ACCENT)
+            response.set(xlabel="Voltage [V]",
+                         ylabel="Peak power [dBm]" if source == "OSA" else f"Power [{response_unit}]",
+                         title=f"{name}: power response")
+            response.grid(True)
+            spectra = None
+            norm = None
+            cmap = None
+            if source == "OSA":
+                spectra = figure.add_subplot(122)
+                spectra.set(xlabel="Wavelength [nm]", ylabel="Power [dBm]", title=f"{name}: spectra")
+                spectra.grid(True)
+                norm = Normalize(*self.crosstalk_voltage_limits)
+                cmap = colormaps["viridis"]
+                figure.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=spectra, label="Voltage [V]")
+            figure.tight_layout()
+            canvas = FigureCanvasTkAgg(figure, master=tab)
+            toolbar = NavigationToolbar2Tk(canvas, tab)
+            toolbar.update()
+            canvas.get_tk_widget().pack(fill="both", expand=True)
+            plot = {"canvas": canvas, "toolbar": toolbar, "response": response, "line": line,
+                    "spectra": spectra, "norm": norm, "cmap": cmap,
+                    "voltages": [], "powers": []}
+            self.crosstalk_plot_items[name] = plot
+        plot["voltages"].append(point.voltage)
+        plot["powers"].append(point.power)
+        plot["line"].set_data(plot["voltages"], plot["powers"])
+        plot["response"].relim()
+        plot["response"].autoscale_view()
+        if source == "OSA":
+            spectra = plot["spectra"]
+            spectra.plot(point.wavelength_nm, point.spectrum_dbm, linewidth=0.8,
+                         alpha=0.65, color=plot["cmap"](plot["norm"](point.voltage)))
+            spectra.relim()
+            spectra.autoscale_view()
+            spectra.set_title(f"{name}: {index} spectra")
+        plot["canvas"].draw_idle()
+        self.crosstalk_status.set(
+            f"{name}: {index}/{total} at {point.voltage:.2f} V, {point.power:.4g} {response_unit}{' peak' if source == 'OSA' else ''}")
+
+    def export_crosstalk_csv(self):
+        if not self.crosstalk_data:
+            return
+        path = filedialog.asksaveasfilename(parent=self, title="Export crosstalk dataset",
+                                            defaultextension=".csv", filetypes=[("CSV data", "*.csv")],
+                                            initialfile=f"crosstalk_{self.crosstalk_data_source.lower()}_{datetime.now():%Y%m%d_%H%M%S}.csv")
+        if not path:
+            return
+        comment = simpledialog.askstring("Dataset comment", "Comment for this CSV:", parent=self)
+        if comment is None:
+            return
+        try:
+            write_crosstalk_csv(path, self.crosstalk_data, self.crosstalk_data_source, comment,
+                                self.crosstalk_data_unit)
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Crosstalk export failed", str(error), parent=self)
+            return
+        messagebox.showinfo("Crosstalk export complete", f"Saved dataset to:\n{path}", parent=self)
+
     def apply_calibration(self):
         try:
             self.controller.apply_calibrated_states(self.network.states)
@@ -375,6 +656,7 @@ class BenesApp(tk.Tk):
                 return
             self.apply_calibration()
             dialog.destroy()
+            self.draw()
             self.update_hardware_status("Mapping saved")
             self.refresh(keep_selection=True)
 
@@ -440,6 +722,7 @@ class BenesApp(tk.Tk):
             straight_var.set(f"{straight:.2f}")
             cross_var.set(f"{cross:.2f}")
             self.show_calibrated_voltages()
+            self.draw()
             self.update_hardware_status(f"{name} calibrated")
             close_scan()
 
@@ -581,6 +864,9 @@ class BenesApp(tk.Tk):
         messagebox.showinfo("Export complete", f"Saved {len(traces)} trace(s) to:\n{path}", parent=parent)
 
     def close(self):
+        if self.crosstalk_running:
+            messagebox.showinfo("Scan in progress", "Wait for the crosstalk scan to finish and reset the switches to 0 V.", parent=self)
+            return
         self.controller.disconnect()
         self.power_meter.disconnect()
         self.destroy()
@@ -636,11 +922,13 @@ class BenesApp(tk.Tk):
             for index, (a, b) in enumerate(pairs):
                 name = f"S{stage + 1}.{index + 1}"
                 crossed = self.network.states[name]
+                calibration = self.controller.settings["calibration"][name]
+                calibrated = calibration["straight"] is not None and calibration["cross"] is not None
                 tag = f"switch:{name}"
-                c.create_rectangle(x - half, self.ys[a] - 12, x + half, self.ys[b] + 12, fill=PANEL, outline="#7790ad", width=1.5, tags=tag)
+                c.create_rectangle(x - half, self.ys[a] - 12, x + half, self.ys[b] + 12, fill=PANEL, outline=ACCENT if calibrated else "#7790ad", width=2.5 if calibrated else 1.5, tags=tag)
                 for start, end in ((a, b), (b, a)) if crossed else ((a, a), (b, b)):
                     c.create_line(x - half, self.ys[start], x + half, self.ys[end], fill="#a4bad4", width=2, tags=tag)
-                c.create_text(x, self.ys[a] - 23, text=f"{name} {'X' if crossed else '='}", fill=TEXT, font=("Segoe UI", 9), tags=tag)
+                c.create_text(x, self.ys[a] - 23, text=f"{name} {'X' if crossed else '='}", fill=ACCENT if calibrated else TEXT, font=("Segoe UI", 9), tags=tag)
                 pin = self.controller.settings["mapping"][name]
                 c.create_text(x, self.ys[b] + 17, text=f"Pin {pin}" if pin is not None else "Unassigned", fill="#9baec6", font=("Segoe UI", 8))
                 entry = ttk.Entry(c, textvariable=self.voltage_vars[name], width=6, justify="center")
@@ -668,6 +956,16 @@ class BenesApp(tk.Tk):
                 tag = f"{side}:{row}"
                 c.create_oval(x - 18, y - 18, x + 18, y + 18, fill=ACCENT if selected else PANEL, outline=ACCENT if selected else WIRE, width=2, tags=tag)
                 c.create_text(x, y, text=str(row + 1), fill=BG if selected else TEXT, font=("Segoe UI", 12, "bold"), tags=tag)
+                if side == "out":
+                    detector_colors = []
+                    if row == self.detector_port(self.power_meter_output_var):
+                        detector_colors.append(POWER_METER_COLOR)
+                    if row == self.detector_port(self.osa_output_var):
+                        detector_colors.append(OSA_COLOR)
+                    for index, color in enumerate(detector_colors):
+                        radius = 23 + index * 5
+                        c.create_oval(x - radius, y - radius, x + radius, y + radius,
+                                      outline=color, width=3, tags=tag)
                 c.tag_bind(tag, "<Button-1>", lambda event, r=row, fn=callback: fn(r))
         c.create_text(self.left_x, 16, text="INPUT", fill=TEXT, font=("Segoe UI", 10, "bold"))
         c.create_text(self.right_x, 16, text="OUTPUT", fill=TEXT, font=("Segoe UI", 10, "bold"))

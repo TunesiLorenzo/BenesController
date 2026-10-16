@@ -1,0 +1,15 @@
+215 INFO: PyInstaller: 6.22.3, contrib hooks: 2026.7
+216 INFO: Python: 3.13.13
+245 INFO: Platform: Windows-11-10.0.26200-SP0
+246 INFO: Python environment: C:\Users\lorenzo\AppData\Local\Programs\Python\Python313
+246 INFO: wrote C:\Users\lorenzo\Desktop\Python\BenesController\BenešGui.spec
+248 INFO: Removing temporary files and cleaning cache in C:\Users\lorenzo\AppData\Local\pyinstaller
+261 INFO: Module search paths (PYTHONPATH):
+['C:\\Users\\lorenzo\\Desktop\\Python\\BenesController',
+ 'C:\\Users\\lorenzo\\AppData\\Local\\Programs\\Python\\Python313\\python313.zip',
+ 'C:\\Users\\lorenzo\\AppData\\Local\\Programs\\Python\\Python313\\DLLs',
+ 'C:\\Users\\lorenzo\\AppData\\Local\\Programs\\Python\\Python313\\Lib',
+ 'C:\\Users\\lorenzo\\AppData\\Local\\Programs\\Python\\Python313',
+ 'C:\\Users\\lorenzo\\AppData\\Roaming\\Python\\Python313\\site-packages',
+ 'C:\\Users\\lorenzo\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\site-packages',
+ 'C:\\Users\\lorenzo\\Desktop\\Python\\BenesController']

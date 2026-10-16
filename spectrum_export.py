@@ -3,6 +3,8 @@
 import csv
 from datetime import datetime
 
+from calibration_scan import SpectrumScanPoint
+
 
 def write_spectra(path, traces, description=""):
     if not traces:
@@ -28,3 +30,24 @@ def write_spectra(path, traces, description=""):
         writer = csv.writer(file)
         writer.writerow(["wavelength_nm"] + [f"{name} [dBm]" for name, _, _ in traces])
         writer.writerows([wave] + [column.get(wave, "") for column in columns] for wave in axis)
+
+
+def write_crosstalk_csv(path, data, source, description="", response_unit=""):
+    """Export voltage responses and, for OSA scans, every acquired spectrum."""
+    if not data or not any(data.values()):
+        raise ValueError("There is no crosstalk dataset to export")
+    with open(path, "w", encoding="utf-8", newline="") as file:
+        file.write(f"# Crosstalk {source} scan exported {datetime.now().isoformat()}\n")
+        file.write(f"# Response power: {'OSA spectrum peak [dBm]' if source == 'OSA' else 'Arduino calibrated power'}\n")
+        file.write(f"# Response unit: {response_unit or ('dBm' if source == 'OSA' else 'unspecified')}\n")
+        for line in description.splitlines() or [""]:
+            file.write(f"# Description: {line}\n")
+        writer = csv.writer(file)
+        writer.writerow(["switch", "voltage_v", "response_power", "wavelength_nm", "spectrum_power_dbm"])
+        for name, points in data.items():
+            for point in points:
+                if isinstance(point, SpectrumScanPoint):
+                    writer.writerows((name, point.voltage, point.power, wavelength, power)
+                                     for wavelength, power in zip(point.wavelength_nm, point.spectrum_dbm))
+                else:
+                    writer.writerow((name, point.voltage, point.power, "", ""))
