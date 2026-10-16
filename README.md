@@ -7,6 +7,32 @@ python benes_gui.py
 ```
 
 No pip packages are required. Tkinter is included in the standard Windows Python installer.
+Physical board control additionally needs the `pyserial` dependency used by the
+sibling VoltageTuner project.
+
+## Board control and calibration
+
+The GUI uses the existing sibling `../VoltageTuner/board.py` implementation, so
+it speaks the same `DC <pin> <voltage>` serial protocol. In the **Voltage board**
+row, choose the serial port and baud rate (or **Dry run** to log commands without
+hardware), then click **Connect**. The saved voltage for every mapped MZI is sent
+on connection.
+
+Each switch in the diagram shows its assigned physical pin and a voltage field.
+Type a voltage and press Enter to store it and, when connected, send it to that
+pin. **MZI ↔ pin mapping / calibration…** maps the 12 MZIs to unique pins 0–15
+and optionally records straight/cross calibration voltages. Once those values are
+recorded, toggling a switch or applying a route sends the voltage for its logical
+state. Mapping, connection settings, voltages, and calibration points are kept in
+`benes_voltage_config.json` beside the application. It is created on first change.
+
+## OSA traces
+
+The **OSA** row reads trace 1 from a VIAVI OSA 500RS. Choose **Overlay** or **New
+window**, name each trace, and use **Export displayed datasets** in a plot window
+to write every visible trace to CSV. The export dialog asks for an optional
+description, which is included as `# Description:` comment line(s) at the top of
+the file. Plotting needs matplotlib (`python -m pip install matplotlib`).
 
 - Click an **input** to highlight its actual path and current output.
 - Click an **output**, or choose a destination above the diagram, to enumerate every physical path between the selected ports. Select **Trace current** to return to the actual route.
