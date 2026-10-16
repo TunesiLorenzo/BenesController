@@ -5,6 +5,10 @@ from network import BenesNetwork
 
 
 class NetworkTests(unittest.TestCase):
+    def test_unbiased_switches_default_to_cross(self):
+        network = BenesNetwork()
+        self.assertTrue(all(network.states.values()))
+
     def test_three_port_subnetworks_independently_route_all_six_permutations(self):
         network = BenesNetwork()
         for offset in (0, 3):

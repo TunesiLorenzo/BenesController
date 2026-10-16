@@ -39,7 +39,8 @@ class BenesNetwork:
                 self.switches[name] = (stage, pair)
                 for row in pair:
                     self.at[stage, row] = name
-        self.states = dict.fromkeys(self.switches, False)
+        # The fabricated MZIs are cross at their unbiased 0 V state.
+        self.states = dict.fromkeys(self.switches, True)
 
     def switch_output(self, stage, row, crossed):
         """Row leaving a switch, before the wiring to the next stage."""

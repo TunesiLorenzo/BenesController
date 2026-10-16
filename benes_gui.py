@@ -8,6 +8,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from network import BenesNetwork
 import osa
+from power_meter import ArduinoPowerMeter
 from spectrum_export import write_spectra
 from voltage_controller import BenesVoltageController
 
@@ -29,6 +30,7 @@ class BenesApp(tk.Tk):
         self.configure(bg=BG)
         self.network = BenesNetwork()
         self.controller = BenesVoltageController(tuple(self.network.switches))
+        self.power_meter = ArduinoPowerMeter()
         self.source = 0
         self.destination = None
         self.routes = []
@@ -48,19 +50,38 @@ class BenesApp(tk.Tk):
         self.osa_plot_mode = tk.StringVar(value="Overlay")
         self.osa_axes = None
         self.trace_count = 0
+        self.arduino_port_var = tk.StringVar(value=self.power_meter.settings["port"])
+        self.arduino_baud_var = tk.StringVar(value=str(self.power_meter.settings["baud"]))
+        self.arduino_duration_var = tk.StringVar(value=str(self.power_meter.settings["duration"]))
+        self.arduino_scale_var = tk.StringVar(value=str(self.power_meter.settings["scale"]))
+        self.arduino_offset_var = tk.StringVar(value=str(self.power_meter.settings["offset"]))
+        self.arduino_unit_var = tk.StringVar(value=self.power_meter.settings["unit"])
+        self.power_reading_var = tk.StringVar(value="No Arduino reading yet")
         style = ttk.Style(self)
         style.theme_use("clam")
         style.configure("TFrame", background=BG)
         style.configure("TLabel", background=BG, foreground=TEXT, font=("Segoe UI", 10))
         style.configure("TButton", font=("Segoe UI", 10), padding=7)
         style.configure("TCheckbutton", background=BG, foreground=TEXT)
+        style.configure("TEntry", fieldbackground=PANEL, foreground=TEXT, insertcolor=TEXT, bordercolor="#7790ad")
+        style.configure("TCombobox", fieldbackground=PANEL, foreground=TEXT, arrowcolor=TEXT, bordercolor="#7790ad")
+        style.map("TCombobox", fieldbackground=[("readonly", PANEL)], foreground=[("readonly", TEXT)])
+        style.configure("TLabelframe", background=BG, foreground=TEXT)
+        style.configure("TLabelframe.Label", background=BG, foreground=TEXT, font=("Segoe UI", 10, "bold"))
 
         header = ttk.Frame(self, padding=(24, 18, 24, 8))
         header.pack(fill="x")
         ttk.Label(header, text="Beneš route explorer", font=("Segoe UI", 23, "bold")).pack(anchor="w")
         ttk.Label(header, text="6 inputs · 6 outputs · 5 stages · 12 switches · generalized topology with bypass wires").pack(anchor="w", pady=(5, 0))
 
-        controls = ttk.Frame(self, padding=(24, 8))
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.route_tab = ttk.Frame(self.notebook)
+        self.hardware_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.route_tab, text="Route explorer")
+        self.notebook.add(self.hardware_tab, text="Boards & measurement")
+
+        controls = ttk.Frame(self.route_tab, padding=(24, 8))
         controls.pack(fill="x")
         ttk.Label(controls, text="Input").pack(side="left")
         self.input_box = ttk.Combobox(controls, values=list(range(1, 7)), width=5, state="readonly")
@@ -76,8 +97,8 @@ class BenesApp(tk.Tk):
         ttk.Button(controls, text="Reset switches", command=self.reset).pack(side="right")
         ttk.Button(controls, text="Random switches", command=self.randomize).pack(side="right", padx=8)
 
-        hardware = ttk.Frame(self, padding=(24, 0, 24, 8))
-        hardware.pack(fill="x")
+        hardware = ttk.LabelFrame(self.hardware_tab, text="Voltage controller", padding=(18, 12))
+        hardware.pack(fill="x", padx=24, pady=(16, 8))
         ttk.Label(hardware, text="Voltage board", font=("Segoe UI", 10, "bold")).pack(side="left")
         ttk.Label(hardware, text="Port").pack(side="left", padx=(14, 4))
         ttk.Entry(hardware, textvariable=self.port_var, width=9).pack(side="left")
@@ -90,8 +111,8 @@ class BenesApp(tk.Tk):
         self.hardware_status = ttk.Label(hardware)
         self.hardware_status.pack(side="right")
 
-        osa_controls = ttk.Frame(self, padding=(24, 0, 24, 8))
-        osa_controls.pack(fill="x")
+        osa_controls = ttk.LabelFrame(self.hardware_tab, text="OSA spectrum analyser", padding=(18, 12))
+        osa_controls.pack(fill="x", padx=24, pady=(0, 8))
         ttk.Label(osa_controls, text="OSA", font=("Segoe UI", 10, "bold")).pack(side="left")
         ttk.Label(osa_controls, text="Host").pack(side="left", padx=(28, 4))
         ttk.Entry(osa_controls, textvariable=self.osa_host_var, width=16).pack(side="left")
@@ -102,14 +123,34 @@ class BenesApp(tk.Tk):
         self.osa_button = ttk.Button(osa_controls, text="Read trace", command=self.read_spectrum)
         self.osa_button.pack(side="left", padx=8)
 
-        self.status = ttk.Label(self, font=("Segoe UI", 12, "bold"), padding=(24, 8))
+        arduino = ttk.LabelFrame(self.hardware_tab, text="Arduino power meter", padding=(18, 12))
+        arduino.pack(fill="x", padx=24, pady=(0, 8))
+        ttk.Label(arduino, text="Port").grid(row=0, column=0, sticky="w")
+        ttk.Entry(arduino, textvariable=self.arduino_port_var, width=10).grid(row=0, column=1, sticky="w", padx=(4, 12))
+        ttk.Label(arduino, text="Baud").grid(row=0, column=2, sticky="w")
+        ttk.Entry(arduino, textvariable=self.arduino_baud_var, width=9).grid(row=0, column=3, sticky="w", padx=(4, 12))
+        ttk.Label(arduino, text="Burst [s]").grid(row=0, column=4, sticky="w")
+        ttk.Entry(arduino, textvariable=self.arduino_duration_var, width=7).grid(row=0, column=5, sticky="w", padx=(4, 12))
+        ttk.Button(arduino, text="Connect", command=self.connect_power_meter).grid(row=0, column=6, sticky="w")
+        ttk.Button(arduino, text="Disconnect", command=self.disconnect_power_meter).grid(row=0, column=7, sticky="w", padx=6)
+        ttk.Label(arduino, text="Power = ADC ×").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(arduino, textvariable=self.arduino_scale_var, width=8).grid(row=1, column=1, sticky="w", padx=(4, 4), pady=(10, 0))
+        ttk.Label(arduino, text="+").grid(row=1, column=2, sticky="w", pady=(10, 0))
+        ttk.Entry(arduino, textvariable=self.arduino_offset_var, width=8).grid(row=1, column=3, sticky="w", padx=(4, 12), pady=(10, 0))
+        ttk.Label(arduino, text="Unit").grid(row=1, column=4, sticky="w", pady=(10, 0))
+        ttk.Entry(arduino, textvariable=self.arduino_unit_var, width=14).grid(row=1, column=5, sticky="w", padx=(4, 12), pady=(10, 0))
+        self.read_power_button = ttk.Button(arduino, text="Read current power", command=self.read_current_power)
+        self.read_power_button.grid(row=1, column=6, sticky="w", pady=(10, 0))
+        ttk.Label(arduino, textvariable=self.power_reading_var, font=("Segoe UI", 10, "bold")).grid(row=2, column=0, columnspan=8, sticky="w", pady=(12, 0))
+
+        self.status = ttk.Label(self.route_tab, font=("Segoe UI", 12, "bold"), padding=(24, 8))
         self.status.pack(fill="x")
-        self.canvas = tk.Canvas(self, bg=BG, highlightthickness=0, height=355)
+        self.canvas = tk.Canvas(self.route_tab, bg=BG, highlightthickness=0, height=355)
         self.canvas.pack(fill="both", expand=True, padx=12)
         self.canvas.bind("<Configure>", lambda event: self.draw())
 
-        ttk.Label(self, text="Click an input to trace it. Click an output to explore destinations. Click a switch to toggle straight / cross. Type a voltage in a switch field and press Enter to send it.", padding=(24, 6)).pack(anchor="w")
-        bottom = ttk.Frame(self, padding=(24, 4, 24, 12))
+        ttk.Label(self.route_tab, text="0 V is the default cross state. Click a switch to toggle it. Type a voltage in a switch field and press Enter to send it.", padding=(24, 6)).pack(anchor="w")
+        bottom = ttk.Frame(self.route_tab, padding=(24, 4, 24, 12))
         bottom.pack(fill="x")
         left = ttk.Frame(bottom)
         left.pack(side="left", fill="both", expand=True)
@@ -130,7 +171,7 @@ class BenesApp(tk.Tk):
         buttons.pack(anchor="w")
         ttk.Button(buttons, text="Route permutation", command=self.route_permutation).pack(side="left")
         ttk.Button(buttons, text="Shuffle", command=self.shuffle).pack(side="left", padx=6)
-        self.mapping_label = ttk.Label(self, padding=(24, 6, 24, 14))
+        self.mapping_label = ttk.Label(self.route_tab, padding=(24, 6, 24, 14))
         self.mapping_label.pack(fill="x")
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.refresh()
@@ -159,7 +200,7 @@ class BenesApp(tk.Tk):
         self.refresh(keep_selection=True)
 
     def reset(self):
-        self.network.states = dict.fromkeys(self.network.switches, False)
+        self.network.states = dict.fromkeys(self.network.switches, True)
         self.apply_calibration()
         self.refresh(keep_selection=True)
 
@@ -221,6 +262,48 @@ class BenesApp(tk.Tk):
     def disconnect_board(self):
         self.controller.disconnect()
         self.update_hardware_status("Disconnected")
+
+    def connect_power_meter(self):
+        try:
+            if self.power_meter.connected:
+                raise RuntimeError("Disconnect the Arduino power meter before changing its connection settings")
+            self.power_meter.configure(
+                self.arduino_port_var.get(), self.arduino_baud_var.get(), self.arduino_duration_var.get(),
+                self.arduino_scale_var.get(), self.arduino_offset_var.get(), self.arduino_unit_var.get(),
+            )
+            self.power_meter.connect()
+        except (OSError, RuntimeError, ValueError) as error:
+            messagebox.showerror("Arduino connection failed", str(error), parent=self)
+            return
+        self.power_reading_var.set(f"Arduino connected on {self.power_meter.settings['port']}")
+
+    def disconnect_power_meter(self):
+        self.power_meter.disconnect()
+        self.power_reading_var.set("Arduino disconnected")
+
+    def read_current_power(self):
+        self.read_power_button.configure(state="disabled")
+
+        def acquire():
+            try:
+                reading = self.power_meter.read_current_power()
+            except Exception as error:
+                self.after(0, lambda: self.power_read_failed(str(error)))
+            else:
+                self.after(0, lambda: self.show_current_power(reading))
+
+        threading.Thread(target=acquire, daemon=True).start()
+
+    def power_read_failed(self, error):
+        self.read_power_button.configure(state="normal")
+        messagebox.showerror("Arduino power read failed", error, parent=self)
+
+    def show_current_power(self, reading):
+        self.read_power_button.configure(state="normal")
+        self.power_reading_var.set(
+            f"Current power: {reading.value:.4g} {reading.unit} "
+            f"(ADC mean {reading.raw_mean:.2f}, {reading.sample_count} samples)"
+        )
 
     def apply_calibration(self):
         try:
@@ -358,6 +441,7 @@ class BenesApp(tk.Tk):
 
     def close(self):
         self.controller.disconnect()
+        self.power_meter.disconnect()
         self.destroy()
 
     def refresh(self, keep_selection=False):

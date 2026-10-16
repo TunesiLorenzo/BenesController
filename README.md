@@ -25,6 +25,10 @@ and optionally records straight/cross calibration voltages. Once those values ar
 recorded, toggling a switch or applying a route sends the voltage for its logical
 state. Mapping, connection settings, voltages, and calibration points are kept in
 `benes_voltage_config.json` beside the application. It is created on first change.
+The route diagram starts with every MZI crossed, matching the 0 V physical state.
+
+Board connection and measurement controls live under the **Boards & measurement**
+tab at the top of the window.
 
 ## OSA traces
 
@@ -33,6 +37,16 @@ window**, name each trace, and use **Export displayed datasets** in a plot windo
 to write every visible trace to CSV. The export dialog asks for an optional
 description, which is included as `# Description:` comment line(s) at the top of
 the file. Plotting needs matplotlib (`python -m pip install matplotlib`).
+
+## Arduino power meter
+
+The same tab can instead use the Arduino detector stream from the sibling
+`../ThorlabsControl/ArduinoSampler.py`. Enter its port, baud rate, and sampling
+burst duration, then connect and choose **Read current power**. The reader
+averages the raw ADC samples and displays `ADC × scale + offset`; set the scale,
+offset, and unit to match the power-meter calibration. The latest scalar result
+is retained by the application as the input for the upcoming MZI calibration
+workflow. Arduino settings are stored in `benes_power_meter_config.json`.
 
 - Click an **input** to highlight its actual path and current output.
 - Click an **output**, or choose a destination above the diagram, to enumerate every physical path between the selected ports. Select **Trace current** to return to the actual route.
