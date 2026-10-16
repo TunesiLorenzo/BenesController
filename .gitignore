@@ -1,0 +1,24 @@
+# Scan output and packaged builds
+/Results/
+/dist/
+/build/
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+
+# Local runtime settings and logs
+/benes_power_meter_config.json
+/benes_voltage_config.json
+*.log

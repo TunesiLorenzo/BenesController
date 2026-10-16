@@ -1,8 +1,0 @@
-{
-  "baud": 230400,
-  "duration": 0.1,
-  "offset": 0.0,
-  "port": "COM3",
-  "scale": 1.0,
-  "unit": "ADC counts"
-}
