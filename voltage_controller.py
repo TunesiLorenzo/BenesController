@@ -34,6 +34,7 @@ class BenesVoltageController:
         self.config_path = config_path or Path(__file__).with_name("benes_voltage_config.json")
         self._board_factory = board_factory
         self.board = None
+        self.applied_voltages: dict[str, float] = {}
         self.load_error = ""
         self.settings = self._load()
 
@@ -125,6 +126,13 @@ class BenesVoltageController:
         self._send(name, voltage)
         return voltage
 
+    def drive_voltage(self, name: str, value: object) -> float:
+        """Send a temporary voltage without changing the saved manual setting."""
+        self._require_switch(name)
+        voltage = validate_voltage(value)
+        self._send(name, voltage)
+        return voltage
+
     def set_calibration(self, name: str, straight: object, cross: object) -> None:
         self._require_switch(name)
         self.settings["calibration"][name] = {
@@ -152,14 +160,21 @@ class BenesVoltageController:
         if self.board is not None:
             self.board.close()
             self.board = None
+            self.applied_voltages.clear()
 
     def apply_calibrated_states(self, states: dict[str, bool]) -> None:
         """Send calibrated cross/straight voltages where they have been defined."""
         for name in self.switch_names:
-            state = "cross" if states[name] else "straight"
-            voltage = self.settings["calibration"][name][state]
-            if voltage is not None:
-                self._send(name, voltage)
+            self.apply_calibrated_state(name, states[name])
+
+    def apply_calibrated_state(self, name: str, crossed: bool) -> float | None:
+        """Send one switch's calibrated voltage, if that state has one."""
+        self._require_switch(name)
+        state = "cross" if crossed else "straight"
+        voltage = self.settings["calibration"][name][state]
+        if voltage is not None:
+            self._send(name, voltage)
+        return voltage
 
     def send_configured_voltages(self) -> None:
         """Synchronize every currently mapped MZI to its saved manual voltage."""
@@ -172,6 +187,7 @@ class BenesVoltageController:
         pin = self.settings["mapping"][name]
         if pin is not None:
             self.board.send(pin, voltage)
+            self.applied_voltages[name] = voltage
 
     def _require_switch(self, name: str) -> None:
         if name not in self.switch_names:

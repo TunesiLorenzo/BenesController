@@ -45,8 +45,18 @@ The same tab can instead use the Arduino detector stream from the sibling
 burst duration, then connect and choose **Read current power**. The reader
 averages the raw ADC samples and displays `ADC × scale + offset`; set the scale,
 offset, and unit to match the power-meter calibration. The latest scalar result
-is retained by the application as the input for the upcoming MZI calibration
-workflow. Arduino settings are stored in `benes_power_meter_config.json`.
+is retained by the application for calibration. Arduino settings are stored in
+`benes_power_meter_config.json`.
+
+To calibrate a switch from measured power, connect both the voltage board and
+Arduino power meter, then open **MZI / pin mapping / calibration** and click
+**Scan...** beside the switch. Save any new pin mapping before scanning. Choose
+the lower voltage limit, upper voltage limit, step, and settling time; the scan measures one Arduino burst
+at each voltage and restores the previous voltage when it finishes. The results
+show the measured maximum and minimum. Assign each extreme to **Straight** or
+**Cross**, then click **Save calibration**. The saved voltages are used when the
+switch state changes. Keep the optical input and other switch states fixed
+during a scan.
 
 - Click an **input** to highlight its actual path and current output.
 - Click an **output**, or choose a destination above the diagram, to enumerate every physical path between the selected ports. Select **Trace current** to return to the actual route.

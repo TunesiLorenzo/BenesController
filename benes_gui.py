@@ -7,6 +7,7 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from network import BenesNetwork
+from calibration_scan import scan_switch, scan_voltages
 import osa
 from power_meter import ArduinoPowerMeter
 from spectrum_export import write_spectra
@@ -31,6 +32,7 @@ class BenesApp(tk.Tk):
         self.network = BenesNetwork()
         self.controller = BenesVoltageController(tuple(self.network.switches))
         self.power_meter = ArduinoPowerMeter()
+        self.scan_settings = {}
         self.source = 0
         self.destination = None
         self.routes = []
@@ -195,9 +197,18 @@ class BenesApp(tk.Tk):
         self.choose_output()
 
     def toggle(self, name):
-        self.network.states[name] = not self.network.states[name]
-        self.apply_calibration()
+        crossed = not self.network.states[name]
+        try:
+            voltage = self.controller.apply_calibrated_state(name, crossed)
+        except (OSError, RuntimeError, ValueError) as error:
+            messagebox.showerror("Calibration command failed", str(error), parent=self)
+            return
+        self.network.states[name] = crossed
+        if voltage is not None:
+            self.voltage_vars[name].set(f"{voltage:.2f}")
         self.refresh(keep_selection=True)
+        if voltage is not None:
+            self.update_hardware_status(f"{name} {'cross' if crossed else 'bar'}: {voltage:.2f} V")
 
     def reset(self):
         self.network.states = dict.fromkeys(self.network.switches, True)
@@ -257,6 +268,7 @@ class BenesApp(tk.Tk):
             messagebox.showerror("Board connection failed", str(error), parent=self)
             return
         mode = "dry run" if self.controller.settings["dry_run"] else self.controller.settings["port"]
+        self.show_calibrated_voltages()
         self.update_hardware_status(f"Connected: {mode}")
 
     def disconnect_board(self):
@@ -310,6 +322,15 @@ class BenesApp(tk.Tk):
             self.controller.apply_calibrated_states(self.network.states)
         except (OSError, RuntimeError, ValueError) as error:
             messagebox.showerror("Calibration command failed", str(error), parent=self)
+            return
+        self.show_calibrated_voltages()
+
+    def show_calibrated_voltages(self):
+        for name in self.network.switches:
+            state = "cross" if self.network.states[name] else "straight"
+            voltage = self.controller.settings["calibration"][name][state]
+            if voltage is not None:
+                self.voltage_vars[name].set(f"{voltage:.2f}")
 
     def update_hardware_status(self, detail=""):
         prefix = "Board connected" if self.controller.connected else "Board disconnected"
@@ -326,8 +347,8 @@ class BenesApp(tk.Tk):
         body = ttk.Frame(dialog, padding=18)
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="Assign each MZI to a unique VoltageTuner pin (0–15).", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, columnspan=4, sticky="w")
-        ttk.Label(body, text="Straight and cross values are optional calibration points. When set, routing or clicking a switch sends the voltage for its new state.", wraplength=590).grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 14))
-        for column, title in enumerate(("MZI", "Pin", "Straight [V]", "Cross [V]")):
+        ttk.Label(body, text="Save a pin mapping before scanning. Each scan restores the switch voltage; choose which power extreme means straight and cross.", wraplength=650).grid(row=1, column=0, columnspan=5, sticky="w", pady=(4, 14))
+        for column, title in enumerate(("MZI", "Pin", "Straight [V]", "Cross [V]", "Power scan")):
             ttk.Label(body, text=title).grid(row=2, column=column, sticky="w", padx=(0, 14), pady=(0, 4))
         pin_vars, straight_vars, cross_vars = {}, {}, {}
         choices = ("Unassigned",) + tuple(str(pin) for pin in range(16))
@@ -341,6 +362,7 @@ class BenesApp(tk.Tk):
             ttk.Combobox(body, textvariable=pin_vars[name], values=choices, state="readonly", width=12).grid(row=row, column=1, sticky="w", padx=(0, 14), pady=2)
             ttk.Entry(body, textvariable=straight_vars[name], width=12).grid(row=row, column=2, sticky="w", padx=(0, 14), pady=2)
             ttk.Entry(body, textvariable=cross_vars[name], width=12).grid(row=row, column=3, sticky="w", pady=2)
+            ttk.Button(body, text="Scan...", command=lambda n=name: self.show_power_scan(dialog, n, pin_vars[n], straight_vars[n], cross_vars[n])).grid(row=row, column=4, sticky="w", padx=(14, 0), pady=2)
 
         def save_mapping():
             try:
@@ -357,9 +379,128 @@ class BenesApp(tk.Tk):
             self.refresh(keep_selection=True)
 
         buttons = ttk.Frame(body)
-        buttons.grid(row=3 + len(self.network.switches), column=0, columnspan=4, sticky="e", pady=(16, 0))
+        buttons.grid(row=3 + len(self.network.switches), column=0, columnspan=5, sticky="e", pady=(16, 0))
         ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right")
         ttk.Button(buttons, text="Save", command=save_mapping).pack(side="right", padx=6)
+
+    def show_power_scan(self, parent, name, pin_var, straight_var, cross_var):
+        window = tk.Toplevel(parent)
+        window.title(f"Power scan: {name}")
+        window.transient(parent)
+        window.grab_set()
+        frame = ttk.Frame(window, padding=18)
+        frame.pack(fill="both", expand=True)
+        fields = {}
+        defaults = {"Lower limit [V]": "-10", "Upper limit [V]": "10",
+                    "Step [V]": "0.5", "Settle [ms]": "50"}
+        saved = self.scan_settings.get(name, defaults)
+        for row, label in enumerate(defaults):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            value = tk.StringVar(value=saved[label])
+            ttk.Entry(frame, textvariable=value, width=12).grid(row=row, column=1, sticky="w", padx=8, pady=3)
+            fields[label] = value
+        ttk.Label(frame, text=f"Each point uses the Arduino burst ({self.power_meter.settings['duration']:g} s).", wraplength=360).grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 4))
+        progress = tk.StringVar(value="Choose a range and start the scan.")
+        ttk.Label(frame, textvariable=progress, wraplength=390).grid(row=5, column=0, columnspan=3, sticky="w", pady=6)
+        extrema = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=extrema, wraplength=390).grid(row=6, column=0, columnspan=3, sticky="w", pady=6)
+        straight_choice = tk.StringVar()
+        cross_choice = tk.StringVar()
+        for row, (label, variable) in enumerate((("Straight", straight_choice), ("Cross", cross_choice)), start=7):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            ttk.Combobox(frame, textvariable=variable, values=("Maximum", "Minimum"), state="readonly", width=12).grid(row=row, column=1, sticky="w", padx=8, pady=3)
+        result = {"maximum": None, "minimum": None}
+        running = {"value": False}
+
+        def close_scan():
+            if running["value"]:
+                return
+            window.grab_release()
+            window.destroy()
+            parent.grab_set()
+
+        window.protocol("WM_DELETE_WINDOW", close_scan)
+
+        def save_scan():
+            if result["maximum"] is None:
+                messagebox.showerror("No scan", "Run a scan before saving calibration.", parent=window)
+                return
+            if {straight_choice.get(), cross_choice.get()} != {"Maximum", "Minimum"}:
+                messagebox.showerror("Choose states", "Assign one extreme to straight and the other to cross.", parent=window)
+                return
+            options = {"Maximum": result["maximum"].voltage, "Minimum": result["minimum"].voltage}
+            straight = options[straight_choice.get()]
+            cross = options[cross_choice.get()]
+            try:
+                self.controller.set_calibration(name, straight, cross)
+                self.controller.apply_calibrated_states(self.network.states)
+            except (OSError, RuntimeError, ValueError) as error:
+                messagebox.showerror("Calibration failed", str(error), parent=window)
+                return
+            straight_var.set(f"{straight:.2f}")
+            cross_var.set(f"{cross:.2f}")
+            self.show_calibrated_voltages()
+            self.update_hardware_status(f"{name} calibrated")
+            close_scan()
+
+        def start_scan():
+            try:
+                voltages = scan_voltages(*(float(fields[key].get()) for key in ("Lower limit [V]", "Upper limit [V]", "Step [V]")))
+                settle_ms = float(fields["Settle [ms]"].get())
+                if not 0 <= settle_ms <= 10000:
+                    raise ValueError("Settling time must be between 0 and 10000 ms")
+            except ValueError as error:
+                messagebox.showerror("Invalid scan", str(error), parent=window)
+                return
+            if str(self.controller.settings["mapping"][name]) != pin_var.get():
+                messagebox.showerror("Save mapping first", "Save this pin mapping before scanning its power response.", parent=window)
+                return
+            if not self.controller.connected or self.controller.settings["dry_run"] or not self.power_meter.connected:
+                messagebox.showerror("Hardware not connected", "Connect the physical voltage board and Arduino power meter before scanning.", parent=window)
+                return
+            self.scan_settings[name] = {key: value.get() for key, value in fields.items()}
+            running["value"] = True
+            result.update(maximum=None, minimum=None)
+            straight_choice.set("")
+            cross_choice.set("")
+            extrema.set("")
+            scan_button.configure(state="disabled")
+            save_button.configure(state="disabled")
+            progress.set(f"Scanning {len(voltages)} voltages...")
+
+            def on_point(index, total, point):
+                self.after(0, lambda: progress.set(f"{index}/{total}: {point.voltage:.2f} V, {point.power:.4g} {self.power_meter.settings['unit']}"))
+
+            def worker():
+                try:
+                    points = scan_switch(self.controller, self.power_meter, name, voltages, settle_ms / 1000, on_point)
+                except Exception as error:
+                    self.after(0, lambda message=str(error): finish_error(message))
+                else:
+                    self.after(0, lambda: finish_scan(points))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def finish_error(message):
+            running["value"] = False
+            scan_button.configure(state="normal")
+            progress.set(f"Scan failed: {message}")
+
+        def finish_scan(points):
+            running["value"] = False
+            scan_button.configure(state="normal")
+            save_button.configure(state="normal")
+            result["maximum"] = max(points, key=lambda point: point.power)
+            result["minimum"] = min(points, key=lambda point: point.power)
+            unit = self.power_meter.settings["unit"]
+            extrema.set(f"Maximum: {result['maximum'].power:.4g} {unit} at {result['maximum'].voltage:.2f} V\nMinimum: {result['minimum'].power:.4g} {unit} at {result['minimum'].voltage:.2f} V")
+            progress.set(f"Scan complete: {len(points)} points. Choose the state for each extreme.")
+
+        scan_button = ttk.Button(frame, text="Start scan", command=start_scan)
+        scan_button.grid(row=9, column=0, sticky="w", pady=(12, 0))
+        save_button = ttk.Button(frame, text="Save calibration", command=save_scan, state="disabled")
+        save_button.grid(row=9, column=1, sticky="w", pady=(12, 0))
+        ttk.Button(frame, text="Close", command=close_scan).grid(row=9, column=2, sticky="e", pady=(12, 0))
 
     def read_spectrum(self):
         try:
