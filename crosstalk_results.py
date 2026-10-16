@@ -70,11 +70,18 @@ def save_scan_artifacts(folder: Path, context: dict, data: dict, source: str,
         figure = Figure(figsize=(10, 5))
         response = figure.add_subplot(121 if source == "OSA" else 111)
         response.plot([point.voltage for point in points], [point.power for point in points],
-                      marker=".", linewidth=1.4, color=ROUTE_COLOR)
+                      marker=".", linewidth=1.4, color=ROUTE_COLOR,
+                      label="Peak" if source == "OSA" else "Power")
+        if source == "OSA":
+            response.plot([point.voltage for point in points],
+                          [point.mean_power_dbm for point in points],
+                          marker=".", linewidth=1.4, color=POWER_COLOR, label="Mean")
+            response.legend(loc="best")
         response.set(xlabel="Voltage [V]",
-                     ylabel=f"Peak power [{response_unit}]" if source == "OSA" else f"Power [{response_unit}]",
+                     ylabel=f"Power [{response_unit}]",
                      title=f"{name}: response")
         response.grid(True)
+        response.autoscale(enable=True, axis="y")
         if source == "OSA":
             spectra = figure.add_subplot(122)
             limits = context["voltages_v"]
@@ -86,6 +93,7 @@ def save_scan_artifacts(folder: Path, context: dict, data: dict, source: str,
                                  alpha=0.65, color=cmap(norm(point.voltage)))
             spectra.set(xlabel="Wavelength [nm]", ylabel="Power [dBm]", title=f"{name}: spectra")
             spectra.grid(True)
+            spectra.autoscale(enable=True, axis="y")
             figure.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=spectra, label="Voltage [V]")
         figure.tight_layout()
         figure.savefig(folder / f"{name.replace('.', '_')}.png", dpi=160)

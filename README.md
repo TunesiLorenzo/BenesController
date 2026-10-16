@@ -61,8 +61,10 @@ during a scan.
 The **Crosstalk** tab can scan several switches in sequence. Select switches
 with Ctrl or Shift, choose **Arduino** or **OSA**, enter the lower and upper
 voltage limits, step, and settling time, then start the scan. Arduino readings
-are burst averages. For OSA scans, each voltage produces a full spectrum and
-the peak dBm value is used for the voltage response. Each switch gets its own
+are burst averages. For OSA scans, each voltage produces a spectrum after the
+last two bins are discarded. The voltage response shows both peak power and
+the mean of the retained bins, calculated in linear mW and converted to dBm.
+Each switch gets its own
 plot tab as measurements arrive, with interactive zoom, pan, and save controls;
 OSA plots also overlay its spectra, colored by voltage. The **Export CSV
 with comment** button saves the voltage response and every acquired OSA

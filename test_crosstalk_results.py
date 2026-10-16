@@ -34,7 +34,8 @@ class CrosstalkResultsTests(unittest.TestCase):
         self.assertEqual(summary["osa_output_port"], 5)
         self.assertEqual(summary["applied_voltages_before_scan"]["S1.1"], 2.5)
         self.assertIn("# Description: Input one test", csv_text)
-        self.assertIn("S1.1,-1,-20,1551.0,-20.0", csv_text)
+        self.assertIn("S1.1,-1,-20,", csv_text)
+        self.assertIn(",1551.0,-20.0", csv_text)
 
     def test_arduino_response_creates_one_figure(self):
         network = BenesNetwork()

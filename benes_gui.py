@@ -194,7 +194,7 @@ class BenesApp(tk.Tk):
         self.crosstalk_comment_var = tk.StringVar()
         ttk.Label(scan_controls, text="Scan comment").grid(row=7, column=0, sticky="w", pady=3)
         ttk.Entry(scan_controls, textvariable=self.crosstalk_comment_var, width=19).grid(row=7, column=1, sticky="w", padx=(10, 0), pady=3)
-        ttk.Label(scan_controls, text="Arduino: burst average. OSA: full spectrum and peak dBm. Each point is taken after settling; switches return to 0 V.", wraplength=245).grid(row=8, column=0, columnspan=2, sticky="w", pady=(12, 8))
+        ttk.Label(scan_controls, text="Arduino: burst average. OSA: trimmed spectrum, peak and mean dBm. Each point is taken after settling; switches return to 0 V.", wraplength=245).grid(row=8, column=0, columnspan=2, sticky="w", pady=(12, 8))
         self.crosstalk_button = ttk.Button(scan_controls, text="Scan selected switches", command=self.start_crosstalk_scan)
         self.crosstalk_button.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(4, 6))
         self.crosstalk_export_button = ttk.Button(scan_controls, text="Export CSV with comment", command=self.export_crosstalk_csv, state="disabled")
@@ -539,9 +539,15 @@ class BenesApp(tk.Tk):
             self.crosstalk_plots.select(tab)
             figure = Figure(figsize=(8, 5))
             response = figure.add_subplot(121 if source == "OSA" else 111)
-            line, = response.plot([], [], marker=".", linewidth=1.4, color=ACCENT)
+            line, = response.plot([], [], marker=".", linewidth=1.4, color=ACCENT,
+                                  label="Peak" if source == "OSA" else "Power")
+            mean_line = None
+            if source == "OSA":
+                mean_line, = response.plot([], [], marker=".", linewidth=1.4,
+                                           color=POWER_METER_COLOR, label="Mean")
+                response.legend(loc="best")
             response.set(xlabel="Voltage [V]",
-                         ylabel="Peak power [dBm]" if source == "OSA" else f"Power [{response_unit}]",
+                         ylabel="Power [dBm]" if source == "OSA" else f"Power [{response_unit}]",
                          title=f"{name}: power response")
             response.grid(True)
             spectra = None
@@ -560,24 +566,31 @@ class BenesApp(tk.Tk):
             toolbar.update()
             canvas.get_tk_widget().pack(fill="both", expand=True)
             plot = {"canvas": canvas, "toolbar": toolbar, "response": response, "line": line,
+                    "mean_line": mean_line, "means": [],
                     "spectra": spectra, "norm": norm, "cmap": cmap,
                     "voltages": [], "powers": []}
             self.crosstalk_plot_items[name] = plot
         plot["voltages"].append(point.voltage)
         plot["powers"].append(point.power)
         plot["line"].set_data(plot["voltages"], plot["powers"])
+        if source == "OSA":
+            plot["means"].append(point.mean_power_dbm)
+            plot["mean_line"].set_data(plot["voltages"], plot["means"])
         plot["response"].relim()
+        plot["response"].autoscale(enable=True, axis="y")
         plot["response"].autoscale_view()
         if source == "OSA":
             spectra = plot["spectra"]
             spectra.plot(point.wavelength_nm, point.spectrum_dbm, linewidth=0.8,
                          alpha=0.65, color=plot["cmap"](plot["norm"](point.voltage)))
             spectra.relim()
+            spectra.autoscale(enable=True, axis="y")
             spectra.autoscale_view()
             spectra.set_title(f"{name}: {index} spectra")
         plot["canvas"].draw_idle()
-        self.crosstalk_status.set(
-            f"{name}: {index}/{total} at {point.voltage:.2f} V, {point.power:.4g} {response_unit}{' peak' if source == 'OSA' else ''}")
+        detail = (f"peak {point.power:.4g}, mean {point.mean_power_dbm:.4g} dBm" if source == "OSA"
+                  else f"{point.power:.4g} {response_unit}")
+        self.crosstalk_status.set(f"{name}: {index}/{total} at {point.voltage:.2f} V, {detail}")
 
     def export_crosstalk_csv(self):
         if not self.crosstalk_data:
@@ -811,8 +824,11 @@ class BenesApp(tk.Tk):
 
     def show_spectrum(self, wave, power):
         self.osa_button.configure(state="normal")
-        if len(power) >= 2:
-            power[-1] = power[-2]
+        try:
+            wave, power = osa.trim_spurious_tail(wave, power)
+        except ValueError as error:
+            messagebox.showerror("OSA trace unavailable", str(error), parent=self)
+            return
         self.trace_count += 1
         try:
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk

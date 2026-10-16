@@ -4,6 +4,7 @@ import csv
 from datetime import datetime
 
 from calibration_scan import SpectrumScanPoint
+from osa import SPURIOUS_TAIL_POINTS
 
 
 def write_spectra(path, traces, description=""):
@@ -38,16 +39,24 @@ def write_crosstalk_csv(path, data, source, description="", response_unit=""):
         raise ValueError("There is no crosstalk dataset to export")
     with open(path, "w", encoding="utf-8", newline="") as file:
         file.write(f"# Crosstalk {source} scan exported {datetime.now().isoformat()}\n")
-        file.write(f"# Response power: {'OSA spectrum peak [dBm]' if source == 'OSA' else 'Arduino calibrated power'}\n")
+        file.write(f"# Response power: {'OSA spectrum peak and linear-bin mean [dBm]' if source == 'OSA' else 'Arduino calibrated power'}\n")
         file.write(f"# Response unit: {response_unit or ('dBm' if source == 'OSA' else 'unspecified')}\n")
+        if source == "OSA":
+            file.write(f"# Final OSA bins discarded per trace: {SPURIOUS_TAIL_POINTS}\n")
+            file.write("# Mean: average of linear mW values across retained bins, converted to dBm\n")
         for line in description.splitlines() or [""]:
             file.write(f"# Description: {line}\n")
         writer = csv.writer(file)
-        writer.writerow(["switch", "voltage_v", "response_power", "wavelength_nm", "spectrum_power_dbm"])
+        if source == "OSA":
+            writer.writerow(["switch", "voltage_v", "peak_power_dbm", "mean_power_dbm",
+                             "wavelength_nm", "spectrum_power_dbm"])
+        else:
+            writer.writerow(["switch", "voltage_v", "response_power", "wavelength_nm", "spectrum_power_dbm"])
         for name, points in data.items():
             for point in points:
                 if isinstance(point, SpectrumScanPoint):
-                    writer.writerows((name, point.voltage, point.power, wavelength, power)
+                    writer.writerows((name, point.voltage, point.power, point.mean_power_dbm, wavelength, power)
                                      for wavelength, power in zip(point.wavelength_nm, point.spectrum_dbm))
                 else:
-                    writer.writerow((name, point.voltage, point.power, "", ""))
+                    writer.writerow((name, point.voltage, point.power, "", "", "") if source == "OSA"
+                                    else (name, point.voltage, point.power, "", ""))

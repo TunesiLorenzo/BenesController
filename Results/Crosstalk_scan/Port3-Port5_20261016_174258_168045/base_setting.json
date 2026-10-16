@@ -1,0 +1,106 @@
+{
+  "started_at": "2026-10-16T17:42:58+02:00",
+  "input_port": 3,
+  "selected_output_port": 5,
+  "actual_output_port": 5,
+  "power_meter_output_port": 6,
+  "osa_output_port": 5,
+  "path_rows": [
+    3,
+    5,
+    6,
+    6,
+    6,
+    5
+  ],
+  "path_switches": [
+    {
+      "name": "S1.2",
+      "state": "cross"
+    },
+    {
+      "name": "S2.2",
+      "state": "cross"
+    },
+    {
+      "name": "S4.2",
+      "state": "bar"
+    },
+    {
+      "name": "S5.3",
+      "state": "cross"
+    }
+  ],
+  "switch_states": {
+    "S1.1": "cross",
+    "S1.2": "cross",
+    "S1.3": "cross",
+    "S2.1": "cross",
+    "S2.2": "cross",
+    "S3.1": "cross",
+    "S3.2": "cross",
+    "S4.1": "cross",
+    "S4.2": "bar",
+    "S5.1": "cross",
+    "S5.2": "cross",
+    "S5.3": "cross"
+  },
+  "switch_pins": {
+    "S1.1": 2,
+    "S1.2": 1,
+    "S1.3": 0,
+    "S2.1": 4,
+    "S2.2": 3,
+    "S3.1": 6,
+    "S3.2": 5,
+    "S4.1": 15,
+    "S4.2": 7,
+    "S5.1": 14,
+    "S5.2": 13,
+    "S5.3": 12
+  },
+  "applied_voltages_before_scan": {
+    "S1.1": 0.0,
+    "S1.2": 0.0,
+    "S1.3": 0.0,
+    "S2.1": 0.0,
+    "S2.2": 0.0,
+    "S3.1": 0.0,
+    "S3.2": 0.0,
+    "S4.1": 0.0,
+    "S4.2": 2.5,
+    "S5.1": 0.0,
+    "S5.2": 0.0,
+    "S5.3": 0.0
+  },
+  "scanned_switches": [
+    "S1.1",
+    "S1.3",
+    "S2.1",
+    "S3.1",
+    "S3.2",
+    "S4.1",
+    "S5.1",
+    "S5.2"
+  ],
+  "voltages_v": [
+    0.0,
+    1.0,
+    2.0,
+    3.0
+  ],
+  "settle_ms": 2500.0,
+  "measurement_source": "OSA",
+  "comment": "First test of crosstalk",
+  "status": "complete",
+  "points_per_switch": {
+    "S1.1": 4,
+    "S1.3": 4,
+    "S2.1": 4,
+    "S3.1": 4,
+    "S3.2": 4,
+    "S4.1": 4,
+    "S5.1": 4,
+    "S5.2": 4
+  }
+}

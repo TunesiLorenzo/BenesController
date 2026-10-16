@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+import osa
 
 
 @dataclass(frozen=True)
@@ -17,10 +19,18 @@ class ScanPoint:
 class SpectrumScanPoint(ScanPoint):
     wavelength_nm: tuple[float, ...]
     spectrum_dbm: tuple[float, ...]
+    mean_power_dbm: float = field(init=False)
+
+    def __post_init__(self):
+        if not self.spectrum_dbm:
+            raise ValueError("The OSA returned an empty spectrum")
+        peak = max(self.spectrum_dbm)
+        relative_mean = sum(10 ** ((power - peak) / 10) for power in self.spectrum_dbm) / len(self.spectrum_dbm)
+        object.__setattr__(self, "mean_power_dbm", peak + 10 * math.log10(relative_mean))
 
 
 def spectrum_scan_point(voltage: float, spectrum) -> SpectrumScanPoint:
-    wavelength, power = spectrum
+    wavelength, power = osa.trim_spurious_tail(*spectrum)
     if not wavelength or len(wavelength) != len(power):
         raise ValueError("The OSA returned an empty or mismatched spectrum")
     if not all(math.isfinite(value) for value in wavelength) or not all(math.isfinite(value) for value in power):

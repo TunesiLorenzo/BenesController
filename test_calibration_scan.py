@@ -79,11 +79,18 @@ class CalibrationScanTests(unittest.TestCase):
         controller = FakeController()
         results = scan_switches_with_reader(
             controller, ["S1.1"], [-1, 1], 0,
-            lambda voltage: spectrum_scan_point(voltage, ([1550.0, 1551.0], [-40.0, -20.0])),
+            lambda voltage: spectrum_scan_point(voltage, ([1550.0, 1551.0, 1552.0, 1553.0],
+                                                         [-40.0, -20.0, 30.0, 40.0])),
         )
         self.assertEqual([point.power for point in results["S1.1"]], [-20.0, -20.0])
         self.assertEqual(results["S1.1"][0].spectrum_dbm, (-40.0, -20.0))
+        self.assertEqual(results["S1.1"][0].wavelength_nm, (1550.0, 1551.0))
         self.assertEqual(controller.sent, [-1, 1, 0])
+
+    def test_osa_mean_is_computed_in_linear_power_after_trimming(self):
+        point = spectrum_scan_point(0, ([1550, 1551, 1552, 1553], [-30, -20, 50, 60]))
+        self.assertEqual(point.power, -20)
+        self.assertAlmostEqual(point.mean_power_dbm, -22.596373, places=5)
 
     def test_osa_reader_rejects_bad_spectrum(self):
         with self.assertRaisesRegex(ValueError, "mismatched"):

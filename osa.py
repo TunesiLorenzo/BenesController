@@ -5,6 +5,18 @@ import socket
 
 
 C = 299792458
+SPURIOUS_TAIL_POINTS = 2
+
+
+def trim_spurious_tail(wavelength, power, count=SPURIOUS_TAIL_POINTS):
+    """Discard the final OSA bins before plotting or calculating power."""
+    if len(wavelength) != len(power):
+        raise ValueError("The OSA returned mismatched wavelength and power arrays")
+    if count < 0 or len(power) <= count:
+        raise ValueError("The OSA trace is too short to discard its final bins")
+    if count == 0:
+        return list(wavelength), list(power)
+    return list(wavelength[:-count]), list(power[:-count])
 
 
 def parse_curve(buffer):
