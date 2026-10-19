@@ -67,6 +67,9 @@ class BenesVoltageController:
                         for index, name in enumerate(self.switch_names)},
             "voltage": {name: 0.0 for name in self.switch_names},
             "calibration": {name: {"straight": None, "cross": None} for name in self.switch_names},
+            # Heater resistances for plotting power = V^2 / R; pins without one use the default.
+            "heater_resistance_ohm": {},
+            "default_heater_resistance_ohm": None,
         }
 
     def _load(self) -> dict:
@@ -88,6 +91,13 @@ class BenesVoltageController:
                     for state in ("straight", "cross")
                 }
             self._ensure_unique_pins(settings["mapping"])
+            settings["heater_resistance_ohm"] = {
+                str(self._validate_pin(int(pin))): self._optional_resistance(value)
+                for pin, value in stored.get("heater_resistance_ohm", {}).items()
+                if value is not None
+            }
+            settings["default_heater_resistance_ohm"] = self._optional_resistance(
+                stored.get("default_heater_resistance_ohm"))
             return settings
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
             self.load_error = f"Could not read {self.config_path.name}: {error}. Defaults are in use."
@@ -96,6 +106,42 @@ class BenesVoltageController:
     @staticmethod
     def _optional_voltage(value: object) -> float | None:
         return None if value in (None, "") else validate_voltage(value)
+
+    @staticmethod
+    def _optional_resistance(value: object) -> float | None:
+        if value is None or str(value).strip() == "":
+            return None
+        resistance = float(value)
+        if not math.isfinite(resistance) or resistance <= 0:
+            raise ValueError("Heater resistance must be a positive number of ohms")
+        return resistance
+
+    def set_heater_resistances(self, per_pin: dict[int, object], default: object) -> None:
+        """Store per-pin heater resistances; blank values fall back to the default."""
+        checked = {pin: self._optional_resistance(value)
+                   for pin, value in per_pin.items() if self._validate_pin(pin) is not None}
+        default = self._optional_resistance(default)
+        stored = dict(self.settings["heater_resistance_ohm"])
+        for pin, resistance in checked.items():
+            if resistance is None:
+                stored.pop(str(pin), None)
+            else:
+                stored[str(pin)] = resistance
+        self.settings["heater_resistance_ohm"] = stored
+        self.settings["default_heater_resistance_ohm"] = default
+        self.save()
+
+    def heater_resistance(self, name: str) -> float | None:
+        """Resistance of the heater on an MZI's mapped pin, or the global default."""
+        self._require_switch(name)
+        pin = self.settings["mapping"][name]
+        resistance = None if pin is None else self.settings["heater_resistance_ohm"].get(str(pin))
+        return resistance if resistance is not None else self.settings["default_heater_resistance_ohm"]
+
+    def heater_power_mw(self, name: str, voltage: float) -> float | None:
+        """Electrical heater power for a commanded voltage, if a resistance is known."""
+        resistance = self.heater_resistance(name)
+        return None if resistance is None else voltage * voltage / resistance * 1000
 
     @staticmethod
     def _validate_pin(pin: object, allow_none: bool = False) -> int | None:

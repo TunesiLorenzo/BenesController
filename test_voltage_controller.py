@@ -63,6 +63,26 @@ class VoltageControllerTests(unittest.TestCase):
             guarded.drive_with_mirror("S1.1", 7, 8)
         self.assertNotIn((0, 7.0), guarded.board.sent)
 
+    def test_heater_resistance_per_pin_with_global_default_persists(self):
+        controller = self.controller()
+        controller.set_mapping({"S1.1": 3, "S1.2": 5})
+        self.assertIsNone(controller.heater_power_mw("S1.1", 2.0))
+        controller.set_heater_resistances({3: "1000", 5: ""}, "500")
+        self.assertEqual(controller.heater_resistance("S1.1"), 1000)
+        self.assertEqual(controller.heater_resistance("S1.2"), 500)
+        self.assertAlmostEqual(controller.heater_power_mw("S1.1", 2.0), 4.0)
+
+        restored = self.controller()
+        self.assertEqual(restored.heater_resistance("S1.1"), 1000)
+        self.assertEqual(restored.settings["default_heater_resistance_ohm"], 500)
+        # The resistance belongs to the pin, so it follows a remapped MZI's new pin.
+        restored.set_mapping({"S1.1": 5, "S1.2": 3})
+        self.assertEqual(restored.heater_resistance("S1.2"), 1000)
+        restored.set_heater_resistances({3: ""}, "")
+        self.assertIsNone(restored.heater_resistance("S1.2"))
+        with self.assertRaisesRegex(ValueError, "positive"):
+            restored.set_heater_resistances({3: "-5"}, "")
+
     def test_new_default_mapping_reserves_pin_8(self):
         names = tuple(BenesNetwork().switches)
         controller = BenesVoltageController(names, self.path, board_factory=FakeBoard)

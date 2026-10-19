@@ -119,6 +119,15 @@ show the measured maximum and minimum. Assign each extreme to **Straight** or
 switch state changes. Keep the optical input and other switch states fixed
 during a scan.
 
+The mapping dialog also has an **R [Ω]** column for each pin's heater
+resistance and a **Default R [Ω]** used for pins left blank. The **X axis**
+selector above the Crosstalk-tab plots switches every response plot, including
+rescans and the saved PNGs, between commanded voltage and heater power
+P = V²/R in mW. Switches with no resistance stay in volts. All controls and
+scan limits remain in volts, and `base_setting.json` records the resistance
+used for each scanned switch. The voltage board has no readback, so power is
+computed from the commanded voltage, not measured.
+
 The **Crosstalk** tab can scan several switches in sequence. Select switches
 with Ctrl or Shift, choose **Arduino** or **OSA**, enter the lower and upper
 voltage limits, step, and settling time, then start the scan. Arduino readings
@@ -144,6 +153,16 @@ switch states are saved with each scan. Enter an optional scan comment in the
 measured switch, and `crosstalk_dataset.csv` with the comment. The folder uses
 the selected destination, or the currently reached output when **Trace current**
 is selected. The summary records the actual reached output separately.
+Automatic path calibrations use the same layout under
+`Results/Path_calibration/` instead. Calibrations saved before this change
+remain in `Results/Crosstalk_scan/`.
+
+**Open results…** above the plots replots any saved scan or calibration folder.
+It shows a **Setup** tab with the run summary, comment, any error, and the base
+path diagram, then one tab per switch with the response, OSA spectra, and any
+range-change rescans. The **X axis** toggle works on loaded results. It uses
+the heater resistances stored with the run, or the current ones when the run
+predates them. **Export CSV with comment** re-exports the loaded dataset.
 
 ### Automatic 0 V path calibration
 

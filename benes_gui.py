@@ -1,5 +1,6 @@
 """Run with: python benes_gui.py"""
 
+import json
 import random
 import threading
 import tkinter as tk
@@ -8,11 +9,12 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from network import BenesNetwork
-from calibration_scan import (calibrate_default_cross_path, minimum_default_cross_pairs,
+from calibration_scan import (ScanPoint, calibrate_default_cross_path, minimum_default_cross_pairs,
                               next_default_cross_pair,
                               scan_switch, scan_switches, scan_switches_with_reader,
                               scan_voltages, spectrum_scan_point, zero_voltage_paths)
-from crosstalk_results import RESCAN_STYLES, create_result_folder, save_scan_artifacts, scan_context
+from crosstalk_results import (PLOT_X_POWER, PLOT_X_VOLTAGE, RESCAN_STYLES, create_result_folder,
+                               load_scan_folder, plot_x_values, save_scan_artifacts, scan_context)
 from impulse_test import (LIVE_PLOT_WINDOW_S, plot_trace_samples, received_pair_rate,
                           run_impulse_test,
                           validate_impulse_settings, write_impulse_csv)
@@ -258,8 +260,22 @@ class BenesApp(tk.Tk):
         self.path_calibration_button.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 6))
         ttk.Label(path_controls, text=f"Minimum all-switch plan: {len(plan)} pairs — {plan_text}", wraplength=270).grid(row=9, column=0, columnspan=2, sticky="w", pady=(0, 8))
         ttk.Label(path_controls, textvariable=self.crosstalk_status, wraplength=270).grid(row=10, column=0, columnspan=2, sticky="w")
-        self.crosstalk_plot_frame = ttk.Frame(self.crosstalk_tab, padding=(0, 18, 18, 18))
-        self.crosstalk_plot_frame.pack(side="left", fill="both", expand=True)
+        plot_area = ttk.Frame(self.crosstalk_tab, padding=(0, 18, 18, 18))
+        plot_area.pack(side="left", fill="both", expand=True)
+        plot_bar = ttk.Frame(plot_area)
+        plot_bar.pack(side="top", fill="x", pady=(0, 6))
+        self.open_results_button = ttk.Button(plot_bar, text="Open results…", command=self.open_results_folder)
+        self.open_results_button.pack(side="left", padx=(0, 16))
+        ttk.Label(plot_bar, text="X axis").pack(side="left")
+        self.plot_x_axis_var = tk.StringVar(value="Voltage [V]")
+        plot_x_box = ttk.Combobox(plot_bar, textvariable=self.plot_x_axis_var,
+                                  values=("Voltage [V]", "Heater power [mW]"), state="readonly", width=18)
+        plot_x_box.pack(side="left", padx=(8, 10))
+        plot_x_box.bind("<<ComboboxSelected>>", lambda event: self.replot_crosstalk_x_axis())
+        ttk.Label(plot_bar, text="Power = V² / R, with R set per pin in MZI / pin mapping. Control stays in volts.",
+                  foreground="#9baec6").pack(side="left")
+        self.crosstalk_plot_frame = ttk.Frame(plot_area)
+        self.crosstalk_plot_frame.pack(side="top", fill="both", expand=True)
         ttk.Label(self.crosstalk_plot_frame, text="Power versus voltage will appear here after a scan.").pack(anchor="center", expand=True)
 
         # Keep every routing action beside the diagram.  The old stacked layout
@@ -815,9 +831,13 @@ class BenesApp(tk.Tk):
             ttk.Label(self.crosstalk_plot_frame, text="No measurements were collected.").pack(anchor="center", expand=True)
         self.crosstalk_status.set("Saving figures, CSV, and base path...")
 
+        plot_x_mode = self.plot_x_mode()
+
         def save_results():
             try:
-                final_context = {**context, "scan_error": error} if error else context
+                final_context = {**context, "plot_x_axis": plot_x_mode}
+                if error:
+                    final_context["scan_error"] = error
                 save_scan_artifacts(folder, final_context, data, source, response_unit, self.network,
                                     status="failed" if error else "complete")
             except Exception as save_error:
@@ -883,6 +903,8 @@ class BenesApp(tk.Tk):
         self.crosstalk_plots.pack(fill="both", expand=True)
         self.crosstalk_plot_items = {}
         self.crosstalk_voltage_limits = (min(voltages), max(voltages))
+        # A loaded results folder plots with the resistances it was saved with.
+        self.plot_resistance_override = {}
 
     def add_crosstalk_point(self, name, point, index, total, source, response_unit):
         from matplotlib import colormaps
@@ -905,7 +927,7 @@ class BenesApp(tk.Tk):
                 mean_line, = response.plot([], [], marker=".", linewidth=1.4,
                                            color=POWER_METER_COLOR, label="Mean")
                 response.legend(loc="best")
-            response.set(xlabel="Voltage [V]",
+            response.set(xlabel=self.plot_x(name, [])[1],
                          ylabel="Power [dBm]" if source == "OSA" else f"Power [{response_unit}]",
                          title=f"{name}: power response")
             response.grid(True)
@@ -927,14 +949,13 @@ class BenesApp(tk.Tk):
             plot = {"canvas": canvas, "toolbar": toolbar, "response": response, "line": line,
                     "mean_line": mean_line, "means": [],
                     "spectra": spectra, "norm": norm, "cmap": cmap,
-                    "voltages": [], "powers": []}
+                    "voltages": [], "powers": [], "source": source}
             self.crosstalk_plot_items[name] = plot
         plot["voltages"].append(point.voltage)
         plot["powers"].append(point.power)
-        plot["line"].set_data(plot["voltages"], plot["powers"])
         if source == "OSA":
             plot["means"].append(point.mean_power_dbm)
-            plot["mean_line"].set_data(plot["voltages"], plot["means"])
+        self.set_crosstalk_plot_data(name, plot)
         plot["response"].relim()
         plot["response"].autoscale(enable=True, axis="y")
         plot["response"].autoscale_view()
@@ -951,10 +972,10 @@ class BenesApp(tk.Tk):
                   else f"{point.power:.4g} {response_unit}")
         self.crosstalk_status.set(f"{name}: {index}/{total} at {point.voltage:.2f} V, {detail}")
 
-    def add_rescan_point(self, name, phase, point, index, total):
+    def add_rescan_point(self, name, phase, point, index, total, unit=None):
         """Plot a range-change rescan on its own axis, since its scale differs."""
         _, label, color = RESCAN_STYLES[phase]
-        unit = self.power_meter.settings["unit"]
+        unit = unit or self.power_meter.settings["unit"]
         self.crosstalk_status.set(f"{name}: {label.lower()} {index}/{total} at {point.voltage:.2f} V, "
                                   f"{point.power:.4g} {unit}")
         plot = self.crosstalk_plot_items.get(name)
@@ -975,10 +996,114 @@ class BenesApp(tk.Tk):
             plot["canvas"].figure.tight_layout()
         series["voltages"].append(point.voltage)
         series["powers"].append(point.power)
-        series["line"].set_data(series["voltages"], series["powers"])
+        series["line"].set_data(self.plot_x(name, series["voltages"])[0], series["powers"])
         axis.relim()
         axis.autoscale_view()
         plot["canvas"].draw_idle()
+
+    def plot_x_mode(self):
+        return PLOT_X_POWER if self.plot_x_axis_var.get().startswith("Heater power") else PLOT_X_VOLTAGE
+
+    def plot_x(self, name, voltages):
+        """X values and label for a switch's voltages under the selected axis mode."""
+        resistance = (getattr(self, "plot_resistance_override", {}).get(name)
+                      or self.controller.heater_resistance(name))
+        return plot_x_values(voltages, resistance, self.plot_x_mode())
+
+    def open_results_folder(self):
+        """Replot a saved crosstalk scan or path calibration."""
+        if self.crosstalk_running:
+            messagebox.showinfo("Scan in progress", "Wait for the current scan to finish.", parent=self)
+            return
+        results = app_dir() / "Results"
+        folder = filedialog.askdirectory(parent=self, title="Open a scan or calibration results folder",
+                                         initialdir=str(results if results.exists() else app_dir()))
+        if not folder:
+            return
+        try:
+            loaded = load_scan_folder(folder)
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+            messagebox.showerror("Could not open results", str(error), parent=self)
+            return
+        self.show_loaded_results(Path(folder), loaded)
+
+    def show_loaded_results(self, folder, loaded):
+        context, data, source, unit = loaded["context"], loaded["data"], loaded["source"], loaded["unit"]
+        voltages = context.get("voltages_v") or [point.voltage for points in data.values() for point in points]
+        if not data or not voltages:
+            messagebox.showinfo("No measurements", f"{folder.name} contains no measured points.", parent=self)
+            return
+        self.prepare_crosstalk_plots(voltages)
+        self.plot_resistance_override = {name: value for name, value in
+                                         context.get("heater_resistance_ohm", {}).items() if value}
+        self.add_results_setup_tab(folder, context, loaded["comment"])
+        for name, points in data.items():
+            for index, point in enumerate(points, start=1):
+                self.add_crosstalk_point(name, point, index, len(points), source, unit)
+            for phase, (key, _, _) in RESCAN_STYLES.items():
+                rows = context.get(key, {}).get(name, [])
+                for index, row in enumerate(rows, start=1):
+                    self.add_rescan_point(name, phase, ScanPoint(row["voltage_v"], row["power"]),
+                                          index, len(rows), unit)
+        self.crosstalk_plots.select(0)
+        self.crosstalk_data = data
+        self.crosstalk_data_source = source
+        self.crosstalk_data_unit = unit
+        self.crosstalk_export_button.configure(state="normal")
+        kind = "Path calibration" if context.get("calibration_mode") else f"{source} crosstalk scan"
+        self.crosstalk_status.set(f"Viewing {folder.name}: {kind}, {context.get('status', 'unknown')}, "
+                                  f"{len(data)} switch(es).")
+
+    def add_results_setup_tab(self, folder, context, comment):
+        tab = ttk.Frame(self.crosstalk_plots, padding=12)
+        self.crosstalk_plots.add(tab, text="Setup")
+        kind = "Path calibration" if context.get("calibration_mode") else "Crosstalk scan"
+        lines = [
+            f"{kind} · {context.get('measurement_source', '')} · {context.get('status', 'unknown')}",
+            f"Folder: {folder}",
+            f"Started: {context.get('started_at', '')}",
+            f"Input {context.get('input_port')} → selected output {context.get('selected_output_port')} "
+            f"(actual {context.get('actual_output_port')})",
+            f"Power meter port: {context.get('power_meter_output_port')} · OSA port: {context.get('osa_output_port')}",
+            f"Switches: {', '.join(context.get('scanned_switches', []))}",
+            f"Settle: {context.get('settle_ms')} ms",
+        ]
+        if comment:
+            lines.append(f"Comment: {comment}")
+        if context.get("scan_error"):
+            lines.append(f"Error: {context['scan_error']}")
+        ttk.Label(tab, text="\n".join(lines), justify="left", wraplength=900).pack(anchor="w")
+        image_path = folder / "base_path.png"
+        if image_path.exists():
+            try:
+                image = tk.PhotoImage(file=str(image_path))
+                image = image.subsample(max(1, -(-image.width() // 900)))
+            except tk.TclError:
+                return
+            label = ttk.Label(tab, image=image)
+            label.image = image  # Keep a reference so Tk does not discard it.
+            label.pack(anchor="w", pady=(12, 0))
+
+    def set_crosstalk_plot_data(self, name, plot):
+        xs, label = self.plot_x(name, plot["voltages"])
+        plot["line"].set_data(xs, plot["powers"])
+        if plot["mean_line"] is not None:
+            plot["mean_line"].set_data(xs, plot["means"])
+        plot["response"].set_xlabel(label)
+
+    def replot_crosstalk_x_axis(self):
+        """Redraw every open response plot against volts or heater power."""
+        for name, plot in getattr(self, "crosstalk_plot_items", {}).items():
+            self.set_crosstalk_plot_data(name, plot)
+            axes = [plot["response"]]
+            for series in plot.get("rescans", {}).values():
+                series["line"].set_data(self.plot_x(name, series["voltages"])[0], series["powers"])
+            if plot.get("rescan_axis") is not None:
+                axes.append(plot["rescan_axis"])
+            for axis in axes:
+                axis.relim()
+                axis.autoscale_view()
+            plot["canvas"].draw_idle()
 
     def export_crosstalk_csv(self):
         if not self.crosstalk_data:
@@ -1031,9 +1156,10 @@ class BenesApp(tk.Tk):
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="Assign each MZI to a unique VoltageTuner pin (0–15).", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(body, text="Save a pin mapping before scanning. Each scan restores the switch voltage; choose which power extreme means straight and cross.", wraplength=650).grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 14))
-        for column, title in enumerate(("MZI", "Pin", "Straight [V]", "Cross [V]", "Power scan", "Saved values")):
+        for column, title in enumerate(("MZI", "Pin", "R [Ω]", "Straight [V]", "Cross [V]", "Power scan", "Saved values")):
             ttk.Label(body, text=title).grid(row=2, column=column, sticky="w", padx=(0, 14), pady=(0, 4))
-        pin_vars, straight_vars, cross_vars = {}, {}, {}
+        pin_vars, straight_vars, cross_vars, resistance_vars = {}, {}, {}, {}
+        resistances = self.controller.settings["heater_resistance_ohm"]
         choices = ("Unassigned",) + tuple(str(pin) for pin in range(16))
 
         def forget_calibration(names, state=None):
@@ -1069,18 +1195,22 @@ class BenesApp(tk.Tk):
             cross_vars[name] = tk.StringVar(value="" if calibration["cross"] is None else f"{calibration['cross']:.2f}")
             ttk.Label(body, text=name).grid(row=row, column=0, sticky="w", padx=(0, 14), pady=2)
             ttk.Combobox(body, textvariable=pin_vars[name], values=choices, state="readonly", width=12).grid(row=row, column=1, sticky="w", padx=(0, 14), pady=2)
+            # Blank uses the default resistance below.
+            resistance = None if pin is None else resistances.get(str(pin))
+            resistance_vars[name] = tk.StringVar(value="" if resistance is None else f"{resistance:g}")
+            ttk.Entry(body, textvariable=resistance_vars[name], width=8).grid(row=row, column=2, sticky="w", padx=(0, 14), pady=2)
             straight_cell = ttk.Frame(body)
-            straight_cell.grid(row=row, column=2, sticky="w", padx=(0, 14), pady=2)
+            straight_cell.grid(row=row, column=3, sticky="w", padx=(0, 14), pady=2)
             ttk.Entry(straight_cell, textvariable=straight_vars[name], width=10).pack(side="left")
             ttk.Button(straight_cell, text="×", width=2,
                        command=lambda n=name: forget_calibration((n,), "straight")).pack(side="left", padx=(3, 0))
             cross_cell = ttk.Frame(body)
-            cross_cell.grid(row=row, column=3, sticky="w", pady=2)
+            cross_cell.grid(row=row, column=4, sticky="w", pady=2)
             ttk.Entry(cross_cell, textvariable=cross_vars[name], width=10).pack(side="left")
             ttk.Button(cross_cell, text="×", width=2,
                        command=lambda n=name: forget_calibration((n,), "cross")).pack(side="left", padx=(3, 0))
-            ttk.Button(body, text="Scan...", command=lambda n=name: self.show_power_scan(dialog, n, pin_vars[n], straight_vars[n], cross_vars[n])).grid(row=row, column=4, sticky="w", padx=(14, 0), pady=2)
-            ttk.Button(body, text="Forget", command=lambda n=name: forget_calibration((n,))).grid(row=row, column=5, sticky="w", padx=(14, 0), pady=2)
+            ttk.Button(body, text="Scan...", command=lambda n=name: self.show_power_scan(dialog, n, pin_vars[n], straight_vars[n], cross_vars[n])).grid(row=row, column=5, sticky="w", padx=(14, 0), pady=2)
+            ttk.Button(body, text="Forget", command=lambda n=name: forget_calibration((n,))).grid(row=row, column=6, sticky="w", padx=(14, 0), pady=2)
 
         def save_mapping():
             try:
@@ -1088,17 +1218,30 @@ class BenesApp(tk.Tk):
                 self.controller.set_mapping(mapping)
                 for name in self.network.switches:
                     self.controller.set_calibration(name, straight_vars[name].get(), cross_vars[name].get())
+                self.controller.set_heater_resistances(
+                    {mapping[name]: resistance_vars[name].get() for name in self.network.switches
+                     if mapping[name] is not None},
+                    default_resistance_var.get())
             except ValueError as error:
                 messagebox.showerror("Invalid mapping or calibration", str(error), parent=dialog)
                 return
             self.apply_calibration()
             dialog.destroy()
             self.draw()
+            self.replot_crosstalk_x_axis()
             self.update_hardware_status("Mapping saved")
             self.refresh(keep_selection=True)
 
+        default_resistance = self.controller.settings["default_heater_resistance_ohm"]
+        default_resistance_var = tk.StringVar(value="" if default_resistance is None else f"{default_resistance:g}")
+        default_row = ttk.Frame(body)
+        default_row.grid(row=3 + len(self.network.switches), column=0, columnspan=7, sticky="w", pady=(12, 0))
+        ttk.Label(default_row, text="Default R [Ω]").pack(side="left")
+        ttk.Entry(default_row, textvariable=default_resistance_var, width=8).pack(side="left", padx=(8, 12))
+        ttk.Label(default_row, text="Heater resistance for power plots (P = V²/R); used for pins with a blank R.",
+                  foreground="#9baec6").pack(side="left")
         buttons = ttk.Frame(body)
-        buttons.grid(row=3 + len(self.network.switches), column=0, columnspan=6, sticky="e", pady=(16, 0))
+        buttons.grid(row=4 + len(self.network.switches), column=0, columnspan=7, sticky="e", pady=(16, 0))
         ttk.Button(buttons, text="Forget all calibrations", command=forget_all_calibrations).pack(side="left", padx=(0, 18))
         ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right")
         ttk.Button(buttons, text="Save", command=save_mapping).pack(side="right", padx=6)
