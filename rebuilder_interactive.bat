@@ -67,6 +67,12 @@ if defined ICON (
 ) else (
     echo No .ico file found; using default executable icon.
 )
+rem Bundle sibling-project helpers that are loaded by file path at runtime,
+rem plus pyserial, which PyInstaller cannot discover through them.
+set "SIBLINGARG="
+if exist "%~dp0..\VoltageTuner\board.py" set "SIBLINGARG=!SIBLINGARG! --add-data "%~dp0..\VoltageTuner\board.py;VoltageTuner""
+if exist "%~dp0..\ThorlabsControl\ArduinoSampler.py" set "SIBLINGARG=!SIBLINGARG! --add-data "%~dp0..\ThorlabsControl\ArduinoSampler.py;ThorlabsControl""
+if defined SIBLINGARG set "SIBLINGARG=!SIBLINGARG! --hidden-import serial"
 set "MODEARG=--console"
 if "%WINDOWED%"=="1" set "MODEARG=--windowed"
 
@@ -89,7 +95,7 @@ if errorlevel 1 (
 echo.
 echo Starting build. Full output will be saved to rebuilder_build.log
 rem Do not group this command in parentheses: it contains user-selected paths.
-python -m PyInstaller --noconfirm --clean --onefile !MODEARG! --name "!EXE_NAME!" !ICONARG! !ICONDATAARG! !HOOKARG! "!PY_FILE!" >"%~dp0rebuilder_build.log" 2>&1
+python -m PyInstaller --noconfirm --clean --onefile !MODEARG! --name "!EXE_NAME!" !ICONARG! !ICONDATAARG! !HOOKARG! !SIBLINGARG! "!PY_FILE!" >"%~dp0rebuilder_build.log" 2>&1
 if errorlevel 1 (
     echo.
     echo PyInstaller failed. Last 30 lines of the log:

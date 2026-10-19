@@ -84,6 +84,24 @@ measured switch, and `crosstalk_dataset.csv` with the comment. The folder uses
 the selected destination, or the currently reached output when **Trace current**
 is selected. The summary records the actual reached output separately.
 
+### Automatic 0 V path calibration
+
+The **Crosstalk** tab also has **Calibrate selected 0 V path**. It is an Arduino
+power-meter workflow designed to minimize thermal crosstalk: choose an input and
+its matching 0 V output in **Route explorer**, mark that output as **Power Meter
+output**, and include 0 V in the scan range. The routine first sends every MZI to
+0 V, then sweeps the selected path in reverse order (output-side switch first).
+For each MZI it stores the measured maximum as **cross** and minimum as
+**straight**, returns that MZI to 0 V, and then advances to the next one. Every
+MZI is forced back to 0 V even if a measurement fails.
+
+For thermally quiet calibration, the routine does not use heated steering MZIs.
+For this six-port topology, the minimum complete default-cross plan is four
+input/output pairs: **1 → 5**, **2 → 6**, **3 → 3**, and **6 → 2**. Together their
+paths cover all twelve MZIs. The tab prompts the required next connection after
+each completed path. Choose the settling time and the number of Arduino burst
+averages per voltage point before starting a path.
+
 - Click an **input** to highlight its actual path and current output.
 - Click an **output**, or choose a destination above the diagram, to enumerate every physical path between the selected ports. Select **Trace current** to return to the actual route.
 - The route list gives the required switch states: **=** means straight; **X** means cross. Switches absent from a route may have either state.

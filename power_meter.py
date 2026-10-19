@@ -9,6 +9,8 @@ import math
 from pathlib import Path
 from typing import Callable
 
+from voltage_controller import app_dir, sibling_module_path
+
 
 @dataclass(frozen=True)
 class PowerReading:
@@ -24,7 +26,7 @@ class ArduinoPowerMeter:
     """Connect to the free-running Arduino ADC and average a timed sample burst."""
 
     def __init__(self, config_path: Path | None = None, sampler_loader: Callable[[], object] | None = None):
-        self.config_path = config_path or Path(__file__).with_name("benes_power_meter_config.json")
+        self.config_path = config_path or app_dir() / "benes_power_meter_config.json"
         self._sampler_loader = sampler_loader
         self.sampler = None
         self.serial = None
@@ -123,7 +125,7 @@ class ArduinoPowerMeter:
 
     @staticmethod
     def _load_sampler() -> object:
-        sampler_path = Path(__file__).resolve().parent.parent / "ThorlabsControl" / "ArduinoSampler.py"
+        sampler_path = sibling_module_path("ThorlabsControl", "ArduinoSampler.py")
         if not sampler_path.exists():
             raise RuntimeError(f"ThorlabsControl Arduino sampler was not found at {sampler_path}")
         spec = importlib.util.spec_from_file_location("benes_thorlabs_arduino_sampler", sampler_path)

@@ -2,8 +2,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from calibration_scan import (scan_switch, scan_switches, scan_switches_with_reader,
+from calibration_scan import (calibrate_default_cross_path, minimum_default_cross_pairs,
+                              scan_switch, scan_switches, scan_switches_with_reader,
                               scan_voltages, spectrum_scan_point)
+from network import BenesNetwork
 
 
 class FakeController:
@@ -21,6 +23,9 @@ class FakeController:
     def drive_voltage(self, name, voltage):
         self.sent.append(voltage)
         self.applied_voltages[name] = voltage
+
+    def set_calibration(self, name, straight, cross):
+        self.settings.setdefault("calibration", {})[name] = {"straight": straight, "cross": cross}
 
 
 class FakeMeter:
@@ -95,6 +100,34 @@ class CalibrationScanTests(unittest.TestCase):
     def test_osa_reader_rejects_bad_spectrum(self):
         with self.assertRaisesRegex(ValueError, "mismatched"):
             spectrum_scan_point(0, ([1550.0], []))
+
+    def test_minimum_default_cross_plan_covers_every_switch_with_four_pairs(self):
+        network = BenesNetwork()
+        plan = minimum_default_cross_pairs(network)
+        self.assertEqual(len(plan), 4)
+        self.assertEqual([(source + 1, output + 1) for source, output, _ in plan],
+                         [(1, 5), (2, 6), (3, 3), (6, 2)])
+        self.assertEqual(set().union(*(set(names) for _, _, names in plan)), set(network.switches))
+
+    @patch("calibration_scan.time.sleep")
+    def test_default_cross_path_calibration_averages_and_resets_every_mzi(self, _sleep):
+        network = BenesNetwork()
+        controller = FakeController()
+        controller.settings["mapping"] = {name: index for index, name in enumerate(network.switches)}
+        readings = iter([10, 14, 1, 3, 5, 7] * 4)
+        meter = SimpleNamespace(connected=True, read_current_power=lambda: SimpleNamespace(value=next(readings)))
+        result = calibrate_default_cross_path(controller, meter, network, 0, 4, [0, 1, 2], 0, averages=2)
+        self.assertEqual(list(result), ["S5.3", "S4.2", "S3.2", "S1.1"])
+        self.assertEqual([point.power for point in result["S5.3"].points], [12, 2, 6])
+        self.assertEqual(controller.settings["calibration"]["S5.3"], {"straight": 1, "cross": 0})
+        self.assertTrue(all(controller.applied_voltages[name] == 0 for name in network.switches))
+
+    def test_default_cross_path_calibration_requires_the_selected_zero_voltage_output(self):
+        network = BenesNetwork()
+        controller = FakeController()
+        controller.settings["mapping"] = {name: index for index, name in enumerate(network.switches)}
+        with self.assertRaisesRegex(ValueError, "reaches output 5"):
+            calibrate_default_cross_path(controller, FakeMeter(), network, 0, 0, [0, 1], 0)
 
 
 if __name__ == "__main__":

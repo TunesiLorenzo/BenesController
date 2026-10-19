@@ -8,12 +8,14 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from network import BenesNetwork
-from calibration_scan import scan_switch, scan_switches, scan_switches_with_reader, scan_voltages, spectrum_scan_point
+from calibration_scan import (calibrate_default_cross_path, minimum_default_cross_pairs,
+                              scan_switch, scan_switches, scan_switches_with_reader,
+                              scan_voltages, spectrum_scan_point, zero_voltage_paths)
 from crosstalk_results import create_result_folder, save_scan_artifacts, scan_context
 import osa
 from power_meter import ArduinoPowerMeter
 from spectrum_export import write_crosstalk_csv, write_spectra
-from voltage_controller import BenesVoltageController
+from voltage_controller import BenesVoltageController, app_dir
 
 
 BG = "#101827"
@@ -30,8 +32,10 @@ class BenesApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Beneš • 6 × 6 route explorer")
-        self.geometry("1320x960")
-        self.minsize(1120, 840)
+        # The diagram reflows with the canvas, so it remains usable on a laptop
+        # display instead of requiring a wide desktop window.
+        self.geometry("1180x880")
+        self.minsize(900, 700)
         self.configure(bg=BG)
         self.network = BenesNetwork()
         self.controller = BenesVoltageController(tuple(self.network.switches))
@@ -42,6 +46,8 @@ class BenesApp(tk.Tk):
         self.crosstalk_data_source = None
         self.crosstalk_data_unit = None
         self.crosstalk_result_folder = None
+        self.active_scan_kind = "Crosstalk scan"
+        self.next_connection_prompt = None
         self.source = 0
         self.destination = None
         self.routes = []
@@ -94,7 +100,7 @@ class BenesApp(tk.Tk):
         self.crosstalk_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.route_tab, text="Route explorer")
         self.notebook.add(self.hardware_tab, text="Boards & measurement")
-        self.notebook.add(self.crosstalk_tab, text="Crosstalk")
+        self.notebook.add(self.crosstalk_tab, text="Crosstalk & calibration")
 
         controls = ttk.Frame(self.route_tab, padding=(24, 8))
         controls.pack(fill="x")
@@ -170,8 +176,15 @@ class BenesApp(tk.Tk):
         self.read_power_button.grid(row=1, column=6, sticky="w", pady=(10, 0))
         ttk.Label(arduino, textvariable=self.power_reading_var, font=("Segoe UI", 10, "bold")).grid(row=2, column=0, columnspan=8, sticky="w", pady=(12, 0))
 
-        scan_controls = ttk.LabelFrame(self.crosstalk_tab, text="Sequential switch scan", padding=18)
-        scan_controls.pack(side="left", fill="y", padx=(24, 12), pady=18)
+        # Keep the two workflows in separate panels.  Appending automatic
+        # calibration below the sequential form made its start button fall off
+        # the bottom of a normal laptop window.
+        scan_tabs = ttk.Notebook(self.crosstalk_tab)
+        scan_tabs.pack(side="left", fill="y", padx=(24, 12), pady=18)
+        scan_controls = ttk.Frame(scan_tabs, padding=18)
+        path_controls = ttk.Frame(scan_tabs, padding=18)
+        scan_tabs.add(scan_controls, text="Sequential scan")
+        scan_tabs.add(path_controls, text="Automatic path")
         ttk.Label(scan_controls, text="Select switches (Ctrl or Shift for multiple)").grid(row=0, column=0, columnspan=2, sticky="w")
         self.crosstalk_switches = tk.Listbox(scan_controls, selectmode="extended", exportselection=False,
                                              height=len(self.network.switches), width=18, bg=PANEL, fg=TEXT,
@@ -201,40 +214,73 @@ class BenesApp(tk.Tk):
         self.crosstalk_export_button.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(0, 10))
         self.crosstalk_status = tk.StringVar(value="Connect the voltage board and select a measurement source.")
         ttk.Label(scan_controls, textvariable=self.crosstalk_status, wraplength=245).grid(row=11, column=0, columnspan=2, sticky="w")
+
+        self.default_cross_plan = minimum_default_cross_pairs(self.network)
+        plan = self.default_cross_plan
+        plan_text = ", ".join(f"{source + 1}→{output + 1}" for source, output, _ in plan)
+        ttk.Label(path_controls, text="Automatic default-cross calibration", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(path_controls, text=("Choose an input and its 0 V output in Route explorer. The sweep starts at the end switch; every non-target MZI remains at 0 V."), wraplength=270).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 10))
+        for row, label in enumerate(("Lower limit [V]", "Upper limit [V]", "Step [V]", "Settle [ms]"), start=2):
+            ttk.Label(path_controls, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            ttk.Entry(path_controls, textvariable=self.crosstalk_fields[label], width=12).grid(row=row, column=1, sticky="w", padx=(10, 0), pady=3)
+        self.path_averages_var = tk.StringVar(value="3")
+        ttk.Label(path_controls, text="Burst averages / point").grid(row=6, column=0, sticky="w", pady=(8, 5))
+        ttk.Entry(path_controls, textvariable=self.path_averages_var, width=7).grid(row=6, column=1, sticky="w", padx=(10, 0), pady=(8, 5))
+        ttk.Label(path_controls, text="Scan comment").grid(row=7, column=0, sticky="w", pady=3)
+        ttk.Entry(path_controls, textvariable=self.crosstalk_comment_var, width=19).grid(row=7, column=1, sticky="w", padx=(10, 0), pady=3)
+        self.path_calibration_button = ttk.Button(path_controls, text="Calibrate selected default-cross path", command=self.start_path_calibration)
+        self.path_calibration_button.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 6))
+        ttk.Label(path_controls, text=f"Minimum all-switch plan: {len(plan)} pairs — {plan_text}", wraplength=270).grid(row=9, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Label(path_controls, textvariable=self.crosstalk_status, wraplength=270).grid(row=10, column=0, columnspan=2, sticky="w")
         self.crosstalk_plot_frame = ttk.Frame(self.crosstalk_tab, padding=(0, 18, 18, 18))
         self.crosstalk_plot_frame.pack(side="left", fill="both", expand=True)
         ttk.Label(self.crosstalk_plot_frame, text="Power versus voltage will appear here after a scan.").pack(anchor="center", expand=True)
 
-        self.status = ttk.Label(self.route_tab, font=("Segoe UI", 12, "bold"), padding=(24, 8))
+        # Keep every routing action beside the diagram.  The old stacked layout
+        # let the canvas consume the window height and clipped these controls.
+        self.status = ttk.Label(self.route_tab, font=("Segoe UI", 11, "bold"), padding=(24, 4))
         self.status.pack(fill="x")
-        self.canvas = tk.Canvas(self.route_tab, bg=BG, highlightthickness=0, height=355)
-        self.canvas.pack(fill="both", expand=True, padx=12)
-        self.canvas.bind("<Configure>", lambda event: self.draw())
-
-        ttk.Label(self.route_tab, text="Green switches have both bar and cross voltages saved. Click a switch to toggle it. Type a voltage and press Enter to send it.", padding=(24, 6)).pack(anchor="w")
-        bottom = ttk.Frame(self.route_tab, padding=(24, 4, 24, 12))
-        bottom.pack(fill="x")
-        left = ttk.Frame(bottom)
-        left.pack(side="left", fill="both", expand=True)
-        self.route_label = ttk.Label(left, text="")
-        self.route_label.pack(anchor="w")
-        self.route_list = tk.Listbox(left, height=4, bg=PANEL, fg=TEXT, selectbackground="#315b78", selectforeground="white", font=("Consolas", 10), exportselection=False, borderwidth=0, highlightthickness=0)
-        self.route_list.pack(fill="x", pady=6)
-        self.route_list.bind("<<ListboxSelect>>", self.select_route)
-        ttk.Button(left, text="Apply selected path to switches", command=self.apply_route).pack(anchor="w")
-        right = ttk.Frame(bottom, padding=(24, 0, 0, 0))
-        right.pack(side="right", fill="y")
-        ttk.Label(right, text="Route a complete permutation", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        ttk.Label(right, text="Desired outputs for inputs 1, 2, 3, 4, 5, 6").pack(anchor="w", pady=4)
-        self.permutation = ttk.Entry(right, width=32)
-        self.permutation.insert(0, "1 2 3 4 5 6")
-        self.permutation.pack(anchor="w", pady=4)
-        buttons = ttk.Frame(right)
-        buttons.pack(anchor="w")
-        ttk.Button(buttons, text="Route permutation", command=self.route_permutation).pack(side="left")
-        ttk.Button(buttons, text="Shuffle", command=self.shuffle).pack(side="left", padx=6)
-        self.mapping_label = ttk.Label(self.route_tab, padding=(24, 6, 24, 14))
+        self.mapping_label = ttk.Label(self.route_tab, padding=(24, 2, 24, 6))
         self.mapping_label.pack(fill="x")
+
+        route_body = ttk.Frame(self.route_tab, padding=(12, 0, 12, 10))
+        route_body.pack(fill="both", expand=True)
+        route_sidebar = ttk.LabelFrame(route_body, text="Routing controls", padding=(12, 8), width=285)
+        route_sidebar.pack(side="right", fill="y", padx=(12, 0))
+        route_sidebar.pack_propagate(False)
+
+        self.route_label = ttk.Label(route_sidebar, text="", wraplength=255, justify="left")
+        self.route_label.pack(anchor="w", fill="x")
+        route_list_frame = ttk.Frame(route_sidebar)
+        route_list_frame.pack(fill="both", expand=True, pady=(6, 8))
+        self.route_list = tk.Listbox(route_list_frame, height=7, bg=PANEL, fg=TEXT,
+                                     selectbackground="#315b78", selectforeground="white",
+                                     font=("Consolas", 9), exportselection=False, borderwidth=0,
+                                     highlightthickness=0)
+        route_scrollbar = ttk.Scrollbar(route_list_frame, orient="vertical", command=self.route_list.yview)
+        self.route_list.configure(yscrollcommand=route_scrollbar.set)
+        self.route_list.pack(side="left", fill="both", expand=True)
+        route_scrollbar.pack(side="right", fill="y")
+        self.route_list.bind("<<ListboxSelect>>", self.select_route)
+        ttk.Button(route_sidebar, text="Apply selected path", command=self.apply_route).pack(anchor="w", fill="x")
+
+        ttk.Separator(route_sidebar, orient="horizontal").pack(fill="x", pady=10)
+        ttk.Label(route_sidebar, text="Route complete permutation", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(route_sidebar, text="Outputs for inputs 1, 2, 3, 4, 5, 6", wraplength=255).pack(anchor="w", pady=(3, 2))
+        self.permutation = ttk.Entry(route_sidebar)
+        self.permutation.insert(0, "1 2 3 4 5 6")
+        self.permutation.pack(anchor="w", fill="x", pady=(0, 5))
+        buttons = ttk.Frame(route_sidebar)
+        buttons.pack(anchor="w", fill="x")
+        ttk.Button(buttons, text="Route permutation", command=self.route_permutation).pack(side="left", fill="x", expand=True)
+        ttk.Button(buttons, text="Shuffle", command=self.shuffle).pack(side="left", padx=(6, 0))
+
+        diagram = ttk.Frame(route_body)
+        diagram.pack(side="left", fill="both", expand=True)
+        self.canvas = tk.Canvas(diagram, bg=BG, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<Configure>", lambda event: self.draw())
+        ttk.Label(diagram, text="Green switches have saved bar and cross voltages. Click a switch to toggle it; type a voltage and press Enter to send it.", padding=(4, 5), wraplength=680).pack(anchor="w", fill="x")
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.refresh()
 
@@ -382,6 +428,129 @@ class BenesApp(tk.Tk):
             f"(ADC mean {reading.raw_mean:.2f}, {reading.sample_count} samples)"
         )
 
+    def start_path_calibration(self):
+        """Sweep the selected zero-volt optical path, starting at its final MZI."""
+        try:
+            if self.destination is None:
+                raise ValueError("Choose both an input and a destination output in Route explorer")
+            if not self.controller.connected or self.controller.settings["dry_run"]:
+                raise RuntimeError("Connect the physical voltage board first")
+            if not self.power_meter.connected:
+                raise RuntimeError("Connect the Arduino power meter first")
+            if self.read_power_button.instate(["disabled"]):
+                raise RuntimeError("Wait for the current Arduino power reading to finish")
+            meter_output = self.detector_port(self.power_meter_output_var)
+            if meter_output != self.destination:
+                raise ValueError("Set Power Meter output to the selected destination output before calibrating")
+            fields = self.crosstalk_fields
+            voltages = scan_voltages(*(float(fields[key].get()) for key in
+                                       ("Lower limit [V]", "Upper limit [V]", "Step [V]")))
+            if 0.0 not in voltages:
+                raise ValueError("Include 0 V in the calibration range to verify the default cross state")
+            settle_ms = float(fields["Settle [ms]"].get())
+            if not 0 <= settle_ms <= 10000:
+                raise ValueError("Settling time must be between 0 and 10000 ms")
+            averages = int(self.path_averages_var.get())
+            if not 1 <= averages <= 100:
+                raise ValueError("Burst averages must be an integer from 1 to 100")
+            zero_route = zero_voltage_paths(self.network)[self.source]
+            if zero_route.rows[-1] != self.destination:
+                raise ValueError(
+                    f"At 0 V, input {self.source + 1} reaches output {zero_route.rows[-1] + 1}; "
+                    "select that output so all non-target MZIs can remain at 0 V"
+                )
+            names = [name for name, _ in reversed(zero_route.states)]
+            for name in self.network.switches:
+                if self.controller.settings["mapping"].get(name) is None:
+                    raise ValueError(f"Assign a voltage-board pin to every MZI before automatic path calibration ({name} is unassigned)")
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk  # noqa: F401
+            from matplotlib.figure import Figure  # noqa: F401
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            messagebox.showerror("Path calibration unavailable", str(error), parent=self)
+            return
+
+        zero_states = dict.fromkeys(self.network.switches, True)
+        context = scan_context(
+            self.network, self.source, self.destination,
+            meter_output, self.detector_port(self.osa_output_var), self.controller,
+            names, voltages, settle_ms, "Arduino", self.crosstalk_comment_var.get().strip(),
+            states=zero_states,
+        )
+        context["calibration_mode"] = "default_cross_path"
+        context["burst_averages_per_point"] = averages
+        try:
+            result_folder = create_result_folder(app_dir(), context)
+            save_scan_artifacts(result_folder, context, {}, "Arduino", self.power_meter.settings["unit"],
+                                self.network, status="in_progress")
+        except (OSError, RuntimeError, ValueError) as error:
+            messagebox.showerror("Calibration results unavailable", str(error), parent=self)
+            return
+
+        self.active_scan_kind = "Path calibration"
+        self.crosstalk_running = True
+        self.crosstalk_data = {}
+        self.crosstalk_data_source = None
+        self.crosstalk_data_unit = None
+        self.crosstalk_result_folder = result_folder
+        self.crosstalk_button.configure(state="disabled")
+        self.path_calibration_button.configure(state="disabled")
+        self.crosstalk_export_button.configure(state="disabled")
+        self.crosstalk_switches.configure(state="disabled")
+        self.crosstalk_source_box.configure(state="disabled")
+        self.notebook.tab(self.route_tab, state="disabled")
+        self.notebook.tab(self.hardware_tab, state="disabled")
+        self.crosstalk_status.set(
+            f"Calibrating {len(names)} MZI(s), from output back to input; "
+            f"{averages} burst average(s) per point..."
+        )
+        self.prepare_crosstalk_plots(voltages)
+        data = {}
+
+        def on_point(name, index, total, point):
+            data.setdefault(name, []).append(point)
+            self.after(0, lambda: self.add_crosstalk_point(
+                name, point, index, total, "Arduino", self.power_meter.settings["unit"]
+            ))
+
+        def worker():
+            try:
+                results = calibrate_default_cross_path(
+                    self.controller, self.power_meter, self.network, self.source, self.destination,
+                    voltages, settle_ms / 1000, averages, on_point,
+                )
+                context["calibration_results"] = {
+                    name: {
+                        "cross_voltage_v": result.cross.voltage,
+                        "cross_power": result.cross.power,
+                        "straight_voltage_v": result.straight.voltage,
+                        "straight_power": result.straight.power,
+                    }
+                    for name, result in results.items()
+                }
+            except Exception as error:
+                self.after(0, lambda message=str(error): self.finish_path_calibration(
+                    names, data, result_folder, context, message
+                ))
+            else:
+                self.after(0, lambda: self.finish_path_calibration(names, data, result_folder, context))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_path_calibration(self, names, data, folder, context, error=None):
+        # The worker has forced every hardware output to 0 V, which is cross.
+        self.network.states = dict.fromkeys(self.network.switches, True)
+        for name in self.network.switches:
+            self.voltage_vars[name].set("0.00")
+        self.refresh(keep_selection=True)
+        if error is None:
+            current = (self.source, self.destination)
+            pairs = [(source, output) for source, output, _ in self.default_cross_plan]
+            if current in pairs:
+                index = pairs.index(current)
+                self.next_connection_prompt = pairs[index + 1] if index + 1 < len(pairs) else "complete"
+        self.finish_crosstalk_scan(names, data, "Arduino", self.power_meter.settings["unit"],
+                                   folder, context, error)
+
     def start_crosstalk_scan(self):
         names = [self.crosstalk_switches.get(index) for index in self.crosstalk_switches.curselection()]
         source = self.crosstalk_source.get()
@@ -428,19 +597,21 @@ class BenesApp(tk.Tk):
             self.controller, names, voltages, settle_ms, source, self.crosstalk_comment_var.get().strip(),
         )
         try:
-            result_folder = create_result_folder(Path(__file__).resolve().parent, context)
+            result_folder = create_result_folder(app_dir(), context)
             save_scan_artifacts(result_folder, context, {}, source, response_unit, self.network,
                                 status="in_progress")
         except (OSError, RuntimeError, ValueError) as error:
             messagebox.showerror("Crosstalk results unavailable", str(error), parent=self)
             return
 
+        self.active_scan_kind = "Crosstalk scan"
         self.crosstalk_running = True
         self.crosstalk_data = {}
         self.crosstalk_data_source = None
         self.crosstalk_data_unit = None
         self.crosstalk_result_folder = result_folder
         self.crosstalk_button.configure(state="disabled")
+        self.path_calibration_button.configure(state="disabled")
         self.crosstalk_export_button.configure(state="disabled")
         self.crosstalk_switches.configure(state="disabled")
         self.crosstalk_source_box.configure(state="disabled")
@@ -501,6 +672,7 @@ class BenesApp(tk.Tk):
     def complete_crosstalk_scan(self, data, folder, scan_error=None, save_error=None):
         self.crosstalk_running = False
         self.crosstalk_button.configure(state="normal")
+        self.path_calibration_button.configure(state="normal")
         self.crosstalk_switches.configure(state="normal")
         self.crosstalk_source_box.configure(state="readonly")
         self.notebook.tab(self.route_tab, state="normal")
@@ -508,14 +680,34 @@ class BenesApp(tk.Tk):
         if data:
             self.crosstalk_export_button.configure(state="normal")
         if scan_error:
-            self.crosstalk_status.set(f"Scan stopped: {scan_error}. Results: {folder}")
-            messagebox.showerror("Crosstalk scan failed", scan_error, parent=self)
+            self.crosstalk_status.set(f"{self.active_scan_kind} stopped: {scan_error}. Results: {folder}")
+            messagebox.showerror(f"{self.active_scan_kind} failed", scan_error, parent=self)
         elif save_error:
-            self.crosstalk_status.set(f"Scan finished, but automatic export failed: {save_error}")
+            self.crosstalk_status.set(f"{self.active_scan_kind} finished, but automatic export failed: {save_error}")
         else:
-            self.crosstalk_status.set(f"Scan complete. Results: {folder}")
+            self.crosstalk_status.set(f"{self.active_scan_kind} complete. Results: {folder}")
         if save_error:
             messagebox.showerror("Crosstalk export failed", f"{save_error}\nFolder: {folder}", parent=self)
+        if self.next_connection_prompt is not None:
+            next_connection = self.next_connection_prompt
+            self.next_connection_prompt = None
+            if next_connection == "complete":
+                messagebox.showinfo(
+                    "Default-cross plan complete",
+                    "The final default-cross I/O path is calibrated. All MZIs are currently at 0 V.",
+                    parent=self,
+                )
+            else:
+                input_port, output_port = next_connection
+                messagebox.showinfo(
+                    "Select the next fiber connection",
+                    f"Next default-cross path:\n\n"
+                    f"Input {input_port + 1} — Fiber {15 - input_port}\n"
+                    f"Output {output_port + 1} — Fiber {4 + output_port}\n\n"
+                    f"Select In {input_port + 1} and Out {output_port + 1} in Route explorer, "
+                    f"then set Power Meter output to Out {output_port + 1}.",
+                    parent=self,
+                )
 
     def prepare_crosstalk_plots(self, voltages):
         for child in self.crosstalk_plot_frame.winfo_children():
@@ -912,21 +1104,33 @@ class BenesApp(tk.Tk):
             entry.destroy()
         self.switch_voltage_entries = {}
         c.delete("all")
-        width, height = max(c.winfo_width(), 1080), max(c.winfo_height(), 300)
-        self.ys = [58 + i * (height - 100) / 5 for i in range(6)]
-        self.xs = [140 + i * (width - 330) / 4 for i in range(5)]
-        self.left_x, self.right_x = 65, width - 65
-        half = 24
+        width, height = c.winfo_width(), c.winfo_height()
+        # Tk initially reports a 1x1 canvas before its first layout pass.
+        if width < 500 or height < 220:
+            return
+        scale = min(1.0, width / 1180, height / 355)
+        font_small = ("Segoe UI", max(7, round(8 * scale)))
+        font_normal = ("Segoe UI", max(8, round(9 * scale)))
+        font_heading = ("Segoe UI", max(9, round(10 * scale)), "bold")
+        self.left_x = max(58, round(78 * scale))
+        self.right_x = width - self.left_x
+        first_stage = self.left_x + max(65, round(75 * scale))
+        last_stage = self.right_x - max(88, round(125 * scale))
+        self.xs = [first_stage + i * (last_stage - first_stage) / 4 for i in range(5)]
+        top, bottom = max(48, round(58 * scale)), max(47, round(55 * scale))
+        self.ys = [top + i * (height - top - bottom) / 5 for i in range(6)]
+        half = max(17, round(24 * scale))
+        self.switch_half = half
         # Group the three middle stages into two independent 3x3 networks.
         for first, last, label in ((0, 2, "Upper 3×3"), (3, 5, "Lower 3×3")):
             c.create_rectangle(self.xs[1] - 65, self.ys[first] - 38,
                                self.xs[3] + 65, self.ys[last] + 26,
                                fill="#131e30", outline="#33465f", dash=(5, 4))
             c.create_text(self.xs[2], self.ys[last] + 17, text=label,
-                          fill="#9baec6", font=("Segoe UI", 9))
+                          fill="#9baec6", font=font_normal)
         for stage, pairs in enumerate(self.network.pairs):
             x = self.xs[stage]
-            c.create_text(x, 16, text=f"STAGE {stage + 1}", fill="#9baec6", font=("Segoe UI", 10, "bold"))
+            c.create_text(x, max(14, round(16 * scale)), text=f"STAGE {stage + 1}", fill="#9baec6", font=font_heading)
             for row, y in enumerate(self.ys):
                 if stage == 0:
                     c.create_line(self.left_x + 18, y, x - half, y, fill=WIRE, width=2)
@@ -934,7 +1138,7 @@ class BenesApp(tk.Tk):
                 c.create_line(x + half, y, next_x, self.ys[self.network.links[stage][row]], fill=WIRE, width=2)
                 if (stage, row) not in self.network.at:
                     c.create_line(x - half, y, x + half, y, fill=WIRE, width=2)
-                    c.create_text(x, y + 13, text="bypass", fill="#8393a9", font=("Segoe UI", 8))
+                    c.create_text(x, y + round(13 * scale), text="bypass", fill="#8393a9", font=font_small)
             for index, (a, b) in enumerate(pairs):
                 name = f"S{stage + 1}.{index + 1}"
                 crossed = self.network.states[name]
@@ -944,12 +1148,12 @@ class BenesApp(tk.Tk):
                 c.create_rectangle(x - half, self.ys[a] - 12, x + half, self.ys[b] + 12, fill=PANEL, outline=ACCENT if calibrated else "#7790ad", width=2.5 if calibrated else 1.5, tags=tag)
                 for start, end in ((a, b), (b, a)) if crossed else ((a, a), (b, b)):
                     c.create_line(x - half, self.ys[start], x + half, self.ys[end], fill="#a4bad4", width=2, tags=tag)
-                c.create_text(x, self.ys[a] - 23, text=f"{name} {'X' if crossed else '='}", fill=ACCENT if calibrated else TEXT, font=("Segoe UI", 9), tags=tag)
+                c.create_text(x, self.ys[a] - round(23 * scale), text=f"{name} {'X' if crossed else '='}", fill=ACCENT if calibrated else TEXT, font=font_normal, tags=tag)
                 pin = self.controller.settings["mapping"][name]
-                c.create_text(x, self.ys[b] + 17, text=f"Pin {pin}" if pin is not None else "Unassigned", fill="#9baec6", font=("Segoe UI", 8))
-                entry = ttk.Entry(c, textvariable=self.voltage_vars[name], width=6, justify="center")
+                c.create_text(x, self.ys[b] + round(17 * scale), text=f"Pin {pin}" if pin is not None else "Unassigned", fill="#9baec6", font=font_small)
+                entry = ttk.Entry(c, textvariable=self.voltage_vars[name], width=5 if scale < 0.85 else 6, justify="center")
                 entry.bind("<Return>", lambda event, n=name: self.apply_voltage(n))
-                c.create_window(x, self.ys[b] + 33, window=entry)
+                c.create_window(x, self.ys[b] + round(33 * scale), window=entry)
                 self.switch_voltage_entries[name] = entry
                 c.tag_bind(tag, "<Button-1>", lambda event, n=name: self.toggle(n))
                 c.tag_bind(tag, "<Enter>", lambda event: c.configure(cursor="hand2"))
@@ -971,7 +1175,13 @@ class BenesApp(tk.Tk):
             ):
                 tag = f"{side}:{row}"
                 c.create_oval(x - 18, y - 18, x + 18, y + 18, fill=ACCENT if selected else PANEL, outline=ACCENT if selected else WIRE, width=2, tags=tag)
-                c.create_text(x, y, text=str(row + 1), fill=BG if selected else TEXT, font=("Segoe UI", 12, "bold"), tags=tag)
+                c.create_text(x, y, text=str(row + 1), fill=BG if selected else TEXT, font=("Segoe UI", max(10, round(12 * scale)), "bold"), tags=tag)
+                if side == "in":
+                    c.create_text(x - 25, y, text=f"In {row + 1}\nFiber {15 - row}", anchor="e",
+                                  fill="#9baec6", font=font_small)
+                else:
+                    c.create_text(x + 25, y, text=f"Out {row + 1}\nFiber {4 + row}", anchor="w",
+                                  fill="#9baec6", font=font_small)
                 if side == "out":
                     detector_colors = []
                     if row == self.detector_port(self.power_meter_output_var):
@@ -983,18 +1193,18 @@ class BenesApp(tk.Tk):
                         c.create_oval(x - radius, y - radius, x + radius, y + radius,
                                       outline=color, width=3, tags=tag)
                 c.tag_bind(tag, "<Button-1>", lambda event, r=row, fn=callback: fn(r))
-        c.create_text(self.left_x, 16, text="INPUT", fill=TEXT, font=("Segoe UI", 10, "bold"))
-        c.create_text(self.right_x, 16, text="OUTPUT", fill=TEXT, font=("Segoe UI", 10, "bold"))
+        c.create_text(self.left_x, max(14, round(16 * scale)), text="INPUT", fill=TEXT, font=font_heading)
+        c.create_text(self.right_x, max(14, round(16 * scale)), text="OUTPUT", fill=TEXT, font=font_heading)
 
     def draw_route(self, route, color, line_width, dashed=False):
         points = [self.left_x + 18, self.ys[route.rows[0]]]
         states = dict(route.states)
         for stage, row in enumerate(route.rows[:-1]):
             x = self.xs[stage]
-            points.extend((x - 24, self.ys[row]))
+            points.extend((x - self.switch_half, self.ys[row]))
             name = self.network.at.get((stage, row))
             exit_row = self.network.switch_output(stage, row, states[name] if name else False)
-            points.extend((x + 24, self.ys[exit_row]))
+            points.extend((x + self.switch_half, self.ys[exit_row]))
         points.extend((self.right_x - 18, self.ys[route.rows[-1]]))
         self.canvas.create_line(*points, fill=color, width=line_width, dash=(5, 5) if dashed else (), joinstyle="round", capstyle="round", state="disabled")
 

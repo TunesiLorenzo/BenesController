@@ -5,8 +5,23 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
+import sys
 from pathlib import Path
 from typing import Callable
+
+
+def app_dir() -> Path:
+    """Folder for settings and results: beside the exe when frozen, else beside the sources."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def sibling_module_path(project: str, filename: str) -> Path:
+    """Locate a helper from a sibling project, or the copy bundled into the exe."""
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS) / project / filename
+    return Path(__file__).resolve().parent.parent / project / filename
 
 
 DEFAULT_PORT = "COM4"
@@ -31,7 +46,7 @@ class BenesVoltageController:
         board_factory: Callable[..., object] | None = None,
     ):
         self.switch_names = tuple(switch_names)
-        self.config_path = config_path or Path(__file__).with_name("benes_voltage_config.json")
+        self.config_path = config_path or app_dir() / "benes_voltage_config.json"
         self._board_factory = board_factory
         self.board = None
         self.applied_voltages: dict[str, float] = {}
@@ -195,7 +210,7 @@ class BenesVoltageController:
 
     @staticmethod
     def _load_board_factory() -> Callable[..., object]:
-        board_path = Path(__file__).resolve().parent.parent / "VoltageTuner" / "board.py"
+        board_path = sibling_module_path("VoltageTuner", "board.py")
         if not board_path.exists():
             raise RuntimeError(f"VoltageTuner board module was not found at {board_path}")
         spec = importlib.util.spec_from_file_location("benes_voltage_tuner_board", board_path)

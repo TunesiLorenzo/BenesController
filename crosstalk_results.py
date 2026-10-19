@@ -16,9 +16,10 @@ ROUTE_COLOR = "#36b38f"
 
 
 def scan_context(network, input_port: int, output_port: int, power_meter_port: int | None,
-                 osa_port: int | None, controller, names, voltages, settle_ms, source, comment):
+                 osa_port: int | None, controller, names, voltages, settle_ms, source, comment,
+                 states=None):
     """Freeze route and voltage-board state before the scan changes any outputs."""
-    states = dict(network.states)
+    states = dict(network.states if states is None else states)
     route = network.trace(input_port, states)
     return {
         "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
