@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from voltage_controller import BenesVoltageController
+from network import BenesNetwork
 
 
 class FakeBoard:
@@ -28,7 +29,44 @@ class VoltageControllerTests(unittest.TestCase):
         self.temp.cleanup()
 
     def controller(self):
-        return BenesVoltageController(self.names, self.path, board_factory=FakeBoard)
+        return BenesVoltageController(self.names, self.path, board_factory=FakeBoard,
+                                      unsafe_voltage_authorizer=lambda name, voltage: True)
+
+    def test_unsafe_voltage_requires_approval_before_board_send(self):
+        controller = BenesVoltageController(self.names, self.path, board_factory=FakeBoard)
+        controller.connect()
+        with self.assertRaisesRegex(ValueError, "outside the default"):
+            controller.drive_voltage("S1.1", -1)
+        self.assertNotIn((0, -1.0), controller.board.sent)
+        with self.assertRaisesRegex(ValueError, "outside the default"):
+            controller.set_voltage("S1.1", 7)
+        self.assertEqual(controller.settings["voltage"]["S1.1"], 0.0)
+
+    def test_mirrored_edge_is_one_unpaced_write_on_a_real_serial_board(self):
+        class Serial:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, payload):
+                self.writes.append(payload)
+                return len(payload)
+
+        controller = self.controller()
+        controller.connect()
+        controller.board.serial = Serial()
+        target_time, mirror_time = controller.drive_with_mirror("S1.1", 2.5, 8)
+        self.assertEqual(controller.board.serial.writes, [b"DC 0 2.50\nDC 8 2.50\n"])
+        self.assertAlmostEqual(mirror_time - target_time, 10 * 10 / 115200)
+        guarded = BenesVoltageController(self.names, self.path, board_factory=FakeBoard)
+        guarded.connect()
+        with self.assertRaisesRegex(ValueError, "outside the default"):
+            guarded.drive_with_mirror("S1.1", 7, 8)
+        self.assertNotIn((0, 7.0), guarded.board.sent)
+
+    def test_new_default_mapping_reserves_pin_8(self):
+        names = tuple(BenesNetwork().switches)
+        controller = BenesVoltageController(names, self.path, board_factory=FakeBoard)
+        self.assertNotIn(8, controller.settings["mapping"].values())
 
     def test_mapping_and_voltage_persist(self):
         controller = self.controller()
@@ -66,6 +104,28 @@ class VoltageControllerTests(unittest.TestCase):
         self.assertEqual(controller.board.sent, [(0, 4.0), (0, -2.0)])
         self.assertIsNone(controller.apply_calibrated_state("S1.2", True))
         self.assertEqual(len(controller.board.sent), 2)
+
+    def test_forget_one_or_all_calibrations_persists_without_sending_voltage(self):
+        controller = self.controller()
+        controller.set_calibration("S1.1", straight=1, cross=2)
+        controller.set_calibration("S1.2", straight=3, cross=4)
+        controller.connect()
+        sent_before = list(controller.board.sent)
+
+        controller.clear_calibration(("S1.1",), "straight")
+        self.assertEqual(self.controller().settings["calibration"]["S1.1"],
+                         {"straight": None, "cross": 2.0})
+        controller.clear_calibration(("S1.1",))
+        self.assertEqual(controller.board.sent, sent_before)
+        self.assertIsNone(controller.apply_calibrated_state("S1.1", True))
+        self.assertEqual(self.controller().settings["calibration"]["S1.2"],
+                         {"straight": 3.0, "cross": 4.0})
+
+        controller.clear_calibration(self.names)
+        restored = self.controller()
+        self.assertTrue(all(values == {"straight": None, "cross": None}
+                            for values in restored.settings["calibration"].values()))
+        self.assertEqual(controller.board.sent, sent_before)
 
 
 if __name__ == "__main__":

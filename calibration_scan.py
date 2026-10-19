@@ -38,6 +38,10 @@ class PathCalibration:
     points: tuple[ScanPoint, ...]
     cross: ScanPoint
     straight: ScanPoint
+    sensitive_points: tuple[ScanPoint, ...] = ()
+    wide_points: tuple[ScanPoint, ...] = ()
+    # The sensitive rescan still hit the noise floor; straight is a best estimate.
+    straight_at_floor: bool = False
 
 
 def zero_voltage_paths(network):
@@ -98,16 +102,40 @@ def minimum_default_cross_pairs(network):
     raise RuntimeError("No set of default-cross paths covers every MZI")
 
 
-def _read_averaged_power(power_meter, averages: int) -> float:
-    values = [power_meter.read_current_power().value for _ in range(averages)]
+def next_default_cross_pair(plan, calibrated_switches):
+    """Choose the first planned path that still covers an uncalibrated MZI."""
+    covered = set(calibrated_switches)
+    for source, output, names in plan:
+        if any(name not in covered for name in names):
+            return source, output
+    return None
+
+
+def _read_averaged_power(power_meter, averages: int) -> tuple[float, bool, bool]:
+    readings = [power_meter.read_current_power() for _ in range(averages)]
+    values = [reading.value for reading in readings]
     if not all(math.isfinite(value) for value in values):
         raise ValueError("The power meter returned a non-finite reading")
-    return sum(values) / len(values)
+    raw_means = [getattr(reading, "raw_mean", None) for reading in readings]
+    # The detector saturates below the ADC full scale, so use the meter's ceiling.
+    ceiling = getattr(power_meter, "ceiling", getattr(power_meter, "full_scale", 255))
+    if all(raw is not None for raw in raw_means):
+        at_floor = all(raw == 0 for raw in raw_means)
+        at_ceiling = all(raw >= ceiling for raw in raw_means)
+    else:
+        # Test readers and older adapters may expose only converted values.
+        settings = getattr(power_meter, "settings", {})
+        offset = settings.get("offset", 0.0)
+        scale = settings.get("scale", 1.0)
+        at_floor = all(value == offset for value in values)
+        at_ceiling = all(value >= offset + ceiling * scale for value in values)
+    return sum(values) / len(values), at_floor, at_ceiling
 
 
 def calibrate_default_cross_path(controller, power_meter, network, input_port: int, output_port: int,
                                  voltages: list[float], settle_s: float, averages: int = 1,
-                                 on_point=None, on_switch=None):
+                                 on_point=None, on_switch=None, on_range_change=None,
+                                 on_sensitive_point=None, on_wide_point=None):
     """Calibrate one all-cross I/O path, from its output-side MZI backwards.
 
     No other switch is ever deliberately heated.  Every MZI is first driven to
@@ -139,23 +167,63 @@ def calibrate_default_cross_path(controller, power_meter, network, input_port: i
 
     results = {}
     reset_error = None
+
+    def sweep(name, callback):
+        points = []
+        floor_hits = ceiling_hits = 0
+        for voltage in voltages:
+            controller.drive_voltage(name, voltage)
+            time.sleep(settle_s)
+            power, at_floor, at_ceiling = _read_averaged_power(power_meter, averages)
+            point = ScanPoint(voltage, power)
+            points.append(point)
+            floor_hits += at_floor
+            ceiling_hits += at_ceiling
+            if callback is not None:
+                callback(name, len(points), len(voltages), point)
+        return points, floor_hits, ceiling_hits
+
+    def rescan(name, phase, hits, callback):
+        controller.drive_voltage(name, 0.0)
+        if on_range_change is None or not on_range_change(name, phase, hits):
+            raise RuntimeError(f"{name}: range change was cancelled; calibration stopped")
+        try:
+            return sweep(name, callback)
+        finally:
+            controller.drive_voltage(name, 0.0)
+            if not on_range_change(name, f"restore_{phase}", hits):
+                raise RuntimeError(f"{name}: original meter range was not confirmed; calibration stopped")
+
     try:
         for name in network.switches:
             controller.drive_voltage(name, 0.0)
         for name in names:
-            points = []
             try:
-                for voltage in voltages:
-                    controller.drive_voltage(name, voltage)
-                    time.sleep(settle_s)
-                    point = ScanPoint(voltage, _read_averaged_power(power_meter, averages))
-                    points.append(point)
-                    if on_point is not None:
-                        on_point(name, len(points), len(voltages), point)
-                cross = max(points, key=lambda point: (point.power, -abs(point.voltage)))
-                straight = min(points, key=lambda point: (point.power, abs(point.voltage)))
+                points, floor_count, ceiling_count = sweep(name, on_point)
+                sensitive_points = []
+                wide_points = []
+                straight_at_floor = False
+                if floor_count >= 2:
+                    sensitive_points, sensitive_floor, _ = rescan(
+                        name, "sensitive", floor_count, on_sensitive_point,
+                    )
+                    # Still at the floor after the range has been restored: keep the
+                    # best estimate and continue with the next switch.
+                    straight_at_floor = sensitive_floor >= 2
+                if ceiling_count >= 2:
+                    wide_points, _, wide_ceiling = rescan(
+                        name, "wide", ceiling_count, on_wide_point,
+                    )
+                    if wide_ceiling >= 2:
+                        raise RuntimeError(f"{name}: multiple readings still reached the ceiling on the wider range")
+                straight_candidates = sensitive_points or points
+                cross_candidates = wide_points or points
+                straight = min(straight_candidates, key=lambda point: (point.power, abs(point.voltage)))
+                cross = max(cross_candidates, key=lambda point: (point.power, -abs(point.voltage)))
                 controller.set_calibration(name, straight.voltage, cross.voltage)
-                result = PathCalibration(name, tuple(points), cross, straight)
+                result = PathCalibration(name, tuple(points), cross, straight,
+                                         tuple(sensitive_points), tuple(wide_points),
+                                         straight_at_floor)
                 results[name] = result
                 if on_switch is not None:
                     on_switch(result)

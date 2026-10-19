@@ -13,6 +13,11 @@ from spectrum_export import write_crosstalk_csv
 POWER_COLOR = "#ffbe69"
 OSA_COLOR = "#78b9ff"
 ROUTE_COLOR = "#36b38f"
+# Path-calibration rescans, keyed by phase: (context key, legend label, colour).
+RESCAN_STYLES = {
+    "sensitive": ("sensitive_range_rescans", "Sensitive-range rescan", "#b48cff"),
+    "wide": ("wide_range_rescans", "Wider-range rescan", "#ff7a59"),
+}
 
 
 def scan_context(network, input_port: int, output_port: int, power_meter_port: int | None,
@@ -83,6 +88,18 @@ def save_scan_artifacts(folder: Path, context: dict, data: dict, source: str,
                      title=f"{name}: response")
         response.grid(True)
         response.autoscale(enable=True, axis="y")
+        rescans = {phase: context.get(key, {}).get(name) for phase, (key, _, _) in RESCAN_STYLES.items()}
+        if any(rescans.values()):
+            # Rescans use another meter range, so they get their own axis.
+            rescan_axis = response.twinx()
+            rescan_axis.set_ylabel(f"Rescan power [{response_unit}] (changed range)")
+            for phase, rows in rescans.items():
+                if rows:
+                    _, label, color = RESCAN_STYLES[phase]
+                    rescan_axis.plot([row["voltage_v"] for row in rows], [row["power"] for row in rows],
+                                     marker=".", linestyle="--", linewidth=1.2, color=color, label=label)
+            lines = response.get_lines() + rescan_axis.get_lines()
+            response.legend(lines, [line.get_label() for line in lines], loc="best")
         if source == "OSA":
             spectra = figure.add_subplot(122)
             limits = context["voltages_v"]

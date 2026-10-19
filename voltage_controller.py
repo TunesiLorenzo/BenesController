@@ -6,6 +6,7 @@ import importlib.util
 import json
 import math
 import sys
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -44,22 +45,26 @@ class BenesVoltageController:
         switch_names: tuple[str, ...] | list[str],
         config_path: Path | None = None,
         board_factory: Callable[..., object] | None = None,
+        unsafe_voltage_authorizer: Callable[[str, float], bool] | None = None,
     ):
         self.switch_names = tuple(switch_names)
         self.config_path = config_path or app_dir() / "benes_voltage_config.json"
         self._board_factory = board_factory
+        self.unsafe_voltage_authorizer = unsafe_voltage_authorizer
         self.board = None
         self.applied_voltages: dict[str, float] = {}
         self.load_error = ""
         self.settings = self._load()
 
     def _defaults(self) -> dict:
-        # The first 12 tuner channels mirror the 12 switches in the network.
+        # Reserve pin 8 for the electrical monitor on new configurations.
+        pins = [pin for pin in range(16) if pin != 8]
         return {
             "port": DEFAULT_PORT,
             "baud": DEFAULT_BAUD,
             "dry_run": False,
-            "mapping": {name: index for index, name in enumerate(self.switch_names)},
+            "mapping": {name: pins[index] if index < len(pins) else None
+                        for index, name in enumerate(self.switch_names)},
             "voltage": {name: 0.0 for name in self.switch_names},
             "calibration": {name: {"straight": None, "cross": None} for name in self.switch_names},
         }
@@ -136,6 +141,7 @@ class BenesVoltageController:
     def set_voltage(self, name: str, value: object) -> float:
         self._require_switch(name)
         voltage = validate_voltage(value)
+        self._check_voltage(name, voltage)
         self.settings["voltage"][name] = voltage
         self.save()
         self._send(name, voltage)
@@ -148,12 +154,58 @@ class BenesVoltageController:
         self._send(name, voltage)
         return voltage
 
+    def drive_with_mirror(self, name: str, value: object, mirror_pin: int) -> tuple[float, float]:
+        """Send one edge to an MZI and a mirror pin in a single unpaced serial write.
+
+        VoltageTuner's Board.send sleeps 10 ms per command and pyserial's Windows
+        flush() polls in 50 ms steps, so both are bypassed here. Returns the
+        estimated perf_counter times at which each command finished arriving.
+        """
+        self._require_switch(name)
+        voltage = validate_voltage(value)
+        pin = self.settings["mapping"][name]
+        if self.board is None or pin is None:
+            raise RuntimeError(f"{name} is not connected to a board pin")
+        self._check_voltage(name, voltage)
+        serial = getattr(self.board, "serial", None)
+        if serial is None:
+            # Dry-run or test boards: keep their own pacing and logging.
+            self.board.send(pin, voltage)
+            target_time = time.perf_counter()
+            self.board.send(mirror_pin, voltage)
+            self.applied_voltages[name] = voltage
+            return target_time, time.perf_counter()
+        # Same text protocol as VoltageTuner's Board.send.
+        target = f"DC {pin} {voltage:.2f}\n".encode("ascii")
+        payload = target + f"DC {mirror_pin} {voltage:.2f}\n".encode("ascii")
+        start = time.perf_counter()
+        if serial.write(payload) != len(payload):
+            raise OSError("Incomplete serial write")
+        self.applied_voltages[name] = voltage
+        seconds_per_byte = 10 / self.settings["baud"]
+        return (start + len(target) * seconds_per_byte,
+                start + len(payload) * seconds_per_byte)
+
     def set_calibration(self, name: str, straight: object, cross: object) -> None:
         self._require_switch(name)
         self.settings["calibration"][name] = {
             "straight": self._optional_voltage(straight),
             "cross": self._optional_voltage(cross),
         }
+        self.save()
+
+    def clear_calibration(self, names, state=None) -> None:
+        """Forget selected saved voltages without changing board outputs."""
+        names = tuple(names)
+        for name in names:
+            self._require_switch(name)
+        if state not in (None, "straight", "cross"):
+            raise ValueError(f"Unknown calibration state: {state}")
+        for name in names:
+            if state is None:
+                self.settings["calibration"][name] = {"straight": None, "cross": None}
+            else:
+                self.settings["calibration"][name][state] = None
         self.save()
 
     def connect(self) -> None:
@@ -201,8 +253,17 @@ class BenesVoltageController:
             return
         pin = self.settings["mapping"][name]
         if pin is not None:
+            self._check_voltage(name, voltage)
             self.board.send(pin, voltage)
             self.applied_voltages[name] = voltage
+
+    def _check_voltage(self, name: str, voltage: float) -> None:
+        if 0.0 <= voltage <= 5.0:
+            return
+        if self.unsafe_voltage_authorizer is None or not self.unsafe_voltage_authorizer(name, voltage):
+            raise ValueError(
+                f"{name}: {voltage:g} V is outside the default 0–5 V range and was not confirmed"
+            )
 
     def _require_switch(self, name: str) -> None:
         if name not in self.switch_names:

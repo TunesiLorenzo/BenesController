@@ -49,6 +49,33 @@ class CrosstalkResultsTests(unittest.TestCase):
             self.assertTrue((folder / "S2_1.png").exists())
             self.assertIn("# Response unit: uW", (folder / "crosstalk_dataset.csv").read_text(encoding="utf-8"))
 
+    def test_saved_figure_draws_range_rescans_on_their_own_axis(self):
+        from unittest.mock import patch
+        from matplotlib.figure import Figure
+
+        network = BenesNetwork()
+        controller = SimpleNamespace(settings={"mapping": {}}, applied_voltages={})
+        context = scan_context(network, 2, 1, None, None, controller, ["S2.1"], [0, 1], 0,
+                               "Arduino", "")
+        context["sensitive_range_rescans"] = {"S2.1": [{"voltage_v": 0, "power": 40},
+                                                       {"voltage_v": 1, "power": 3}]}
+        context["wide_range_rescans"] = {"S2.1": [{"voltage_v": 0, "power": 20}]}
+        figures = []
+
+        def recording_figure(*args, **kwargs):
+            figures.append(Figure(*args, **kwargs))
+            return figures[-1]
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("matplotlib.figure.Figure", side_effect=recording_figure):
+            folder = create_result_folder(Path(directory), context)
+            save_scan_artifacts(folder, context, {"S2.1": [ScanPoint(0, 10), ScanPoint(1, 12)]},
+                                "Arduino", "uW", network)
+        response, rescan = figures[-1].axes
+        self.assertEqual([line.get_label() for line in rescan.get_lines()],
+                         ["Sensitive-range rescan", "Wider-range rescan"])
+        self.assertEqual(len(response.get_legend().get_texts()), 3)
+
 
 if __name__ == "__main__":
     unittest.main()
