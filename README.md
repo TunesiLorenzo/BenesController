@@ -33,8 +33,10 @@ confirmation before the board sends it; the prompt reminds you to disconnect
 the Arduino sampler from the voltage-board signal and check the heater current
 limit.
 
-Board connection and measurement controls live under the **Boards & measurement**
-tab at the top of the window.
+The UI is organized by workflow: **Routing**, **Hardware & OSA**, **Calibration
+scans**, and **Impulse test**. Hardware & OSA separates the voltage board, OSA
+and its output selector, and Arduino meter into sub-tabs so every control remains
+visible on a laptop display.
 
 ## OSA traces
 
@@ -43,6 +45,23 @@ window**, name each trace, and use **Export displayed datasets** in a plot windo
 to write every visible trace to CSV. The export dialog asks for an optional
 description, which is included as `# Description:` comment line(s) at the top of
 the file. Plotting needs matplotlib (`python -m pip install matplotlib`).
+
+### OSA output selector
+
+The **OSA & output switch** hardware page provides a persistent framework for
+the external switch that routes one Benes output to the OSA. Select an output and
+use **Route + read**, or use **Read all six outputs** to acquire the six spectra
+sequentially—useful when different signals are present at all inputs in parallel.
+Every automatic trace is labelled with the current `In → Out` connection and the
+output/fiber number; all traces can be exported together from the spectrum plot
+window.
+
+Until the switch protocol is known, connect it in **Dry run** mode. For serial
+switches, enter the serial port, baud rate, settling time, and a command template
+containing `{port}`, for example `OUT {port}`. The application persists this in
+`benes_osa_output_switch_config.json`; it will send the rendered command followed
+by a newline. Reply parsing, command acknowledgements, or a non-serial interface
+can be added later in `osa_output_switch.py` without changing the OSA scan flow.
 
 ## Arduino power meter
 

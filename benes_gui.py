@@ -19,6 +19,7 @@ from impulse_test import (LIVE_PLOT_WINDOW_S, plot_trace_samples, received_pair_
                           run_impulse_test,
                           validate_impulse_settings, write_impulse_csv)
 import osa
+from osa_output_switch import OSAOutputSwitch
 from power_meter import ArduinoPowerMeter
 from spectrum_export import write_crosstalk_csv, write_spectra
 from voltage_controller import BenesVoltageController, app_dir
@@ -35,20 +36,49 @@ OSA_COLOR = "#78b9ff"
 ZERO_VOLT_COLOR = "#ffd84d"
 
 
+class VerticalScrolledFrame(ttk.Frame):
+    """A compact scroll container for dialogs whose content exceeds the display."""
+
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.canvas = tk.Canvas(self, bg=BG, highlightthickness=0, borderwidth=0)
+        vertical = ttk.Scrollbar(self, orient="vertical", style="Accent.Vertical.TScrollbar",
+                                 command=self.canvas.yview)
+        horizontal = ttk.Scrollbar(self, orient="horizontal", style="Accent.Horizontal.TScrollbar",
+                                   command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        horizontal.pack(side="bottom", fill="x")
+        vertical.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.content = ttk.Frame(self.canvas)
+        self.content_id = self.canvas.create_window((0, 0), window=self.content, anchor="nw")
+        self.content.bind("<Configure>", self._update_region)
+        self.canvas.bind("<MouseWheel>", self._scroll)
+
+    def _update_region(self, _event=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _scroll(self, event):
+        self.canvas.yview_scroll(-1 * (event.delta // 120), "units")
+
+
 class BenesApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Beneš • 6 × 6 route explorer")
-        # The diagram reflows with the canvas, so it remains usable on a laptop
-        # display instead of requiring a wide desktop window.
-        self.geometry("1180x880")
-        self.minsize(900, 700)
+        # Fit the initial window to the actual usable display.  Fixed 1180x880
+        # geometry was taller than many laptop displays and hid lower controls.
+        usable_width = max(760, self.winfo_screenwidth() - 80)
+        usable_height = max(560, self.winfo_screenheight() - 120)
+        self.geometry(f"{min(1180, usable_width)}x{min(880, usable_height)}")
+        self.minsize(min(900, usable_width), min(600, usable_height))
         self.configure(bg=BG)
         self.network = BenesNetwork()
         self.controller = BenesVoltageController(tuple(self.network.switches))
         self._approved_unsafe_voltages = set()
         self.controller.unsafe_voltage_authorizer = self.confirm_unsafe_voltage
         self.power_meter = ArduinoPowerMeter()
+        self.osa_output_switch = OSAOutputSwitch()
         self.scan_settings = {}
         self.crosstalk_running = False
         self.crosstalk_data = {}
@@ -84,6 +114,14 @@ class BenesApp(tk.Tk):
         self.osa_plot_mode = tk.StringVar(value="Overlay")
         self.osa_axes = None
         self.trace_count = 0
+        self.osa_switch_port_var = tk.StringVar(value=self.osa_output_switch.settings["port"])
+        self.osa_switch_baud_var = tk.StringVar(value=str(self.osa_output_switch.settings["baud"]))
+        self.osa_switch_dry_run_var = tk.BooleanVar(value=self.osa_output_switch.settings["dry_run"])
+        self.osa_switch_command_var = tk.StringVar(value=self.osa_output_switch.settings["command_template"])
+        self.osa_switch_settle_var = tk.StringVar(value=str(self.osa_output_switch.settings["settle_s"]))
+        selected_osa_output = self.osa_output_switch.settings["selected_output"]
+        self.osa_switch_output_var = tk.StringVar(value="1" if selected_osa_output is None else str(selected_osa_output))
+        self.osa_switch_status_var = tk.StringVar(value="OSA output switch not connected")
         self.arduino_port_var = tk.StringVar(value=self.power_meter.settings["port"])
         self.arduino_baud_var = tk.StringVar(value=str(self.power_meter.settings["baud"]))
         self.arduino_duration_var = tk.StringVar(value=str(self.power_meter.settings["duration"]))
@@ -97,18 +135,34 @@ class BenesApp(tk.Tk):
         style.theme_use("clam")
         style.configure("TFrame", background=BG)
         style.configure("TLabel", background=BG, foreground=TEXT, font=("Segoe UI", 10))
-        style.configure("TButton", font=("Segoe UI", 10), padding=7)
+        style.configure("TButton", background="#263650", foreground=TEXT, font=("Segoe UI", 10), padding=(10, 7))
+        style.map("TButton", background=[("active", "#355171"), ("disabled", "#1b2638")],
+                  foreground=[("disabled", "#71829a")])
+        style.configure("Accent.TButton", background=ACCENT, foreground=BG,
+                        font=("Segoe UI", 10, "bold"), padding=(10, 7))
+        style.map("Accent.TButton", background=[("active", "#7bf0cf"), ("disabled", "#285749")],
+                  foreground=[("disabled", "#9ab9af")])
         style.configure("TCheckbutton", background=BG, foreground=TEXT)
         style.configure("TEntry", fieldbackground=PANEL, foreground=TEXT, insertcolor=TEXT, bordercolor="#7790ad")
         style.configure("TCombobox", fieldbackground=PANEL, foreground=TEXT, arrowcolor=TEXT, bordercolor="#7790ad")
         style.map("TCombobox", fieldbackground=[("readonly", PANEL)], foreground=[("readonly", TEXT)])
         style.configure("TLabelframe", background=BG, foreground=TEXT)
         style.configure("TLabelframe.Label", background=BG, foreground=TEXT, font=("Segoe UI", 10, "bold"))
+        style.configure("TNotebook", background=BG, borderwidth=0)
+        style.configure("TNotebook.Tab", background="#172338", foreground="#9baec6", padding=(15, 8),
+                        font=("Segoe UI", 10, "bold"))
+        style.map("TNotebook.Tab", background=[("selected", PANEL), ("active", "#21324b")],
+                  foreground=[("selected", ACCENT), ("active", TEXT)])
+        for scrollbar_style in ("Accent.Vertical.TScrollbar", "Accent.Horizontal.TScrollbar"):
+            style.configure(scrollbar_style, background=ACCENT, troughcolor="#172338",
+                            bordercolor=BG, arrowcolor=BG, gripcount=0)
+            style.map(scrollbar_style, background=[("active", "#7bf0cf"), ("pressed", "#3ac69f")])
 
-        header = ttk.Frame(self, padding=(24, 18, 24, 8))
+        header = ttk.Frame(self, padding=(24, 14, 24, 6))
         header.pack(fill="x")
-        ttk.Label(header, text="Beneš route explorer", font=("Segoe UI", 23, "bold")).pack(anchor="w")
-        ttk.Label(header, text="6 inputs · 6 outputs · 5 stages · 12 switches · generalized topology with bypass wires").pack(anchor="w", pady=(5, 0))
+        ttk.Label(header, text="BENES LAB", foreground=ACCENT, font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(header, text="6 × 6 photonic routing", font=("Segoe UI", 22, "bold")).pack(anchor="w")
+        ttk.Label(header, text="Route · calibrate · measure", foreground="#9baec6").pack(anchor="w", pady=(2, 0))
 
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=12, pady=(0, 12))
@@ -116,9 +170,9 @@ class BenesApp(tk.Tk):
         self.hardware_tab = ttk.Frame(self.notebook)
         self.crosstalk_tab = ttk.Frame(self.notebook)
         self.impulse_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.route_tab, text="Route explorer")
-        self.notebook.add(self.hardware_tab, text="Boards & measurement")
-        self.notebook.add(self.crosstalk_tab, text="Crosstalk & calibration")
+        self.notebook.add(self.route_tab, text="Routing")
+        self.notebook.add(self.hardware_tab, text="Hardware & OSA")
+        self.notebook.add(self.crosstalk_tab, text="Calibration scans")
         self.notebook.add(self.impulse_tab, text="Impulse test")
 
         controls = ttk.Frame(self.route_tab, padding=(24, 8))
@@ -149,8 +203,17 @@ class BenesApp(tk.Tk):
         self.power_meter_output_var.trace_add("write", lambda *_: self.draw())
         self.osa_output_var.trace_add("write", lambda *_: self.draw())
 
-        hardware = ttk.LabelFrame(self.hardware_tab, text="Voltage controller", padding=(18, 12))
-        hardware.pack(fill="x", padx=24, pady=(16, 8))
+        hardware_tabs = ttk.Notebook(self.hardware_tab)
+        hardware_tabs.pack(fill="both", expand=True, padx=18, pady=16)
+        voltage_page = ttk.Frame(hardware_tabs)
+        osa_page = ttk.Frame(hardware_tabs)
+        meter_page = ttk.Frame(hardware_tabs)
+        hardware_tabs.add(voltage_page, text="Voltage board")
+        hardware_tabs.add(osa_page, text="OSA & output switch")
+        hardware_tabs.add(meter_page, text="Arduino meter")
+
+        hardware = ttk.LabelFrame(voltage_page, text="Voltage controller", padding=(18, 12))
+        hardware.pack(fill="x")
         ttk.Label(hardware, text="Voltage board", font=("Segoe UI", 10, "bold")).pack(side="left")
         ttk.Label(hardware, text="Port").pack(side="left", padx=(14, 4))
         ttk.Entry(hardware, textvariable=self.port_var, width=9).pack(side="left")
@@ -163,8 +226,8 @@ class BenesApp(tk.Tk):
         self.hardware_status = ttk.Label(hardware)
         self.hardware_status.pack(side="right")
 
-        osa_controls = ttk.LabelFrame(self.hardware_tab, text="OSA spectrum analyser", padding=(18, 12))
-        osa_controls.pack(fill="x", padx=24, pady=(0, 8))
+        osa_controls = ttk.LabelFrame(osa_page, text="OSA spectrum analyser", padding=(18, 12))
+        osa_controls.pack(fill="x")
         ttk.Label(osa_controls, text="OSA", font=("Segoe UI", 10, "bold")).pack(side="left")
         ttk.Label(osa_controls, text="Host").pack(side="left", padx=(28, 4))
         ttk.Entry(osa_controls, textvariable=self.osa_host_var, width=16).pack(side="left")
@@ -172,11 +235,28 @@ class BenesApp(tk.Tk):
         ttk.Entry(osa_controls, textvariable=self.osa_port_var, width=6).pack(side="left")
         ttk.Combobox(osa_controls, textvariable=self.osa_plot_mode, values=("Overlay", "New window"), state="readonly", width=11).pack(side="left", padx=10)
         ttk.Checkbutton(osa_controls, text="Simulate", variable=self.osa_dry_run_var).pack(side="left")
-        self.osa_button = ttk.Button(osa_controls, text="Read trace", command=self.read_spectrum)
+        self.osa_button = ttk.Button(osa_controls, text="Read trace", style="Accent.TButton", command=self.read_spectrum)
         self.osa_button.pack(side="left", padx=8)
 
-        arduino = ttk.LabelFrame(self.hardware_tab, text="Arduino power meter", padding=(18, 12))
-        arduino.pack(fill="x", padx=24, pady=(0, 8))
+        osa_router = ttk.LabelFrame(osa_page, text="OSA output switch", padding=(18, 12))
+        osa_router.pack(fill="x", pady=(12, 0))
+        ttk.Label(osa_router, text="Select an output to sample on the OSA.", foreground="#9baec6").grid(
+            row=0, column=0, columnspan=5, sticky="w")
+        ttk.Label(osa_router, text="Output").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Combobox(osa_router, textvariable=self.osa_switch_output_var, values=tuple(map(str, range(1, 7))),
+                     state="readonly", width=6).grid(row=1, column=1, sticky="w", padx=(6, 12), pady=(10, 0))
+        self.osa_port_read_button = ttk.Button(osa_router, text="Route + read", style="Accent.TButton",
+                                               command=self.read_selected_osa_output)
+        self.osa_port_read_button.grid(row=1, column=2, sticky="w", pady=(10, 0))
+        self.osa_all_outputs_button = ttk.Button(osa_router, text="Read all outputs", command=self.read_all_osa_outputs)
+        self.osa_all_outputs_button.grid(row=1, column=3, sticky="w", padx=(6, 0), pady=(10, 0))
+        ttk.Button(osa_router, text="Selector setup…", command=self.show_osa_output_switch_setup).grid(
+            row=1, column=4, sticky="w", padx=(12, 0), pady=(10, 0))
+        ttk.Label(osa_router, textvariable=self.osa_switch_status_var, wraplength=650).grid(
+            row=2, column=0, columnspan=5, sticky="w", pady=(10, 0))
+
+        arduino = ttk.LabelFrame(meter_page, text="Arduino power meter", padding=(18, 12))
+        arduino.pack(fill="x")
         ttk.Label(arduino, text="Port").grid(row=0, column=0, sticky="w")
         ttk.Entry(arduino, textvariable=self.arduino_port_var, width=10).grid(row=0, column=1, sticky="w", padx=(4, 12))
         ttk.Label(arduino, text="Baud").grid(row=0, column=2, sticky="w")
@@ -342,6 +422,13 @@ class BenesApp(tk.Tk):
         value = variable.get()
         return None if value == "None" else int(value) - 1
 
+    def fit_dialog_to_screen(self, dialog, preferred_width=900, preferred_height=650):
+        """Size a dialog within the current display, leaving OS chrome visible."""
+        width = min(preferred_width, max(480, self.winfo_screenwidth() - 100))
+        height = min(preferred_height, max(360, self.winfo_screenheight() - 140))
+        dialog.geometry(f"{width}x{height}")
+        dialog.minsize(min(480, width), min(360, height))
+
     def confirm_unsafe_voltage(self, name, voltage):
         if voltage in self._approved_unsafe_voltages:
             return True
@@ -506,6 +593,159 @@ class BenesApp(tk.Tk):
         self.power_meter.disconnect()
         self._approved_unsafe_voltages.clear()
         self.power_reading_var.set("Arduino disconnected")
+
+    def connect_osa_output_switch(self):
+        try:
+            if self.osa_output_switch.connected:
+                raise RuntimeError("Disconnect the OSA output switch before changing its settings")
+            self.osa_output_switch.configure(
+                self.osa_switch_port_var.get(), self.osa_switch_baud_var.get(),
+                self.osa_switch_dry_run_var.get(), self.osa_switch_command_var.get(),
+                self.osa_switch_settle_var.get(),
+            )
+            self.osa_output_switch.connect()
+        except (OSError, RuntimeError, ValueError) as error:
+            messagebox.showerror("OSA output switch", str(error), parent=self)
+            return
+        mode = "dry run" if self.osa_output_switch.settings["dry_run"] else self.osa_output_switch.settings["port"]
+        self.osa_switch_status_var.set(f"OSA output switch connected: {mode}")
+
+    def disconnect_osa_output_switch(self):
+        self.osa_output_switch.disconnect()
+        self.osa_switch_status_var.set("OSA output switch disconnected")
+
+    def show_osa_output_switch_setup(self):
+        """Keep optional protocol details out of the normal measurement workflow."""
+        dialog = tk.Toplevel(self)
+        dialog.title("OSA output switch setup")
+        dialog.configure(bg=BG)
+        dialog.transient(self)
+        dialog.grab_set()
+        self.fit_dialog_to_screen(dialog, preferred_width=520, preferred_height=420)
+        body = ttk.Frame(dialog, padding=20)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="OSA output switch", foreground=ACCENT,
+                  font=("Segoe UI", 12, "bold")).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(body, text="Use Dry run until the selector command protocol is known.",
+                  foreground="#9baec6", wraplength=420).grid(row=1, column=0, columnspan=2,
+                                                               sticky="w", pady=(3, 14))
+        fields = (
+            ("Serial port", self.osa_switch_port_var, 14),
+            ("Baud", self.osa_switch_baud_var, 14),
+            ("Command template", self.osa_switch_command_var, 28),
+            ("Settle [s]", self.osa_switch_settle_var, 14),
+        )
+        for row, (label, variable, width) in enumerate(fields, start=2):
+            ttk.Label(body, text=label).grid(row=row, column=0, sticky="w", pady=4)
+            ttk.Entry(body, textvariable=variable, width=width).grid(row=row, column=1, sticky="w", padx=(12, 0), pady=4)
+        ttk.Checkbutton(body, text="Dry run", variable=self.osa_switch_dry_run_var).grid(
+            row=6, column=1, sticky="w", padx=(12, 0), pady=(4, 0))
+        ttk.Label(body, text="Physical serial commands must contain {port}; for example OUT {port}.",
+                  foreground="#9baec6", wraplength=420).grid(row=7, column=0, columnspan=2,
+                                                               sticky="w", pady=(12, 0))
+
+        def connect_and_close():
+            self.connect_osa_output_switch()
+            if self.osa_output_switch.connected:
+                dialog.destroy()
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=8, column=0, columnspan=2, sticky="e", pady=(18, 0))
+        ttk.Button(buttons, text="Disconnect", command=self.disconnect_osa_output_switch).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="Connect", style="Accent.TButton", command=connect_and_close).pack(side="left")
+
+    def osa_connection(self):
+        """Return OSA connection settings after validating the visible fields."""
+        simulate = self.osa_dry_run_var.get()
+        host = self.osa_host_var.get().strip()
+        try:
+            port = int(self.osa_port_var.get()) if not simulate else 0
+        except ValueError as error:
+            raise ValueError("Enter an OSA port from 1 to 65535") from error
+        if not simulate and (not host or not 1 <= port <= 65535):
+            raise ValueError("Enter a valid OSA host and port in Hardware & OSA")
+        return host, port, simulate
+
+    def set_osa_reading(self, reading: bool):
+        state = "disabled" if reading else "normal"
+        self.osa_button.configure(state=state)
+        self.osa_port_read_button.configure(state=state)
+        self.osa_all_outputs_button.configure(state=state)
+
+    def osa_trace_name(self, output):
+        """Identify the current routed input as well as the sampled output/fiber."""
+        mapping = self.network.mapping()
+        input_port = mapping.index(output - 1) + 1
+        return f"In {input_port} → Out {output} · Fiber {output + 3}"
+
+    def start_osa_read(self, output=None):
+        try:
+            host, port, simulate = self.osa_connection()
+            if output is not None:
+                output = int(output)
+                if not self.osa_output_switch.connected:
+                    raise RuntimeError("Connect the OSA output switch first (dry run is available)")
+        except (RuntimeError, ValueError) as error:
+            messagebox.showerror("OSA read unavailable", str(error), parent=self)
+            return
+        self.set_osa_reading(True)
+
+        def acquire():
+            try:
+                if output is not None:
+                    self.osa_output_switch.select_output(output)
+                data = osa.simulated_spectrum() if simulate else osa.get_spectrum(host, port)
+            except Exception as error:
+                self.after(0, lambda: self.osa_failed(str(error)))
+            else:
+                self.after(0, lambda: self.finish_osa_read(data, output))
+
+        threading.Thread(target=acquire, daemon=True).start()
+
+    def finish_osa_read(self, data, output):
+        if output is not None:
+            self.osa_output_var.set(str(output))
+            self.osa_switch_status_var.set(
+                f"OSA routed to output {output} (fiber {output + 3}); spectrum acquired."
+            )
+        self.show_spectrum(*data, name=None if output is None else self.osa_trace_name(output))
+
+    def read_selected_osa_output(self):
+        self.start_osa_read(self.osa_switch_output_var.get())
+
+    def read_all_osa_outputs(self):
+        try:
+            host, port, simulate = self.osa_connection()
+            if not self.osa_output_switch.connected:
+                raise RuntimeError("Connect the OSA output switch first (dry run is available)")
+        except (RuntimeError, ValueError) as error:
+            messagebox.showerror("OSA read unavailable", str(error), parent=self)
+            return
+        self.set_osa_reading(True)
+        self.osa_switch_status_var.set("Reading OSA spectra from outputs 1–6...")
+
+        def acquire_all():
+            spectra = []
+            try:
+                for output in range(1, 7):
+                    self.osa_output_switch.select_output(output)
+                    spectrum = osa.simulated_spectrum() if simulate else osa.get_spectrum(host, port)
+                    spectra.append((output, spectrum))
+            except Exception as error:
+                self.after(0, lambda: self.osa_failed(str(error)))
+            else:
+                self.after(0, lambda: self.show_all_osa_spectra(spectra))
+
+        threading.Thread(target=acquire_all, daemon=True).start()
+
+    def show_all_osa_spectra(self, spectra):
+        self.set_osa_reading(False)
+        for output, (wave, power) in spectra:
+            self.show_spectrum(wave, power, name=self.osa_trace_name(output), restore_buttons=False)
+        if spectra:
+            self.osa_output_var.set(str(spectra[-1][0]))
+        self.osa_switch_status_var.set(f"Read {len(spectra)} OSA output spectra; export them from the plot window.")
 
     def read_current_power(self):
         self.read_power_button.configure(state="disabled")
@@ -1152,7 +1392,10 @@ class BenesApp(tk.Tk):
         dialog.configure(bg=BG)
         dialog.transient(self)
         dialog.grab_set()
-        body = ttk.Frame(dialog, padding=18)
+        self.fit_dialog_to_screen(dialog, preferred_width=1080, preferred_height=700)
+        scroll = VerticalScrolledFrame(dialog)
+        scroll.pack(fill="both", expand=True)
+        body = ttk.Frame(scroll.content, padding=18)
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="Assign each MZI to a unique VoltageTuner pin (0–15).", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(body, text="Save a pin mapping before scanning. Each scan restores the switch voltage; choose which power extreme means straight and cross.", wraplength=650).grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 14))
@@ -1251,6 +1494,7 @@ class BenesApp(tk.Tk):
         window.title(f"Power scan: {name}")
         window.transient(parent)
         window.grab_set()
+        self.fit_dialog_to_screen(window, preferred_width=500, preferred_height=520)
         frame = ttk.Frame(window, padding=18)
         frame.pack(fill="both", expand=True)
         fields = {}
@@ -1372,31 +1616,17 @@ class BenesApp(tk.Tk):
         ttk.Button(frame, text="Close", command=close_scan).grid(row=9, column=2, sticky="e", pady=(12, 0))
 
     def read_spectrum(self):
-        try:
-            port = int(self.osa_port_var.get())
-            if not self.osa_host_var.get().strip() or not 1 <= port <= 65535:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("Invalid OSA connection", "Enter a host and a port from 1 to 65535.", parent=self)
-            return
-        self.osa_button.configure(state="disabled")
-
-        def acquire():
-            try:
-                data = osa.simulated_spectrum() if self.osa_dry_run_var.get() else osa.get_spectrum(self.osa_host_var.get().strip(), port)
-            except Exception as error:
-                self.after(0, lambda: self.osa_failed(str(error)))
-            else:
-                self.after(0, lambda: self.show_spectrum(*data))
-
-        threading.Thread(target=acquire, daemon=True).start()
+        """Read the currently connected OSA without changing the output selector."""
+        self.start_osa_read()
 
     def osa_failed(self, error):
-        self.osa_button.configure(state="normal")
+        self.set_osa_reading(False)
+        self.osa_switch_status_var.set(f"OSA read failed: {error}")
         messagebox.showerror("OSA read failed", error, parent=self)
 
-    def show_spectrum(self, wave, power):
-        self.osa_button.configure(state="normal")
+    def show_spectrum(self, wave, power, name=None, restore_buttons=True):
+        if restore_buttons:
+            self.set_osa_reading(False)
         try:
             wave, power = osa.trim_spurious_tail(wave, power)
         except ValueError as error:
@@ -1409,9 +1639,10 @@ class BenesApp(tk.Tk):
         except ImportError:
             messagebox.showerror("Plot unavailable", "Install matplotlib to plot OSA traces:\npython -m pip install matplotlib", parent=self)
             return
-        name = simpledialog.askstring("Trace name", "Name for this OSA trace:", initialvalue=f"Trace {self.trace_count}", parent=self)
         if name is None:
-            return
+            name = simpledialog.askstring("Trace name", "Name for this OSA trace:", initialvalue=f"Trace {self.trace_count}", parent=self)
+            if name is None:
+                return
         name = name.strip() or f"Trace {self.trace_count}"
         new_window = self.osa_plot_mode.get() == "New window" or self.osa_axes is None
         if not new_window:
@@ -1422,6 +1653,7 @@ class BenesApp(tk.Tk):
         if new_window:
             window = tk.Toplevel(self)
             window.title("OSA Spectrum")
+            self.fit_dialog_to_screen(window, preferred_width=900, preferred_height=650)
             figure = Figure(figsize=(8, 5))
             self.osa_axes = figure.add_subplot(xlabel="Wavelength [nm]", ylabel="Power [dBm]", title="OSA Spectrum")
             self.osa_axes.grid(True)
@@ -1461,12 +1693,17 @@ class BenesApp(tk.Tk):
             return
         self.controller.disconnect()
         self.power_meter.disconnect()
+        self.osa_output_switch.disconnect()
         self.destroy()
 
     def build_impulse_tab(self):
-        controls = ttk.Frame(self.impulse_tab, padding=18, width=310)
-        controls.pack(side="left", fill="y")
-        controls.pack_propagate(False)
+        control_column = ttk.Frame(self.impulse_tab, padding=18, width=310)
+        control_column.pack(side="left", fill="y")
+        control_column.pack_propagate(False)
+        settings_scroll = VerticalScrolledFrame(control_column)
+        settings_scroll.pack(fill="both", expand=True)
+        controls = ttk.Frame(settings_scroll.content, padding=(0, 0, 10, 0))
+        controls.pack(anchor="nw")
         plot_area = ttk.Frame(self.impulse_tab, padding=(0, 18, 18, 18))
         plot_area.pack(side="left", fill="both", expand=True)
         self.impulse_plot_area = plot_area
@@ -1506,13 +1743,15 @@ class BenesApp(tk.Tk):
             row=10, column=0, columnspan=2, sticky="w", pady=(12, 4))
         ttk.Label(controls, text="Board pin 8 mirrors the selected MZI. Arduino A0 reads optical power; A1 reads pin 8.",
                   wraplength=275).grid(row=11, column=0, columnspan=2, sticky="w", pady=(0, 12))
-        self.impulse_play_button = ttk.Button(controls, text="Play square wave", command=lambda: self.start_impulse("square"))
+        self.impulse_play_button = ttk.Button(controls, text="Play square wave", style="Accent.TButton",
+                                               command=lambda: self.start_impulse("square"))
         self.impulse_play_button.grid(row=12, column=0, columnspan=2, sticky="ew", pady=3)
         self.impulse_single_button = ttk.Button(controls, text="Single pulse", command=lambda: self.start_impulse("single"))
         self.impulse_single_button.grid(row=13, column=0, columnspan=2, sticky="ew", pady=3)
         self.impulse_stop_button = ttk.Button(controls, text="Stop", command=self.stop_impulse, state="disabled")
         self.impulse_stop_button.grid(row=14, column=0, columnspan=2, sticky="ew", pady=3)
-        self.impulse_export_button = ttk.Button(controls, text="Export trace CSV", command=self.export_impulse, state="disabled")
+        self.impulse_export_button = ttk.Button(controls, text="Export trace CSV", style="Accent.TButton",
+                                                 command=self.export_impulse, state="disabled")
         self.impulse_export_button.grid(row=16, column=0, columnspan=2, sticky="ew", pady=(12, 3))
         self.impulse_status = tk.StringVar(value="Raw stream: tagged 7-bit A0/A1 pairs.")
         ttk.Label(controls, textvariable=self.impulse_status, wraplength=275).grid(
@@ -1765,7 +2004,7 @@ class BenesApp(tk.Tk):
         c.delete("all")
         width, height = c.winfo_width(), c.winfo_height()
         # Tk initially reports a 1x1 canvas before its first layout pass.
-        if width < 500 or height < 220:
+        if width < 420 or height < 220:
             return
         scale = min(1.0, width / 1180, height / 355)
         font_small = ("Segoe UI", max(7, round(8 * scale)))
@@ -1778,8 +2017,12 @@ class BenesApp(tk.Tk):
         self.xs = [first_stage + i * (last_stage - first_stage) / 4 for i in range(5)]
         top, bottom = max(48, round(58 * scale)), max(47, round(55 * scale))
         self.ys = [top + i * (height - top - bottom) / 5 for i in range(6)]
-        half = max(17, round(24 * scale))
+        # Keep each MZI visually quiet: one compact label and one voltage field.
+        half = max(15, round(18 * scale))
         self.switch_half = half
+        row_gap = min(self.ys[index + 1] - self.ys[index] for index in range(5))
+        show_voltage_entry = row_gap >= 42
+        card_pad = max(6, round(7 * scale))
         # Group the three middle stages into two independent 3x3 networks.
         for first, last, label in ((0, 2, "Upper 3×3"), (3, 5, "Lower 3×3")):
             c.create_rectangle(self.xs[1] - 65, self.ys[first] - 38,
@@ -1806,23 +2049,23 @@ class BenesApp(tk.Tk):
                 calibrated = calibration["straight"] is not None and calibration["cross"] is not None
                 tag = f"switch:{name}"
                 outline = ZERO_VOLT_COLOR if zero else ACCENT if calibrated else "#7790ad"
-                c.create_rectangle(x - half, self.ys[a] - 12, x + half, self.ys[b] + 12,
+                c.create_rectangle(x - half, self.ys[a] - card_pad, x + half, self.ys[b] + card_pad,
                                    fill="#2b2a1c" if zero else PANEL, outline=outline,
                                    width=2.5 if zero or calibrated else 1.5, tags=tag)
                 for start, end in ((a, b), (b, a)) if crossed else ((a, a), (b, b)):
                     c.create_line(x - half, self.ys[start], x + half, self.ys[end],
                                   fill=ZERO_VOLT_COLOR if zero else "#a4bad4", width=2,
                                   dash=(4, 3) if zero else (), tags=tag)
-                symbol = "0V" if zero else "X" if crossed else "="
-                c.create_text(x, self.ys[a] - round(23 * scale), text=f"{name} {symbol}",
+                pin = self.controller.settings["mapping"][name]
+                c.create_text(x, self.ys[a] - max(13, round(15 * scale)),
+                              text=f"{name}   PIN {pin if pin is not None else '-'}",
                               fill=ZERO_VOLT_COLOR if zero else ACCENT if calibrated else TEXT,
                               font=font_normal, tags=tag)
-                pin = self.controller.settings["mapping"][name]
-                c.create_text(x, self.ys[b] + round(17 * scale), text=f"Pin {pin}" if pin is not None else "Unassigned", fill="#9baec6", font=font_small)
-                entry = ttk.Entry(c, textvariable=self.voltage_vars[name], width=5 if scale < 0.85 else 6, justify="center")
-                entry.bind("<Return>", lambda event, n=name: self.apply_voltage(n))
-                c.create_window(x, self.ys[b] + round(33 * scale), window=entry)
-                self.switch_voltage_entries[name] = entry
+                if show_voltage_entry:
+                    entry = ttk.Entry(c, textvariable=self.voltage_vars[name], width=4, justify="center")
+                    entry.bind("<Return>", lambda event, n=name: self.apply_voltage(n))
+                    c.create_window(x, self.ys[b] + max(19, round(20 * scale)), window=entry)
+                    self.switch_voltage_entries[name] = entry
                 c.tag_bind(tag, "<Button-1>", lambda event, n=name: self.toggle(n))
                 c.tag_bind(tag, "<Enter>", lambda event: c.configure(cursor="hand2"))
                 c.tag_bind(tag, "<Leave>", lambda event: c.configure(cursor=""))
