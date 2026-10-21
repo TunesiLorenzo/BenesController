@@ -22,13 +22,18 @@ from impulse_test import (LIVE_PLOT_WINDOW_S, plot_trace_samples, received_pair_
                           run_impulse_test,
                           validate_impulse_settings, write_impulse_csv)
 import osa
-from osa_output_switch import OSAOutputSwitch
+from osa_output_switch import JDSU_CHANNELS, OUTPUTS, OSAOutputSwitch, fiber_number
 from power_meter import ArduinoPowerMeter
 from spectrum_export import write_crosstalk_csv, write_spectra
 from voltage_controller import BenesVoltageController, app_dir
+from wdm_comb import (INPUTS, WDMPlan, create_wdm_folder, input_fiber_number, routed_wavelengths,
+                      save_wdm_scan, scan_outputs, simulated_comb_spectrum)
 from heater_setup import BREAK_CURRENT_DENSITY, SAFE_CURRENT_DENSITY, load_heater_csv, voltage_limit
 from scrollable import ScrollableFrame, fit_to_screen
 
+# Completed OSA sweeps to wait for after moving the output switch: the first may
+# have begun before the move, the second lies wholly after it.
+POST_SWITCH_SWEEPS = 2
 # Smallest plot area before the tab scrolls instead of squeezing the figure further.
 PLOT_MIN_SIZE = {"width": 480, "height": 320}
 
@@ -42,6 +47,10 @@ COLORS = ("#53dfbb", "#ffbe69", "#78b9ff", "#ed91cf", "#b6a0ff", "#fff080")
 POWER_METER_COLOR = "#ffbe69"
 OSA_COLOR = "#78b9ff"
 ZERO_VOLT_COLOR = "#ffd84d"
+# One colour per input for the paths and spectrum markers of assigned comb lines.
+WDM_COLORS = ("#ff6b6b", "#ffa94d", "#4dabf7", "#f06595", "#b197fc", "#c0eb75")
+# Tags comb-line marker lines so spectrum export skips them.
+WDM_MARKER_GID = "wdm-comb-line"
 
 
 class VerticalScrolledFrame(ttk.Frame):
@@ -90,6 +99,11 @@ class BenesApp(tk.Tk):
         self.controller.current_density_authorizer = self.confirm_over_safe_current
         self.power_meter = ArduinoPowerMeter()
         self.osa_output_switch = OSAOutputSwitch()
+        # The lab always drives the real JDSU; Dry run stays available in Selector setup.
+        self.osa_output_switch.settings["dry_run"] = False
+        self.wdm_plan = WDMPlan()
+        self.wdm_running = False
+        self.wdm_stop_event = None
         self.scan_settings = {}
         self.crosstalk_running = False
         self.crosstalk_data = {}
@@ -126,11 +140,16 @@ class BenesApp(tk.Tk):
         self.osa_axes = None
         self.trace_count = 0
         self.osa_trace_records = []
-        self.osa_switch_port_var = tk.StringVar(value=self.osa_output_switch.settings["port"])
-        self.osa_switch_baud_var = tk.StringVar(value=str(self.osa_output_switch.settings["baud"]))
+        self.osa_switch_resource_var = tk.StringVar(value=self.osa_output_switch.settings["resource"])
         self.osa_switch_dry_run_var = tk.BooleanVar(value=self.osa_output_switch.settings["dry_run"])
-        self.osa_switch_command_var = tk.StringVar(value=self.osa_output_switch.settings["command_template"])
         self.osa_switch_settle_var = tk.StringVar(value=str(self.osa_output_switch.settings["settle_s"]))
+        channel_map = self.osa_output_switch.settings["channel_map"]
+        self.osa_switch_channel_vars = {
+            output: tk.StringVar(value="—" if channel_map[str(output)] is None else str(channel_map[str(output)]))
+            for output in OUTPUTS
+        }
+        # Prevents the two linked OSA output pickers from re-triggering each other.
+        self._syncing_osa_output = False
         selected_osa_output = self.osa_output_switch.settings["selected_output"]
         self.osa_switch_output_var = tk.StringVar(value="1" if selected_osa_output is None else str(selected_osa_output))
         self.osa_switch_status_var = tk.StringVar(value="OSA output switch not connected")
@@ -182,11 +201,13 @@ class BenesApp(tk.Tk):
         self.notebook.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         # Each tab fills the window when it fits and scrolls when the window is smaller.
         tabs = []
-        for text in ("Routing", "Hardware & OSA", "Calibration scans", "Dataset coverage", "Impulse test"):
+        for text in ("Routing", "Hardware & OSA", "Calibration scans", "WDM comb", "Dataset coverage",
+                     "Impulse test"):
             scroller = ScrollableFrame(self.notebook, background=BG)
             self.notebook.add(scroller, text=text)
             tabs.append(scroller.inner)
-        self.route_tab, self.hardware_tab, self.crosstalk_tab, self.dataset_tab, self.impulse_tab = tabs
+        (self.route_tab, self.hardware_tab, self.crosstalk_tab, self.wdm_tab, self.dataset_tab,
+         self.impulse_tab) = tabs
 
         controls = ttk.Frame(self.route_tab, padding=(24, 8))
         controls.pack(fill="x")
@@ -215,6 +236,8 @@ class BenesApp(tk.Tk):
         ttk.Label(detector_controls, text="Colored rings mark detector ports; the selected route output remains green.").pack(side="left")
         self.power_meter_output_var.trace_add("write", lambda *_: self.draw())
         self.osa_output_var.trace_add("write", lambda *_: self.draw())
+        # Choosing an OSA output on either page routes the JDSU switch to it.
+        self.osa_output_var.trace_add("write", lambda *_: self.osa_output_chosen(self.osa_output_var))
 
         hardware_tabs = ttk.Notebook(self.hardware_tab)
         hardware_tabs.pack(fill="both", expand=True, padx=18, pady=16)
@@ -253,7 +276,8 @@ class BenesApp(tk.Tk):
 
         osa_router = ttk.LabelFrame(osa_page, text="OSA output switch", padding=(18, 12))
         osa_router.pack(fill="x", pady=(12, 0))
-        ttk.Label(osa_router, text="Select an output to sample on the OSA.", foreground="#9baec6").grid(
+        ttk.Label(osa_router, text="Selecting an output routes the JDSU switch so the OSA samples it.",
+                  foreground="#9baec6").grid(
             row=0, column=0, columnspan=5, sticky="w")
         ttk.Label(osa_router, text="Output").grid(row=1, column=0, sticky="w", pady=(10, 0))
         ttk.Combobox(osa_router, textvariable=self.osa_switch_output_var, values=tuple(map(str, range(1, 7))),
@@ -267,6 +291,7 @@ class BenesApp(tk.Tk):
             row=1, column=4, sticky="w", padx=(12, 0), pady=(10, 0))
         ttk.Label(osa_router, textvariable=self.osa_switch_status_var, wraplength=650).grid(
             row=2, column=0, columnspan=5, sticky="w", pady=(10, 0))
+        self.osa_switch_output_var.trace_add("write", lambda *_: self.osa_output_chosen(self.osa_switch_output_var))
 
         arduino = ttk.LabelFrame(meter_page, text="Arduino power meter", padding=(18, 12))
         arduino.pack(fill="x")
@@ -377,6 +402,8 @@ class BenesApp(tk.Tk):
         self.status.pack(fill="x")
         self.mapping_label = ttk.Label(self.route_tab, padding=(24, 2, 24, 6))
         self.mapping_label.pack(fill="x")
+        self.wdm_route_label = ttk.Label(self.route_tab, padding=(24, 0, 24, 6), foreground=OSA_COLOR)
+        self.wdm_route_label.pack(fill="x")
 
         route_body = ttk.Frame(self.route_tab, padding=(12, 0, 12, 10))
         route_body.pack(fill="both", expand=True)
@@ -416,10 +443,12 @@ class BenesApp(tk.Tk):
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda event: self.draw())
         ttk.Label(diagram, text="Green switches have saved bar and cross voltages. Click a switch to toggle it; type a voltage and press Enter to send it.", padding=(4, 5), wraplength=680).pack(anchor="w", fill="x")
+        self.build_wdm_tab()
         self.build_dataset_tab()
         self.build_impulse_tab()
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.refresh()
+        self.after(200, self.auto_connect_osa_output_switch)
 
     def choose_input(self, event=None):
         self.source = self.input_box.current()
@@ -650,55 +679,144 @@ class BenesApp(tk.Tk):
         self._approved_unsafe_voltages.clear()
         self.power_reading_var.set("Arduino disconnected")
 
-    def connect_osa_output_switch(self):
+    def osa_switch_channel_map(self):
+        return {str(output): variable.get() for output, variable in self.osa_switch_channel_vars.items()}
+
+    def save_osa_output_switch_settings(self):
         try:
-            if self.osa_output_switch.connected:
-                raise RuntimeError("Disconnect the OSA output switch before changing its settings")
             self.osa_output_switch.configure(
-                self.osa_switch_port_var.get(), self.osa_switch_baud_var.get(),
-                self.osa_switch_dry_run_var.get(), self.osa_switch_command_var.get(),
-                self.osa_switch_settle_var.get(),
+                self.osa_switch_resource_var.get(), self.osa_switch_dry_run_var.get(),
+                self.osa_switch_settle_var.get(), self.osa_switch_channel_map(),
             )
+        except Exception as error:
+            # Changing the resource or dry-run mode reconnects, which can raise PyVISA errors.
+            messagebox.showerror("OSA output switch", str(error), parent=self)
+            return False
+        return True
+
+    def auto_connect_osa_output_switch(self):
+        """Connect the JDSU in the background at startup; a missing switch only updates the status."""
+        switch = self.osa_output_switch
+        self.osa_switch_status_var.set(f"Connecting OSA output switch on {switch.settings['resource']}...")
+
+        def connect():
+            try:
+                switch.connect()
+            except Exception as error:
+                message = f"OSA output switch not connected: {error}"
+            else:
+                message = f"OSA output switch connected: {switch.settings['resource']}"
+            self.after(0, lambda: self.osa_switch_status_var.set(message))
+
+        threading.Thread(target=connect, daemon=True).start()
+
+    def connect_osa_output_switch(self):
+        if not self.save_osa_output_switch_settings():
+            return
+        try:
             self.osa_output_switch.connect()
-        except (OSError, RuntimeError, ValueError) as error:
+        except Exception as error:
+            # PyVISA raises its own error types for GPIB faults.
             messagebox.showerror("OSA output switch", str(error), parent=self)
             return
-        mode = "dry run" if self.osa_output_switch.settings["dry_run"] else self.osa_output_switch.settings["port"]
+        mode = "dry run" if self.osa_output_switch.settings["dry_run"] else self.osa_output_switch.settings["resource"]
         self.osa_switch_status_var.set(f"OSA output switch connected: {mode}")
+        self.osa_output_chosen(self.osa_switch_output_var)
 
     def disconnect_osa_output_switch(self):
         self.osa_output_switch.disconnect()
         self.osa_switch_status_var.set("OSA output switch disconnected")
 
+    def osa_output_chosen(self, variable):
+        """Mirror an OSA output choice to the other picker and route the JDSU to it."""
+        if self._syncing_osa_output:
+            return
+        value = variable.get()
+        if value == "None":
+            return
+        other = self.osa_switch_output_var if variable is self.osa_output_var else self.osa_output_var
+        self._syncing_osa_output = True
+        try:
+            other.set(value)
+        finally:
+            self._syncing_osa_output = False
+        self.route_osa_output(int(value))
+
+    def route_osa_output(self, output):
+        switch = self.osa_output_switch
+        if not switch.connected or switch.routed_output == output:
+            return
+        try:
+            channel = switch.channel_for(output)
+        except ValueError as error:
+            self.osa_switch_status_var.set(str(error))
+            return
+        self.osa_switch_status_var.set(f"Routing output {output} (fiber {fiber_number(output)}) "
+                                       f"to the OSA via JDSU channel {channel}...")
+
+        def route():
+            try:
+                switch.select_output(output)
+            except Exception as error:
+                self.after(0, lambda: self.osa_switch_status_var.set(f"OSA output switch failed: {error}"))
+            else:
+                self.after(0, lambda: self.osa_switch_status_var.set(
+                    f"OSA sampling output {output} (fiber {fiber_number(output)}) via JDSU channel {channel}"))
+
+        threading.Thread(target=route, daemon=True).start()
+
     def show_osa_output_switch_setup(self):
-        """Keep optional protocol details out of the normal measurement workflow."""
+        """Keep GPIB details and the fiber patching out of the normal measurement workflow."""
         dialog = tk.Toplevel(self)
         dialog.title("OSA output switch setup")
         dialog.configure(bg=BG)
         dialog.transient(self)
         dialog.grab_set()
-        self.fit_dialog_to_screen(dialog, preferred_width=520, preferred_height=420)
+        self.fit_dialog_to_screen(dialog, preferred_width=560, preferred_height=620)
         body = ttk.Frame(dialog, padding=20)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="OSA output switch", foreground=ACCENT,
-                  font=("Segoe UI", 12, "bold")).grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Label(body, text="Use Dry run until the selector command protocol is known.",
-                  foreground="#9baec6", wraplength=420).grid(row=1, column=0, columnspan=2,
+        ttk.Label(body, text="JDSU SC optical switch", foreground=ACCENT,
+                  font=("Segoe UI", 12, "bold")).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(body, text="Each Benes output fiber enters one JDSU channel; the switch common port "
+                             "feeds the OSA. The switch must use its SC command set with CR+LF termination.",
+                  foreground="#9baec6", wraplength=480).grid(row=1, column=0, columnspan=3,
                                                                sticky="w", pady=(3, 14))
-        fields = (
-            ("Serial port", self.osa_switch_port_var, 14),
-            ("Baud", self.osa_switch_baud_var, 14),
-            ("Command template", self.osa_switch_command_var, 28),
-            ("Settle [s]", self.osa_switch_settle_var, 14),
-        )
-        for row, (label, variable, width) in enumerate(fields, start=2):
-            ttk.Label(body, text=label).grid(row=row, column=0, sticky="w", pady=4)
-            ttk.Entry(body, textvariable=variable, width=width).grid(row=row, column=1, sticky="w", padx=(12, 0), pady=4)
+        ttk.Label(body, text="VISA resource").grid(row=2, column=0, sticky="w", pady=4)
+        resource_box = ttk.Combobox(body, textvariable=self.osa_switch_resource_var, width=22)
+        resource_box.grid(row=2, column=1, sticky="w", padx=(12, 0), pady=4)
+
+        def list_resources():
+            try:
+                resources = self.osa_output_switch.list_resources()
+            except Exception as error:
+                messagebox.showerror("VISA resources", str(error), parent=dialog)
+                return
+            resource_box.configure(values=resources)
+            if not resources:
+                messagebox.showinfo("VISA resources", "No VISA resources found", parent=dialog)
+
+        ttk.Button(body, text="List", command=list_resources).grid(row=2, column=2, sticky="w", padx=(6, 0))
+        ttk.Label(body, text="Extra settle [s]").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Entry(body, textvariable=self.osa_switch_settle_var, width=10).grid(
+            row=3, column=1, sticky="w", padx=(12, 0), pady=4)
         ttk.Checkbutton(body, text="Dry run", variable=self.osa_switch_dry_run_var).grid(
-            row=6, column=1, sticky="w", padx=(12, 0), pady=(4, 0))
-        ttk.Label(body, text="Physical serial commands must contain {port}; for example OUT {port}.",
-                  foreground="#9baec6", wraplength=420).grid(row=7, column=0, columnspan=2,
-                                                               sticky="w", pady=(12, 0))
+            row=4, column=1, sticky="w", padx=(12, 0), pady=(4, 0))
+
+        mapping = ttk.LabelFrame(body, text="Output fiber → JDSU channel", padding=(14, 8))
+        mapping.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(16, 0))
+        channels = ("—",) + tuple(map(str, JDSU_CHANNELS))
+        for row, output in enumerate(OUTPUTS):
+            ttk.Label(mapping, text=f"Output {output} · Fiber {fiber_number(output)}").grid(
+                row=row, column=0, sticky="w", pady=3)
+            ttk.Combobox(mapping, textvariable=self.osa_switch_channel_vars[output], values=channels,
+                         state="readonly", width=6).grid(row=row, column=1, sticky="w", padx=(14, 0), pady=3)
+        ttk.Label(mapping, text="Each channel can be used once; an output set to — is skipped by Read all outputs.",
+                  foreground="#9baec6", wraplength=440).grid(row=len(OUTPUTS), column=0, columnspan=2,
+                                                              sticky="w", pady=(8, 0))
+
+        def save_and_close():
+            if self.save_osa_output_switch_settings():
+                dialog.destroy()
 
         def connect_and_close():
             self.connect_osa_output_switch()
@@ -706,9 +824,10 @@ class BenesApp(tk.Tk):
                 dialog.destroy()
 
         buttons = ttk.Frame(body)
-        buttons.grid(row=8, column=0, columnspan=2, sticky="e", pady=(18, 0))
+        buttons.grid(row=6, column=0, columnspan=3, sticky="e", pady=(18, 0))
         ttk.Button(buttons, text="Disconnect", command=self.disconnect_osa_output_switch).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="Save", command=save_and_close).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="Connect", style="Accent.TButton", command=connect_and_close).pack(side="left")
 
     def osa_connection(self):
@@ -733,7 +852,7 @@ class BenesApp(tk.Tk):
         """Identify the current routed input as well as the sampled output/fiber."""
         mapping = self.network.mapping()
         input_port = mapping.index(output - 1) + 1
-        return f"In {input_port} → Out {output} · Fiber {output + 3}"
+        return f"In {input_port} → Out {output} · Fiber {fiber_number(output)}"
 
     def start_osa_read(self, output=None):
         try:
@@ -742,6 +861,7 @@ class BenesApp(tk.Tk):
                 output = int(output)
                 if not self.osa_output_switch.connected:
                     raise RuntimeError("Connect the OSA output switch first (dry run is available)")
+                self.osa_output_switch.channel_for(output)
         except (RuntimeError, ValueError) as error:
             messagebox.showerror("OSA read unavailable", str(error), parent=self)
             return
@@ -751,7 +871,8 @@ class BenesApp(tk.Tk):
             try:
                 if output is not None:
                     self.osa_output_switch.select_output(output)
-                data = osa.simulated_spectrum() if simulate else osa.get_spectrum(host, port)
+                data = osa.simulated_spectrum() if simulate else osa.get_spectrum(
+                    host, port, fresh_sweeps=0 if output is None else POST_SWITCH_SWEEPS)
             except Exception as error:
                 self.after(0, lambda: self.osa_failed(str(error)))
             else:
@@ -763,7 +884,8 @@ class BenesApp(tk.Tk):
         if output is not None:
             self.osa_output_var.set(str(output))
             self.osa_switch_status_var.set(
-                f"OSA routed to output {output} (fiber {output + 3}); spectrum acquired."
+                f"OSA routed to output {output} (fiber {fiber_number(output)}) via JDSU channel "
+                f"{self.osa_output_switch.channel_for(output)}; spectrum acquired."
             )
         self.show_spectrum(*data, name=None if output is None else self.osa_trace_name(output),
                            output_port=output)
@@ -776,18 +898,22 @@ class BenesApp(tk.Tk):
             host, port, simulate = self.osa_connection()
             if not self.osa_output_switch.connected:
                 raise RuntimeError("Connect the OSA output switch first (dry run is available)")
+            outputs = self.osa_output_switch.mapped_outputs()
+            if not outputs:
+                raise RuntimeError("Map at least one output fiber to a JDSU channel in Selector setup")
         except (RuntimeError, ValueError) as error:
             messagebox.showerror("OSA read unavailable", str(error), parent=self)
             return
         self.set_osa_reading(True)
-        self.osa_switch_status_var.set("Reading OSA spectra from outputs 1–6...")
+        self.osa_switch_status_var.set(f"Reading OSA spectra from outputs {', '.join(map(str, outputs))}...")
 
         def acquire_all():
             spectra = []
             try:
-                for output in range(1, 7):
+                for output in outputs:
                     self.osa_output_switch.select_output(output)
-                    spectrum = osa.simulated_spectrum() if simulate else osa.get_spectrum(host, port)
+                    spectrum = osa.simulated_spectrum() if simulate else osa.get_spectrum(
+                        host, port, fresh_sweeps=POST_SWITCH_SWEEPS)
                     spectra.append((output, spectrum))
             except Exception as error:
                 self.after(0, lambda: self.osa_failed(str(error)))
@@ -1791,11 +1917,14 @@ class BenesApp(tk.Tk):
         self.osa_switch_status_var.set(f"OSA read failed: {error}")
         messagebox.showerror("OSA read failed", error, parent=self)
 
-    def show_spectrum(self, wave, power, name=None, restore_buttons=True, output_port=None):
+    def show_spectrum(self, wave, power, name=None, restore_buttons=True, output_port=None, trimmed=False,
+                      markers=()):
+        """Plot an OSA trace; ``markers`` are (wavelength nm, colour, label) drawn as vertical lines."""
         if restore_buttons:
             self.set_osa_reading(False)
         try:
-            wave, power = osa.trim_spurious_tail(wave, power)
+            if not trimmed:
+                wave, power = osa.trim_spurious_tail(wave, power)
         except ValueError as error:
             messagebox.showerror("OSA trace unavailable", str(error), parent=self)
             return
@@ -1841,12 +1970,23 @@ class BenesApp(tk.Tk):
             canvas.get_tk_widget().configure(**PLOT_MIN_SIZE)
             canvas.get_tk_widget().pack(fill="both", expand=True)
         self.osa_axes.plot(wave, power, linewidth=1.2, label=name)
+        # Overlaid traces share their comb lines, so draw each marker once per plot.
+        drawn = {line.get_xdata()[0] for line in self.osa_axes.lines if line.get_gid() == WDM_MARKER_GID}
+        for wavelength, color, label in markers:
+            if wavelength in drawn:
+                continue
+            drawn.add(wavelength)
+            self.osa_axes.axvline(wavelength, color=color, linestyle="--", linewidth=1, gid=WDM_MARKER_GID,
+                                  label="_nolegend_")
+            self.osa_axes.text(wavelength, 0.98, label, color=color, fontsize=8, rotation=90, ha="right", va="top",
+                               transform=self.osa_axes.get_xaxis_transform())
         self.osa_axes.legend(loc="best")
         self.osa_axes.figure.canvas.draw_idle()
 
     def export_spectra(self, axes):
         parent = axes.figure.canvas.get_tk_widget().winfo_toplevel()
-        traces = [(line.get_label(), list(line.get_xdata()), list(line.get_ydata())) for line in axes.lines if line.get_visible()]
+        traces = [(line.get_label(), list(line.get_xdata()), list(line.get_ydata())) for line in axes.lines
+                  if line.get_visible() and line.get_gid() != WDM_MARKER_GID]
         if not traces:
             messagebox.showinfo("Export datasets", "There are no displayed traces to export.", parent=parent)
             return
@@ -1862,6 +2002,413 @@ class BenesApp(tk.Tk):
             messagebox.showerror("Export failed", str(error), parent=parent)
             return
         messagebox.showinfo("Export complete", f"Saved {len(traces)} trace(s) to:\n{path}", parent=parent)
+
+    def build_wdm_tab(self):
+        """Wavelength plan for the WDM comb at the inputs and the per-output OSA scan."""
+        controls_column = ttk.Frame(self.wdm_tab, padding=(18, 18, 8, 18), width=390)
+        controls_column.pack(side="left", fill="y")
+        controls_column.pack_propagate(False)
+        control_scroll = VerticalScrolledFrame(controls_column)
+        control_scroll.pack(fill="both", expand=True)
+        controls = ttk.Frame(control_scroll.content, padding=(0, 0, 12, 0))
+        controls.pack(anchor="nw", fill="x")
+        results = ttk.Frame(self.wdm_tab, padding=(8, 18, 18, 18))
+        results.pack(side="left", fill="both", expand=True)
+
+        settings = self.wdm_plan.settings
+        self.wdm_wavelength_vars = {
+            port: tk.StringVar(value="" if settings["assignment"][str(port)] is None
+                               else f"{settings['assignment'][str(port)]:g}")
+            for port in INPUTS
+        }
+        self.wdm_destination_vars = {port: tk.StringVar() for port in INPUTS}
+        self.wdm_comb_var = tk.StringVar(value=" ".join(f"{line:g}" for line in settings["comb_lines"]))
+        self.wdm_preset_var = tk.StringVar(value=settings["active_preset"] or "")
+        self.wdm_window_var = tk.StringVar(value=f"{settings['half_window_nm']:g}")
+        self.wdm_settle_var = tk.StringVar(value=f"{settings['settle_s']:g}")
+        self.wdm_output_vars = {output: tk.BooleanVar(value=True) for output in OUTPUTS}
+        self.wdm_comment_var = tk.StringVar()
+        self.wdm_dataset_var = tk.BooleanVar(value=False)
+        self.wdm_plot_var = tk.BooleanVar(value=True)
+        self.wdm_status_var = tk.StringVar(value="Assign comb wavelengths to the inputs, then scan the outputs.")
+
+        ttk.Label(controls, text="WDM COMB", foreground=ACCENT, font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(controls, text="Assign one comb line to each input. The current permutation decides the "
+                                 "output where each line should appear.", wraplength=340).pack(anchor="w", pady=(4, 12))
+
+        plan = ttk.LabelFrame(controls, text="Wavelength plan", padding=10)
+        plan.pack(fill="x")
+        ttk.Label(plan, text="Comb lines [nm]").grid(row=0, column=0, sticky="w")
+        comb_entry = ttk.Entry(plan, textvariable=self.wdm_comb_var, width=30)
+        comb_entry.grid(row=0, column=1, columnspan=2, sticky="ew", padx=(8, 0))
+        ttk.Label(plan, text="Optional grid offered in each input's list, e.g. 1549.32 1550.12 1550.92",
+                  foreground="#9baec6", wraplength=320).grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 8))
+        ttk.Label(plan, text="Input").grid(row=2, column=0, sticky="w")
+        ttk.Label(plan, text="λ [nm]").grid(row=2, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(plan, text="Reaches").grid(row=2, column=2, sticky="w", padx=(8, 0))
+        self.wdm_wavelength_boxes = []
+        for row, port in enumerate(INPUTS, start=3):
+            ttk.Label(plan, text=f"In {port} · Fiber {input_fiber_number(port)}", foreground=WDM_COLORS[port - 1]).grid(
+                row=row, column=0, sticky="w", pady=2)
+            box = ttk.Combobox(plan, textvariable=self.wdm_wavelength_vars[port], width=10)
+            box.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=2)
+            self.wdm_wavelength_boxes.append(box)
+            ttk.Label(plan, textvariable=self.wdm_destination_vars[port], foreground=OSA_COLOR).grid(
+                row=row, column=2, sticky="w", padx=(8, 0), pady=2)
+            self.wdm_wavelength_vars[port].trace_add("write", lambda *_: (self.update_wdm_routing(), self.draw()))
+        comb_entry.bind("<FocusOut>", lambda _event: self.update_wdm_comb_choices())
+        comb_entry.bind("<Return>", lambda _event: self.update_wdm_comb_choices())
+        ttk.Button(plan, text="Save plan", style="Accent.TButton", command=self.save_wdm_plan).grid(
+            row=9, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+
+        presets = ttk.LabelFrame(controls, text="Saved wavelength plans", padding=10)
+        presets.pack(fill="x", pady=(12, 0))
+        self.wdm_preset_box = ttk.Combobox(presets, textvariable=self.wdm_preset_var, state="readonly", width=24)
+        self.wdm_preset_box.pack(fill="x")
+        preset_buttons = ttk.Frame(presets)
+        preset_buttons.pack(fill="x", pady=(6, 0))
+        ttk.Button(preset_buttons, text="Load", command=self.load_wdm_preset).pack(side="left", fill="x", expand=True)
+        ttk.Button(preset_buttons, text="Save as…", command=self.save_wdm_preset).pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Button(preset_buttons, text="Delete", command=self.delete_wdm_preset).pack(side="left", fill="x", expand=True)
+
+        scan = ttk.LabelFrame(controls, text="Output scan", padding=10)
+        scan.pack(fill="x", pady=(12, 0))
+        ttk.Label(scan, text="Settling delay [s]").grid(row=0, column=0, sticky="w")
+        ttk.Entry(scan, textvariable=self.wdm_settle_var, width=8).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(scan, text="Waited after each switch move, before reading. Allow at least one full OSA sweep "
+                             "so the trace holds no light from the previous output.",
+                  foreground="#9baec6", wraplength=320).grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 8))
+        ttk.Label(scan, text="Line window ± [nm]").grid(row=2, column=0, sticky="w")
+        ttk.Entry(scan, textvariable=self.wdm_window_var, width=8).grid(row=2, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(scan, text="Outputs").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        output_checks = ttk.Frame(scan)
+        output_checks.grid(row=4, column=0, columnspan=2, sticky="w")
+        for output in OUTPUTS:
+            ttk.Checkbutton(output_checks, text=str(output), variable=self.wdm_output_vars[output]).pack(side="left")
+        ttk.Label(scan, text="Comment").grid(row=5, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(scan, textvariable=self.wdm_comment_var).grid(row=6, column=0, columnspan=2, sticky="ew")
+        ttk.Checkbutton(scan, text="Plot the spectra", variable=self.wdm_plot_var).grid(
+            row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(scan, text="Also record in the linked dataset", variable=self.wdm_dataset_var).grid(
+            row=8, column=0, columnspan=2, sticky="w")
+        scan_buttons = ttk.Frame(scan)
+        scan_buttons.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.wdm_start_button = ttk.Button(scan_buttons, text="Start scan", style="Accent.TButton",
+                                           command=self.start_wdm_scan)
+        self.wdm_start_button.pack(side="left", fill="x", expand=True)
+        self.wdm_stop_button = ttk.Button(scan_buttons, text="Stop", command=self.stop_wdm_scan, state="disabled")
+        self.wdm_stop_button.pack(side="left", padx=(6, 0))
+        ttk.Label(controls, text="Uses the OSA and JDSU settings from Hardware & OSA.",
+                  foreground="#9baec6", wraplength=340).pack(anchor="w", pady=(10, 0))
+        ttk.Label(controls, textvariable=self.wdm_status_var, wraplength=340).pack(anchor="w", pady=(8, 4))
+
+        ttk.Label(results, text="Output measurements", foreground=ACCENT,
+                  font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        ttk.Label(results, text="Peak and window-mean power of the routed comb line at each output. Isolation is "
+                                "the routed peak minus the strongest other comb line.", wraplength=700).pack(anchor="w", pady=(2, 8))
+        # Read-only view of the current switch states with each assigned comb line in its input's colour.
+        self.wdm_canvas = tk.Canvas(results, bg=BG, highlightthickness=0, height=240)
+        self.wdm_canvas.pack(fill="x")
+        self.wdm_canvas.bind("<Configure>", lambda event: self.draw_wdm_diagram())
+        ttk.Label(results, text="Solid: routed light · thin dashes: possible crosstalk from the other switch port",
+                  foreground="#9baec6").pack(anchor="w", pady=(0, 10))
+        style = ttk.Style(self)
+        style.configure("Treeview", background=PANEL, fieldbackground=PANEL, foreground=TEXT, rowheight=24)
+        style.configure("Treeview.Heading", background="#263650", foreground=TEXT, font=("Segoe UI", 9, "bold"))
+        columns = (("output", "Output", 70), ("fiber", "Fiber", 50), ("channel", "JDSU", 50),
+                   ("input", "From input", 80), ("wavelength", "λ [nm]", 90), ("peak", "Peak [dBm]", 85),
+                   ("peak_nm", "Peak λ [nm]", 95), ("mean", "Window mean [dBm]", 120), ("isolation", "Isolation [dB]", 100))
+        table_frame = ttk.Frame(results)
+        table_frame.pack(fill="both", expand=True)
+        self.wdm_table = ttk.Treeview(table_frame, columns=[name for name, _, _ in columns], show="headings", height=8)
+        for name, heading, width in columns:
+            self.wdm_table.heading(name, text=heading)
+            self.wdm_table.column(name, width=width, anchor="center")
+        for port in INPUTS:
+            self.wdm_table.tag_configure(f"input{port}", foreground=WDM_COLORS[port - 1])
+        table_scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.wdm_table.xview,
+                                     style="Accent.Horizontal.TScrollbar")
+        self.wdm_table.configure(xscrollcommand=table_scroll.set)
+        self.wdm_table.pack(fill="both", expand=True)
+        table_scroll.pack(fill="x")
+        self.update_wdm_comb_choices()
+        self.update_wdm_presets()
+
+    def update_wdm_comb_choices(self):
+        values = self.wdm_comb_var.get().replace(",", " ").replace(";", " ").split()
+        for box in self.wdm_wavelength_boxes:
+            box.configure(values=values)
+
+    def update_wdm_presets(self):
+        self.wdm_preset_box.configure(values=sorted(self.wdm_plan.settings["presets"]))
+
+    def wdm_assignment(self):
+        return {str(port): variable.get() for port, variable in self.wdm_wavelength_vars.items()}
+
+    def update_wdm_routing(self):
+        """Show where each assigned comb line leaves the network for the current switch states."""
+        if not hasattr(self, "wdm_destination_vars"):
+            return
+        mapping = self.network.mapping()
+        lines = []
+        for port in INPUTS:
+            output = mapping[port - 1] + 1
+            self.wdm_destination_vars[port].set(f"→ Out {output} · Fiber {fiber_number(output)}")
+            wavelength = self.wdm_wavelength_vars[port].get().strip()
+            if wavelength:
+                lines.append(f"{wavelength} nm: In {port} → Out {output}")
+        self.wdm_route_label.configure(text="WDM COMB    " + "     ".join(lines) if lines else "")
+        self.draw_wdm_diagram()
+
+    def wdm_routes(self):
+        """(input row, wavelength nm, colour) for every input with an assigned comb line."""
+        if not hasattr(self, "wdm_wavelength_vars"):
+            return []
+        routes = []
+        for port in INPUTS:
+            try:
+                wavelength = float(self.wdm_wavelength_vars[port].get())
+            except ValueError:
+                continue
+            routes.append((port - 1, wavelength, WDM_COLORS[port - 1]))
+        return routes
+
+    def draw_wdm_diagram(self):
+        c = getattr(self, "wdm_canvas", None)
+        if c is None:
+            return
+        c.delete("all")
+        width, height = c.winfo_width(), c.winfo_height()
+        if width < 360 or height < 150:
+            return
+        font = ("Segoe UI", 8)
+        left_x, right_x = 92, width - 92
+        first_stage, last_stage = left_x + 45, right_x - 60
+        xs = [first_stage + i * (last_stage - first_stage) / 4 for i in range(5)]
+        ys = [20 + i * (height - 40) / 5 for i in range(6)]
+        half = 11
+        for stage, pairs in enumerate(self.network.pairs):
+            x = xs[stage]
+            for row, y in enumerate(ys):
+                if stage == 0:
+                    c.create_line(left_x + 11, y, x - half, y, fill=WIRE, width=1.5)
+                next_x = xs[stage + 1] - half if stage < 4 else right_x - 11
+                c.create_line(x + half, y, next_x, ys[self.network.links[stage][row]], fill=WIRE, width=1.5)
+                if (stage, row) not in self.network.at:
+                    c.create_line(x - half, y, x + half, y, fill=WIRE, width=1.5)
+            for a, b in pairs:
+                crossed = self.network.states[self.network.at[stage, a]]
+                c.create_rectangle(x - half, ys[a] - 5, x + half, ys[b] + 5, fill=PANEL, outline="#7790ad")
+                for start, end in ((a, b), (b, a)) if crossed else ((a, a), (b, b)):
+                    c.create_line(x - half, ys[start], x + half, ys[end], fill="#a4bad4", width=1.5)
+        routed = {}
+        routes = [(self.network.trace(row), wavelength, color)
+                  for row, wavelength, color in self.wdm_routes()]
+        for route, _, color in routes:
+            for points in self.crosstalk_points(route, right_x - 11, xs, ys, half):
+                c.create_line(*points, fill=color, width=1.5, dash=(3, 4),
+                              joinstyle="round", capstyle="round")
+        for route, wavelength, color in routes:
+            row = route.rows[0]
+            routed[row, "in"] = routed[route.rows[-1], "out"] = (wavelength, color)
+            c.create_line(*self.route_points(route, left_x + 11, right_x - 11, xs, ys, half),
+                          fill=color, width=3, joinstyle="round", capstyle="round")
+        for row, y in enumerate(ys):
+            for side, x, anchor, offset in (("in", left_x, "e", -16), ("out", right_x, "w", 16)):
+                wavelength, color = routed.get((row, side), (None, None))
+                c.create_oval(x - 11, y - 11, x + 11, y + 11, fill=PANEL, outline=color or WIRE,
+                              width=2.5 if color else 1.5)
+                c.create_text(x, y, text=str(row + 1), fill=TEXT, font=("Segoe UI", 9, "bold"))
+                label = f"{'In' if side == 'in' else 'Out'} {row + 1}"
+                if wavelength is not None:
+                    label += f"\n{wavelength:g} nm"
+                c.create_text(x + offset, y, text=label, anchor=anchor, fill=color or "#9baec6", font=font)
+
+    def save_wdm_plan(self, quiet=False):
+        try:
+            self.wdm_plan.configure(self.wdm_assignment(), self.wdm_window_var.get(), self.wdm_settle_var.get(),
+                                    self.wdm_comb_var.get())
+        except (OSError, ValueError) as error:
+            if not quiet:
+                messagebox.showerror("WDM plan", str(error), parent=self)
+            raise
+        self.update_wdm_comb_choices()
+        self.wdm_status_var.set("Wavelength plan saved.")
+        return True
+
+    def set_wdm_assignment(self, assignment):
+        for port in INPUTS:
+            wavelength = assignment[str(port)]
+            self.wdm_wavelength_vars[port].set("" if wavelength is None else f"{wavelength:g}")
+
+    def save_wdm_preset(self):
+        name = simpledialog.askstring("Save wavelength plan", "Name for this wavelength plan:",
+                                      initialvalue=self.wdm_preset_var.get(), parent=self)
+        if name is None:
+            return
+        try:
+            self.save_wdm_plan()
+            self.wdm_plan.save_preset(name)
+        except (OSError, ValueError) as error:
+            messagebox.showerror("WDM plan", str(error), parent=self)
+            return
+        self.update_wdm_presets()
+        self.wdm_preset_var.set(name.strip())
+        self.wdm_status_var.set(f"Saved wavelength plan {name.strip()!r}.")
+
+    def load_wdm_preset(self):
+        name = self.wdm_preset_var.get()
+        if not name:
+            return
+        try:
+            assignment = self.wdm_plan.load_preset(name)
+        except (OSError, ValueError) as error:
+            messagebox.showerror("WDM plan", str(error), parent=self)
+            return
+        self.set_wdm_assignment(assignment)
+        self.wdm_status_var.set(f"Loaded wavelength plan {name!r}.")
+
+    def delete_wdm_preset(self):
+        name = self.wdm_preset_var.get()
+        if not name or not messagebox.askyesno("Delete wavelength plan", f"Delete the plan {name!r}?", parent=self):
+            return
+        try:
+            self.wdm_plan.delete_preset(name)
+        except OSError as error:
+            messagebox.showerror("WDM plan", str(error), parent=self)
+            return
+        self.wdm_preset_var.set("")
+        self.update_wdm_presets()
+
+    def start_wdm_scan(self):
+        if self.wdm_running:
+            return
+        switch = self.osa_output_switch
+        try:
+            try:
+                self.save_wdm_plan(quiet=True)
+            except OSError as error:
+                raise ValueError(f"Could not save the wavelength plan: {error}") from error
+            assignment = dict(self.wdm_plan.assignment)
+            if not any(wavelength is not None for wavelength in assignment.values()):
+                raise ValueError("Assign a comb wavelength to at least one input")
+            host, port, simulate = self.osa_connection()
+            if not switch.connected:
+                raise RuntimeError("Connect the OSA output switch first (dry run is available)")
+            outputs = [output for output, variable in self.wdm_output_vars.items() if variable.get()]
+            if not outputs:
+                raise ValueError("Select at least one output to scan")
+            for output in outputs:
+                switch.channel_for(output)
+            dataset_root = self.dataset_root() if self.wdm_dataset_var.get() else None
+            if dataset_root is not None and not (dataset_root / "benes_dataset.json").exists():
+                raise ValueError("Initialize the linked dataset in Dataset coverage first")
+        except (RuntimeError, ValueError) as error:
+            messagebox.showerror("WDM scan unavailable", str(error), parent=self)
+            return
+
+        mapping = self.network.mapping()
+        permutation = self.active_dataset_permutation()
+        routed = routed_wavelengths(mapping, assignment)
+        settings = self.wdm_plan.settings
+        comment = self.wdm_comment_var.get()
+        context = {
+            "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "permutation": list(permutation),
+            "assignment": assignment,
+            "wavelength_plan": settings["active_preset"],
+            "half_window_nm": settings["half_window_nm"],
+            "settle_s": settings["settle_s"],
+            "jdsu_switch_settle_s": switch.settings["settle_s"],
+            "jdsu_channel_map": dict(switch.settings["channel_map"]),
+            "switch_states": {name: "cross" if crossed else "bar" for name, crossed in self.network.states.items()},
+            "switch_voltages_v": dict(self.controller.settings["voltage"]),
+            "simulated_osa": simulate,
+            "dry_run_switch": switch.settings["dry_run"],
+        }
+
+        def read(output):
+            if simulate:
+                return simulated_comb_spectrum(assignment, routed[output][0])
+            return osa.get_spectrum(host, port, fresh_sweeps=POST_SWITCH_SWEEPS)
+
+        self.wdm_running = True
+        self.wdm_stop_event = threading.Event()
+        self.wdm_start_button.configure(state="disabled")
+        self.wdm_stop_button.configure(state="normal")
+        self.set_osa_reading(True)
+        self.wdm_table.delete(*self.wdm_table.get_children())
+        self.wdm_status_var.set(f"Scanning outputs {', '.join(map(str, outputs))}...")
+        stop_event = self.wdm_stop_event
+
+        markers = [(wavelength, WDM_COLORS[int(port) - 1], f"In {port} · {wavelength:g} nm")
+                   for port, wavelength in assignment.items() if wavelength is not None]
+
+        def on_result(result, index, total):
+            self.after(0, lambda: self.add_wdm_result(result, index, total))
+
+        def worker():
+            results, folder, error = [], None, None
+            try:
+                results = scan_outputs(switch, read, outputs, mapping, assignment, settings["half_window_nm"],
+                                       settings["settle_s"], on_result=on_result, stop_event=stop_event)
+                if results:
+                    complete = {**context, "complete": len(results) == len(outputs)}
+                    folder = create_wdm_folder(app_dir())
+                    files = save_wdm_scan(folder, results, complete, comment)
+                    if dataset_root is not None:
+                        record = save_measurement(
+                            dataset_root, source="OSA WDM", permutation=permutation,
+                            input_ports=[result.routed_input for result in results],
+                            output_ports=[result.output for result in results], mode="routed_pairs",
+                            files=files, comment=comment, extra={"results_folder": str(folder)})
+                        save_wdm_scan(record, results, complete, comment)
+            except Exception as error_value:
+                error = str(error_value)
+            self.after(0, lambda: self.finish_wdm_scan(results, folder, error, stop_event.is_set(),
+                                                       dataset_root is not None, markers))
+
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def add_wdm_result(self, result, index, total):
+        signal = result.signal
+        fmt = lambda value, digits=2: "—" if value is None else f"{value:.{digits}f}"
+        self.wdm_table.insert("", "end", values=(
+            result.output, result.fiber, result.jdsu_channel, result.routed_input,
+            fmt(result.wavelength_nm, 3), fmt(signal and signal.peak_dbm), fmt(signal and signal.peak_nm, 3),
+            fmt(signal and signal.mean_dbm), fmt(result.isolation_db)), tags=(f"input{result.routed_input}",))
+        self.wdm_status_var.set(f"Measured output {result.output} ({index}/{total}).")
+
+    def stop_wdm_scan(self):
+        if self.wdm_stop_event is not None:
+            self.wdm_stop_event.set()
+            self.wdm_status_var.set("Stopping after the current output...")
+
+    def finish_wdm_scan(self, results, folder, error, stopped, recorded, markers=()):
+        self.wdm_running = False
+        self.wdm_start_button.configure(state="normal")
+        self.wdm_stop_button.configure(state="disabled")
+        self.set_osa_reading(False)
+        if results:
+            self.osa_switch_status_var.set(f"OSA sampling output {results[-1].output} after the WDM scan")
+            self.osa_output_var.set(str(results[-1].output))
+        if self.wdm_plot_var.get():
+            for result in results:
+                self.show_spectrum(result.wave, result.power, name=f"WDM Out {result.output} (In {result.routed_input})",
+                                   restore_buttons=False, output_port=result.output, trimmed=True, markers=markers)
+        if error:
+            self.wdm_status_var.set(f"WDM scan failed: {error}" + (f" Partial results saved in {folder}." if folder else ""))
+            messagebox.showerror("WDM scan failed", error, parent=self)
+            return
+        prefix = "WDM scan stopped" if stopped else "WDM scan complete"
+        if folder is None:
+            self.wdm_status_var.set(f"{prefix}; nothing was measured.")
+            return
+        self.wdm_status_var.set(f"{prefix}: {len(results)} output(s) saved in {folder}"
+                                + (" and recorded in the dataset." if recorded else "."))
+        if recorded:
+            self.analyze_linked_dataset()
 
     def build_dataset_tab(self):
         """Build the durable measurement index and coverage view.
@@ -1895,7 +2442,7 @@ class BenesApp(tk.Tk):
         ttk.Entry(folder_box, textvariable=self.dataset_folder_var, width=34).pack(fill="x")
         folder_buttons = ttk.Frame(folder_box)
         folder_buttons.pack(fill="x", pady=(8, 0))
-        ttk.Button(folder_buttons, text="Choose folderâ€¦", command=self.choose_dataset_folder).pack(
+        ttk.Button(folder_buttons, text="Choose folder…", command=self.choose_dataset_folder).pack(
             side="left", fill="x", expand=True)
         ttk.Button(folder_buttons, text="Analyse", style="Accent.TButton",
                    command=self.analyze_linked_dataset).pack(side="left", padx=(6, 0))
@@ -1951,7 +2498,7 @@ class BenesApp(tk.Tk):
 
         ttk.Label(summary, text="Coverage", foreground=ACCENT,
                   font=("Segoe UI", 14, "bold")).pack(anchor="w")
-        ttk.Label(summary, text="The report counts the six routed inputâ†’output paths required for each expected permutation.",
+        ttk.Label(summary, text="The report counts the six routed input→output paths required for each expected permutation.",
                   wraplength=700).pack(anchor="w", pady=(2, 8))
         report_frame = ttk.Frame(summary)
         report_frame.pack(fill="both", expand=True)
@@ -2066,12 +2613,12 @@ class BenesApp(tk.Tk):
             return
         active = self.active_dataset_permutation()
         active_item = next((item for item in report["configurations"] if item["permutation"] == active), None)
-        format_pair = lambda pair: f"In{pair[0]}â†’Out{pair[1]}"
+        format_pair = lambda pair: f"In{pair[0]}→Out{pair[1]}"
         lines = [
             f"Dataset: {root}",
             f"Measurements saved: {report['measurement_count']}",
             f"Configurations complete: {report['complete_configurations']} / {report['expected_configurations']}",
-            f"Routed paths covered: {report['covered_paths']} / {report['expected_paths']}  â€¢  missing {report['missing_paths']}",
+            f"Routed paths covered: {report['covered_paths']} / {report['expected_paths']}  •  missing {report['missing_paths']}",
             f"Detailed CSV: {csv_path.name}",
             "",
         ]
@@ -2091,7 +2638,7 @@ class BenesApp(tk.Tk):
                 missing = ", ".join(map(format_pair, item["missing"]))
                 lines.append(f"  {permutation}: {missing}")
             if len(incomplete) > 30:
-                lines.append(f"  â€¦ plus {len(incomplete) - 30} more in {csv_path.name}")
+                lines.append(f"  … plus {len(incomplete) - 30} more in {csv_path.name}")
         self.set_dataset_report("\n".join(lines))
         self.dataset_status_var.set(f"Coverage analysed: {report['missing_paths']} routed path(s) still missing.")
 
@@ -2107,6 +2654,9 @@ class BenesApp(tk.Tk):
             return
         if self.crosstalk_running:
             messagebox.showinfo("Scan in progress", "Wait for the crosstalk scan to finish and reset the switches to 0 V.", parent=self)
+            return
+        if self.wdm_running:
+            messagebox.showinfo("WDM scan in progress", "Stop the WDM scan and wait for it to finish first.", parent=self)
             return
         self.controller.disconnect()
         self.power_meter.disconnect()
@@ -2412,6 +2962,7 @@ class BenesApp(tk.Tk):
         self.route_label.configure(text=f"{len(self.routes)} possible paths · = straight, X cross, 0V unbiased (routes as cross; click a switch to cycle) · switches omitted from a path are unconstrained" if self.routes else "Current route · select a destination to list every possible path and its required switch states")
         mapping = self.network.mapping()
         self.mapping_label.configure(text="CURRENT CONNECTIONS    " + "     ".join(f"{i + 1} → {out + 1}" for i, out in enumerate(mapping)))
+        self.update_wdm_routing()
         current = mapping[self.source] + 1
         self.status.configure(text=f"Input {self.source + 1} currently reaches output {current}" + (f"   •   Exploring output {self.destination + 1}" if self.destination is not None else ""))
         self.update_hardware_status()
@@ -2492,28 +3043,53 @@ class BenesApp(tk.Tk):
                 c.tag_bind(tag, "<Leave>", lambda event: c.configure(cursor=""))
 
         current = self.network.trace(self.source)
+        wdm = self.wdm_routes()
+        wdm_ends = {}
+        for row, wavelength, color in wdm:
+            wdm_ends[row, "in"] = wdm_ends[self.network.trace(row).rows[-1], "out"] = (wavelength, color)
+        for row, _, color in wdm:
+            for points in self.crosstalk_points(self.network.trace(row), self.right_x - 18,
+                                                self.xs, self.ys, self.switch_half):
+                c.create_line(*points, fill=color, width=1.5, dash=(3, 4),
+                              joinstyle="round", capstyle="round", state="disabled")
+        if not self.routes and (self.source, "in") not in wdm_ends:
+            for points in self.crosstalk_points(current, self.right_x - 18,
+                                                self.xs, self.ys, self.switch_half):
+                c.create_line(*points, fill=ACCENT, width=1.5, dash=(3, 4),
+                              joinstyle="round", capstyle="round", state="disabled")
         if self.routes:
+            for row, _, color in wdm:
+                self.draw_route(self.network.trace(row), color, 3)
             if self.all_paths.get():
                 for index, route in enumerate(self.routes):
                     self.draw_route(route, COLORS[index % len(COLORS)], 2, dashed=True)
             self.draw_route(self.routes[self.selected_route], ACCENT, 4)
-            c.create_text(width / 2, height - 12, text=f"Preview: path {self.selected_route + 1} in green · dashed lines show alternatives · Apply sets the required switches", fill=ACCENT, font=("Segoe UI", 10))
+            c.create_text(width / 2, height - 12, text=f"Preview: path {self.selected_route + 1} in green · broad dashes show alternatives · thin dashes show crosstalk", fill=ACCENT, font=("Segoe UI", 10))
         else:
-            self.draw_route(current, ACCENT, 4)
+            # A wide green halo keeps the selected input visible beneath its comb-line colour.
+            self.draw_route(current, ACCENT, 9 if (self.source, "in") in wdm_ends else 4)
+            for row, _, color in wdm:
+                self.draw_route(self.network.trace(row), color, 3)
+            c.create_text(width / 2, height - 12, text="Solid: routed light · thin dashes: possible crosstalk in the same input colour",
+                          fill="#9baec6", font=font_normal)
         for row, y in enumerate(self.ys):
             for side, x, selected, callback in (
                 ("in", self.left_x, row == self.source, self.click_input),
                 ("out", self.right_x, row == (self.destination if self.destination is not None else current.rows[-1]), self.click_output),
             ):
                 tag = f"{side}:{row}"
-                c.create_oval(x - 18, y - 18, x + 18, y + 18, fill=ACCENT if selected else PANEL, outline=ACCENT if selected else WIRE, width=2, tags=tag)
+                wavelength, wdm_color = wdm_ends.get((row, side), (None, None))
+                outline = ACCENT if selected else wdm_color or WIRE
+                c.create_oval(x - 18, y - 18, x + 18, y + 18, fill=ACCENT if selected else PANEL, outline=outline,
+                              width=3 if wdm_color and not selected else 2, tags=tag)
                 c.create_text(x, y, text=str(row + 1), fill=BG if selected else TEXT, font=("Segoe UI", max(10, round(12 * scale)), "bold"), tags=tag)
-                if side == "in":
-                    c.create_text(x - 25, y, text=f"In {row + 1}\nFiber {15 - row}", anchor="e",
-                                  fill="#9baec6", font=font_small)
-                else:
-                    c.create_text(x + 25, y, text=f"Out {row + 1}\nFiber {4 + row}", anchor="w",
-                                  fill="#9baec6", font=font_small)
+                label_x, anchor = (x - 25, "e") if side == "in" else (x + 25, "w")
+                label = f"In {row + 1}\nFiber {15 - row}" if side == "in" else f"Out {row + 1}\nFiber {4 + row}"
+                label_y = y if wavelength is None else y - round(6 * scale)
+                c.create_text(label_x, label_y, text=label, anchor=anchor, fill="#9baec6", font=font_small)
+                if wavelength is not None:
+                    c.create_text(label_x, y + round(18 * scale), text=f"{wavelength:g} nm", anchor=anchor,
+                                  fill=wdm_color, font=font_small)
                 if side == "out":
                     detector_colors = []
                     if row == self.detector_port(self.power_meter_output_var):
@@ -2528,16 +3104,43 @@ class BenesApp(tk.Tk):
         c.create_text(self.left_x, max(14, round(16 * scale)), text="INPUT", fill=TEXT, font=font_heading)
         c.create_text(self.right_x, max(14, round(16 * scale)), text="OUTPUT", fill=TEXT, font=font_heading)
 
-    def draw_route(self, route, color, line_width, dashed=False):
-        points = [self.left_x + 18, self.ys[route.rows[0]]]
+    def route_points(self, route, start_x, end_x, xs, ys, half):
+        points = [start_x, ys[route.rows[0]]]
         states = dict(route.states)
         for stage, row in enumerate(route.rows[:-1]):
-            x = self.xs[stage]
-            points.extend((x - self.switch_half, self.ys[row]))
+            x = xs[stage]
+            points.extend((x - half, ys[row]))
             name = self.network.at.get((stage, row))
             exit_row = self.network.switch_output(stage, row, states[name] if name else False)
-            points.extend((x + self.switch_half, self.ys[exit_row]))
-        points.extend((self.right_x - 18, self.ys[route.rows[-1]]))
+            points.extend((x + half, ys[exit_row]))
+        points.extend((end_x, ys[route.rows[-1]]))
+        return points
+
+    def crosstalk_points(self, route, end_x, xs, ys, half):
+        """Possible leakage from each used switch's other port, then along current states."""
+        states = self.network.states
+        for stage, row in enumerate(route.rows[:-1]):
+            name = self.network.at.get((stage, row))
+            if name is None:
+                continue
+            a, b = self.network.switches[name][1]
+            main_exit = self.network.switch_output(stage, row, states[name])
+            other_exit = b if main_exit == a else a
+            points = [xs[stage] - half, ys[row], xs[stage] + half, ys[other_exit]]
+            next_row = self.network.links[stage][other_exit]
+            for next_stage in range(stage + 1, len(self.network.pairs)):
+                x = xs[next_stage]
+                points.extend((x - half, ys[next_row]))
+                next_name = self.network.at.get((next_stage, next_row))
+                exit_row = self.network.switch_output(
+                    next_stage, next_row, states[next_name] if next_name else False)
+                points.extend((x + half, ys[exit_row]))
+                next_row = self.network.links[next_stage][exit_row]
+            points.extend((end_x, ys[next_row]))
+            yield points
+
+    def draw_route(self, route, color, line_width, dashed=False):
+        points = self.route_points(route, self.left_x + 18, self.right_x - 18, self.xs, self.ys, self.switch_half)
         self.canvas.create_line(*points, fill=color, width=line_width, dash=(5, 5) if dashed else (), joinstyle="round", capstyle="round", state="disabled")
 
 

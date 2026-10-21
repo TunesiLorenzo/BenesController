@@ -9,6 +9,22 @@ from impulse_test import validate_impulse_settings
 
 
 class PathProgressTests(unittest.TestCase):
+    def test_crosstalk_branches_use_other_port_and_follow_downstream_switches(self):
+        network = BenesNetwork()
+        app = SimpleNamespace(network=network)
+        xs = [100, 200, 300, 400, 500]
+        ys = [10, 30, 50, 70, 90, 110]
+        for crossed, other_exit in ((True, 0), (False, 1)):
+            network.states["S1.1"] = crossed
+            route = network.trace(0)
+            branches = list(BenesApp.crosstalk_points(app, route, 600, xs, ys, 10))
+            self.assertEqual(len(branches), len(route.states))
+            self.assertEqual(branches[0][:4], [90, 10, 110, ys[other_exit]])
+            row = network.links[0][other_exit]
+            for stage in range(1, len(network.pairs)):
+                row = network.step(stage, row, network.states.get(network.at.get((stage, row)), False))
+            self.assertEqual(branches[0][-2:], [600, ys[row]])
+
     def test_impulse_time_fields_accept_scientific_notation_in_seconds(self):
         values = {
             "Low voltage [V]": "0", "High voltage [V]": "2e0",

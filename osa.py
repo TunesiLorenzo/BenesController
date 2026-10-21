@@ -2,6 +2,7 @@
 
 import math
 import socket
+import time
 
 
 C = 299792458
@@ -43,7 +44,35 @@ def simulated_spectrum(points=4001):
     return scale_curve(raw, xoff, xscale, 0.0, 0.01)
 
 
-def get_spectrum(host="192.168.0.200", port=8002, timeout=10, curve=1):
+def wait_for_fresh_trace(fetch, needed, max_wait_s=30.0, baseline=None, poll_s=0.1,
+                         clock=time.monotonic, sleep=time.sleep):
+    """Return the curve buffer once it has been republished ``needed`` times.
+
+    The OSA replaces the whole buffer when a sweep completes (every 1.5–3 s on
+    the lab instrument), so a changed buffer marks one finished sweep.
+    ``baseline`` is a buffer read earlier, e.g. just before starting a sweep.
+    """
+    buffer = fetch() if baseline is None else baseline
+    deadline = clock() + max_wait_s
+    while needed > 0:
+        if clock() >= deadline:
+            raise TimeoutError(f"The OSA trace did not refresh within {max_wait_s:g} s; check that it is sweeping")
+        sleep(poll_s)
+        latest = fetch()
+        if latest != buffer:
+            buffer = latest
+            needed -= 1
+    return buffer
+
+
+def get_spectrum(host="192.168.0.200", port=8002, timeout=10, curve=1, fresh_sweeps=0, max_wait_s=30.0):
+    """Download a trace; ``fresh_sweeps`` waits for that many sweeps to complete first.
+
+    After moving the output switch use ``fresh_sweeps=2``: the first new sweep
+    may have started before the move, the second lies wholly after it.  When the
+    OSA was stopped, the sweep this call starts is already wholly fresh, so one
+    is enough, and the stale buffer from before the start is never returned.
+    """
     with socket.create_connection((host, port), timeout=timeout) as connection:
         stream = connection.makefile("rwb")
 
@@ -60,10 +89,16 @@ def get_spectrum(host="192.168.0.200", port=8002, timeout=10, curve=1):
 
         write("*REM")
         query("*IDN?")
-        if query("STAT:ACQ?") == "STOPPED":
-            write("KEY START")
         write(f":CUR:SELECT {curve}")
         query(":CUR:SIZE?")
-        raw = parse_curve(query(":CUR:BUFF?"))
+        started = query("STAT:ACQ?") == "STOPPED"
+        if started:
+            # Capture the stale buffer first so the new sweep is recognised.
+            stale = query(":CUR:BUFF?")
+            write("KEY START")
+            buffer = wait_for_fresh_trace(lambda: query(":CUR:BUFF?"), 1, max_wait_s, baseline=stale)
+        else:
+            buffer = wait_for_fresh_trace(lambda: query(":CUR:BUFF?"), fresh_sweeps, max_wait_s)
+        raw = parse_curve(buffer)
         xoff, xscale, yoff, yscale = (float(query(f":CUR:{name}?")) for name in ("XOFF", "XSCale", "YOFF", "YSCale"))
     return scale_curve(raw, xoff, xscale, yoff, yscale)

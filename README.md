@@ -56,20 +56,57 @@ the file. Plotting needs matplotlib (`python -m pip install matplotlib`).
 
 ### OSA output selector
 
-The **OSA & output switch** hardware page provides a persistent framework for
-the external switch that routes one Benes output to the OSA. Select an output and
-use **Route + read**, or use **Read all six outputs** to acquire the six spectra
-sequentially—useful when different signals are present at all inputs in parallel.
-Every automatic trace is labelled with the current `In → Out` connection and the
-output/fiber number; all traces can be exported together from the spectrum plot
-window.
+All six Benes output fibers are patched into a JDSU SC optical switch (GPIB),
+whose common port feeds the OSA. The **OSA & output switch** hardware page
+selects which output the OSA samples. Choosing an output there, or in the **OSA
+output** picker on the routing tab, immediately closes the matching JDSU channel
+(the two pickers stay in sync). **Route + read** routes and acquires one output;
+**Read all outputs** acquires every mapped output sequentially—useful when
+different signals are present at all inputs in parallel. Every automatic trace is
+labelled with the current `In → Out` connection and the output/fiber number; all
+traces can be exported together from the spectrum plot window.
 
-Until the switch protocol is known, connect it in **Dry run** mode. For serial
-switches, enter the serial port, baud rate, settling time, and a command template
-containing `{port}`, for example `OUT {port}`. The application persists this in
-`benes_osa_output_switch_config.json`; it will send the rendered command followed
-by a newline. Reply parsing, command acknowledgements, or a non-serial interface
-can be added later in `osa_output_switch.py` without changing the OSA scan flow.
+**Selector setup…** holds the VISA resource (default `GPIB0::25::INSTR`; **List**
+shows detected resources), an extra settling delay, **Dry run**, and the
+**Output fiber → JDSU channel** table (default: output *n* → channel *n*; each
+channel may be used once, `—` leaves an output unmapped). The mapping can be
+edited and saved while connected. The switch must use its SC command set with
+CR+LF termination: the application sends `CLOSE n`, waits for bit 2 of `CNB?`,
+and verifies the channel with `CLOSE?`, as in the sister `Jdsu_switch` project.
+After each switch move, reads wait for the OSA to finish two new sweeps (the first may have begun before the move); if the OSA was stopped, the read starts it and waits for that one sweep. A trace therefore never contains light from the previous output, whatever the sweep time. Settings and the mapping persist in `benes_osa_output_switch_config.json`.
+Physical mode needs NI-VISA and `python -m pip install pyvisa`.
+
+### WDM comb plan and output scan
+
+The **WDM comb** tab records which comb wavelength enters each input. Type a
+wavelength per input, or list the comb grid under **Comb lines** and pick from
+each input's dropdown; an input left empty carries no line. Beside each input the
+tab shows the output and fiber it currently reaches, and the routing tab lists
+every `λ: In → Out` pair, both following the applied permutation. **Save plan**
+keeps the plan in `benes_wdm_plan_config.json`; **Saved wavelength plans** stores
+named plans to load later.
+
+**Start scan** routes the JDSU to each selected output, waits the **Settling
+delay**, reads the OSA (Hardware & OSA settings; **Simulate** gives a synthetic
+comb) and measures every assigned comb line within **Line window ±** of its
+wavelength. The delay should cover the switch settling and at least one complete
+OSA sweep, so a trace holds no light from the previous output; the JDSU's own
+settle check and its extra delay from **Selector setup…** still run first.
+**Stop** ends the scan after the current wait or read and still saves the outputs
+measured so far.
+
+The table lists, per output, the routed input and wavelength, the routed line's
+peak power and wavelength, the linear mean over the window, and the isolation:
+the routed peak minus the strongest other comb line at that output. Each scan is
+saved in `Results/WDM_scan/<timestamp>/`:
+
+- `wdm_summary.csv`: one row per output, as in the table.
+- `wdm_line_matrix.csv`: peak power of every input's line (columns) at every output (rows).
+- `wdm_spectra.csv`: all spectra.
+- `wdm_scan.json`: permutation, wavelength plan, delays, JDSU map, switch states and voltages.
+
+With **Also record in the linked dataset**, the same files are also registered as
+an `OSA WDM` measurement in the dataset chosen in **Dataset coverage**.
 
 ## Permutation measurement datasets
 
@@ -280,6 +317,7 @@ repeating a path cannot mark the plan complete early. Choose the settling time
 and the number of Arduino burst averages per voltage point before starting a path.
 
 - Click an **input** to highlight its actual path and current output.
+- Thin dashed lines in the input's colour show where possible crosstalk leaves the unused port of each switch and travels through downstream switches. These paths are illustrative; their optical power is not measured by the diagram.
 - Click an **output**, or choose a destination above the diagram, to enumerate every physical path between the selected ports. Select **Trace current** to return to the actual route.
 - The route list gives the required switch states: **=** means straight; **X** means cross. Switches absent from a route may have either state.
 - Select a path to highlight it in green. The overlay checkbox shows all alternatives with dashed lines. This is a preview until you click **Apply selected path to switches**.
