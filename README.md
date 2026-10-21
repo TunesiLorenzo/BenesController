@@ -33,8 +33,10 @@ confirmation before the board sends it; the prompt reminds you to disconnect
 the Arduino sampler from the voltage-board signal and check the heater current
 limit.
 
-Board connection and measurement controls live under the **Boards & measurement**
-tab at the top of the window.
+The UI is organized by workflow: **Routing**, **Hardware & OSA**, **Calibration
+scans**, and **Impulse test**. Hardware & OSA separates the voltage board, OSA
+and its output selector, and Arduino meter into sub-tabs so every control remains
+visible on a laptop display.
 
 Every tab and dialog stretches to fill its window and scrolls when the window
 is smaller than its content. Vertical and horizontal scrollbars appear only
@@ -51,6 +53,46 @@ window**, name each trace, and use **Export displayed datasets** in a plot windo
 to write every visible trace to CSV. The export dialog asks for an optional
 description, which is included as `# Description:` comment line(s) at the top of
 the file. Plotting needs matplotlib (`python -m pip install matplotlib`).
+
+### OSA output selector
+
+The **OSA & output switch** hardware page provides a persistent framework for
+the external switch that routes one Benes output to the OSA. Select an output and
+use **Route + read**, or use **Read all six outputs** to acquire the six spectra
+sequentially—useful when different signals are present at all inputs in parallel.
+Every automatic trace is labelled with the current `In → Out` connection and the
+output/fiber number; all traces can be exported together from the spectrum plot
+window.
+
+Until the switch protocol is known, connect it in **Dry run** mode. For serial
+switches, enter the serial port, baud rate, settling time, and a command template
+containing `{port}`, for example `OUT {port}`. The application persists this in
+`benes_osa_output_switch_config.json`; it will send the rendered command followed
+by a newline. Reply parsing, command acknowledgements, or a non-serial interface
+can be added later in `osa_output_switch.py` without changing the OSA scan flow.
+
+## Permutation measurement datasets
+
+The **Dataset coverage** tab links a folder to a structured Benes measurement
+dataset. Initialize it for the full 720 six-port permutations, or for just the
+currently applied permutation. Each saved acquisition receives its own folder
+under `Measurements/`, containing the raw CSV and a `measurement.json` sidecar
+with the active permutation, selected inputs and outputs, source, comment, and
+the exact atomic inputâ†’output connections it represents.
+
+Choose one or more input and output ports before saving. This supports one-input/
+one-output, many-input/one-output, and many-input/many-output acquisitions. For
+an OSA save, acquire each selected output using **Route + read** or **Read all
+outputs** first; the app stores one current spectrum per selected output in the
+same CSV. For the Arduino source, read the current power first. The selection is
+deliberate metadata: it states which parallel signals or routes the reading
+represents rather than guessing from filenames.
+
+Press **Analyse** at any time to calculate coverage. The panel reports the active
+permutation's missing routed pairs and a compact list of other incomplete
+configurations. `coverage_report.csv` in the dataset root holds the full
+configuration-by-configuration list, so it remains practical for all 720
+permutations.
 
 ## Arduino power meter
 
