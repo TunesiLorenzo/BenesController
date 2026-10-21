@@ -36,6 +36,14 @@ limit.
 Board connection and measurement controls live under the **Boards & measurement**
 tab at the top of the window.
 
+Every tab and dialog stretches to fill its window and scrolls when the window
+is smaller than its content. Vertical and horizontal scrollbars appear only
+when needed. The mouse wheel scrolls the area under the pointer
+(Shift+wheel scrolls horizontally). Dialogs open at their natural size,
+capped to the screen. The mapping dialog keeps **Save**/**Cancel** visible
+below its scrolling table. Plots rescale with the window down to about
+480 × 320 px, then the tab scrolls instead.
+
 ## OSA traces
 
 The **OSA** row reads trace 1 from a VIAVI OSA 500RS. Choose **Overlay** or **New
@@ -119,14 +127,43 @@ show the measured maximum and minimum. Assign each extreme to **Straight** or
 switch state changes. Keep the optical input and other switch states fixed
 during a scan.
 
-The mapping dialog also has an **R [Ω]** column for each pin's heater
-resistance and a **Default R [Ω]** used for pins left blank. The **X axis**
-selector above the Crosstalk-tab plots switches every response plot, including
-rescans and the saved PNGs, between commanded voltage and heater power
-P = V²/R in mW. Switches with no resistance stay in volts. All controls and
-scan limits remain in volts, and `base_setting.json` records the resistance
-used for each scanned switch. The voltage board has no readback, so power is
-computed from the commanded voltage, not measured.
+The mapping dialog also records each pin's heater: **R heater [Ω]**, **R total
+[Ω]** (heater plus routing, pad to pad) and **J peak/V** (peak current density
+per applied volt, in mA/µm²/V). **Import heater CSV...** reads the
+`mzi_results.csv` written by the sibling GDS_heater project (for example
+`../GDS_heater/Setups/`). Pick a row's device in the **Device** column to fill
+its values. On import, rows without a device in the file are filled in file
+order, so check the assignment before saving. J peak/V is the heater's
+`J peak` divided by the file's `V [V]`; the routing density is not used, as the
+limits apply to the heater.
+**Default R [Ω]** is used as both resistances for pins with a blank R heater, and
+a blank R total equals R heater. The current is I = V / R total and the heater
+power is I²·R heater.
+
+**Max V safe / break** gives the voltage at which the heater's peak current
+density reaches 50 mA/µm² (safe) and 70 mA/µm² (break), with the currents at those
+voltages. It turns amber when a saved straight/cross voltage exceeds the safe
+limit and red when one reaches the break limit. The power-scan window also
+shows the limits.
+
+The limits are enforced on every voltage sent to the board: manual entry,
+switch toggles and routes, scans, path calibration, impulse tests, and the
+saved voltages sent on connect. Sign is ignored, since current flows either
+way. A voltage at or above the break limit is always refused, with no
+override. A voltage above the safe limit asks for confirmation first; each
+approval covers that switch and voltage until the mapping is saved or the
+application restarts. Scans, path calibration and impulse tests check their
+whole voltage list before starting: one break-limit voltage stops the run, and
+all over-safe voltages are approved in a single prompt. Switches without a
+J peak/V value only have the 0–5 V confirmation.
+
+The **X axis** selector above the Crosstalk-tab plots switches every response
+plot, including rescans and the saved PNGs, between commanded voltage and
+heater power in mW. Switches with no resistance stay in volts. All controls and
+scan limits remain in volts, and `base_setting.json` records both resistances
+used for each scanned switch. Runs saved before R total was recorded plot as
+V²/R. The voltage board has no readback, so power is computed from the
+commanded voltage, not measured.
 
 The **Crosstalk** tab can scan several switches in sequence. Select switches
 with Ctrl or Shift, choose **Arduino** or **OSA**, enter the lower and upper

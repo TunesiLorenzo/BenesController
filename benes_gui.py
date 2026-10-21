@@ -22,6 +22,11 @@ import osa
 from power_meter import ArduinoPowerMeter
 from spectrum_export import write_crosstalk_csv, write_spectra
 from voltage_controller import BenesVoltageController, app_dir
+from heater_setup import BREAK_CURRENT_DENSITY, SAFE_CURRENT_DENSITY, load_heater_csv, voltage_limit
+from scrollable import ScrollableFrame, fit_to_screen
+
+# Smallest plot area before the tab scrolls instead of squeezing the figure further.
+PLOT_MIN_SIZE = {"width": 480, "height": 320}
 
 
 BG = "#101827"
@@ -41,13 +46,17 @@ class BenesApp(tk.Tk):
         self.title("Beneš • 6 × 6 route explorer")
         # The diagram reflows with the canvas, so it remains usable on a laptop
         # display instead of requiring a wide desktop window.
-        self.geometry("1180x880")
-        self.minsize(900, 700)
+        # Tabs scroll when the window is smaller than their content, so the
+        # window only has to fit the screen.
+        self.geometry(f"{min(1180, self.winfo_screenwidth() - 40)}x{min(880, self.winfo_screenheight() - 80)}")
+        self.minsize(480, 360)
         self.configure(bg=BG)
         self.network = BenesNetwork()
         self.controller = BenesVoltageController(tuple(self.network.switches))
         self._approved_unsafe_voltages = set()
+        self._approved_over_safe = set()
         self.controller.unsafe_voltage_authorizer = self.confirm_unsafe_voltage
+        self.controller.current_density_authorizer = self.confirm_over_safe_current
         self.power_meter = ArduinoPowerMeter()
         self.scan_settings = {}
         self.crosstalk_running = False
@@ -104,6 +113,11 @@ class BenesApp(tk.Tk):
         style.map("TCombobox", fieldbackground=[("readonly", PANEL)], foreground=[("readonly", TEXT)])
         style.configure("TLabelframe", background=BG, foreground=TEXT)
         style.configure("TLabelframe.Label", background=BG, foreground=TEXT, font=("Segoe UI", 10, "bold"))
+        # High-contrast scrollbars so it is obvious when a window has more content.
+        for orient in ("Vertical", "Horizontal"):
+            style.configure(f"{orient}.TScrollbar", background="#5d7a9c", troughcolor=PANEL,
+                            bordercolor=PANEL, arrowcolor=TEXT, gripcount=0)
+            style.map(f"{orient}.TScrollbar", background=[("active", "#7f9cc0")])
 
         header = ttk.Frame(self, padding=(24, 18, 24, 8))
         header.pack(fill="x")
@@ -112,14 +126,13 @@ class BenesApp(tk.Tk):
 
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-        self.route_tab = ttk.Frame(self.notebook)
-        self.hardware_tab = ttk.Frame(self.notebook)
-        self.crosstalk_tab = ttk.Frame(self.notebook)
-        self.impulse_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.route_tab, text="Route explorer")
-        self.notebook.add(self.hardware_tab, text="Boards & measurement")
-        self.notebook.add(self.crosstalk_tab, text="Crosstalk & calibration")
-        self.notebook.add(self.impulse_tab, text="Impulse test")
+        # Each tab fills the window when it fits and scrolls when the window is smaller.
+        tabs = []
+        for text in ("Route explorer", "Boards & measurement", "Crosstalk & calibration", "Impulse test"):
+            scroller = ScrollableFrame(self.notebook, background=BG)
+            self.notebook.add(scroller, text=text)
+            tabs.append(scroller.inner)
+        self.route_tab, self.hardware_tab, self.crosstalk_tab, self.impulse_tab = tabs
 
         controls = ttk.Frame(self.route_tab, padding=(24, 8))
         controls.pack(fill="x")
@@ -272,8 +285,8 @@ class BenesApp(tk.Tk):
                                   values=("Voltage [V]", "Heater power [mW]"), state="readonly", width=18)
         plot_x_box.pack(side="left", padx=(8, 10))
         plot_x_box.bind("<<ComboboxSelected>>", lambda event: self.replot_crosstalk_x_axis())
-        ttk.Label(plot_bar, text="Power = V² / R, with R set per pin in MZI / pin mapping. Control stays in volts.",
-                  foreground="#9baec6").pack(side="left")
+        ttk.Label(plot_bar, text="Heater power = I²·R heater with I = V / R total, set per pin in MZI / pin mapping. "
+                  "Control stays in volts.", foreground="#9baec6", wraplength=420).pack(side="left")
         self.crosstalk_plot_frame = ttk.Frame(plot_area)
         self.crosstalk_plot_frame.pack(side="top", fill="both", expand=True)
         ttk.Label(self.crosstalk_plot_frame, text="Power versus voltage will appear here after a scan.").pack(anchor="center", expand=True)
@@ -288,8 +301,8 @@ class BenesApp(tk.Tk):
         route_body = ttk.Frame(self.route_tab, padding=(12, 0, 12, 10))
         route_body.pack(fill="both", expand=True)
         route_sidebar = ttk.LabelFrame(route_body, text="Routing controls", padding=(12, 8), width=285)
+        # Natural size (no pack_propagate(False)) so the tab knows when to scroll.
         route_sidebar.pack(side="right", fill="y", padx=(12, 0))
-        route_sidebar.pack_propagate(False)
 
         self.route_label = ttk.Label(route_sidebar, text="", wraplength=255, justify="left")
         self.route_label.pack(anchor="w", fill="x")
@@ -342,22 +355,14 @@ class BenesApp(tk.Tk):
         value = variable.get()
         return None if value == "None" else int(value) - 1
 
-    def confirm_unsafe_voltage(self, name, voltage):
-        if voltage in self._approved_unsafe_voltages:
-            return True
+    def _ask_on_main_thread(self, title, message, icon=messagebox.QUESTION):
+        """Ask a yes/no question, also from a scan worker thread."""
         accepted = [False]
         ready = threading.Event()
 
         def ask():
             try:
-                accepted[0] = messagebox.askyesno(
-                    "Voltage outside 0–5 V",
-                    f"{name} is about to receive {voltage:g} V.\n\n"
-                    "Disconnect the Arduino sampler from the voltage-board signal "
-                    "and check the heater overcurrent limit before continuing.\n\n"
-                    "Apply this voltage?",
-                    parent=self,
-                )
+                accepted[0] = messagebox.askyesno(title, message, icon=icon, parent=self)
             finally:
                 ready.set()
 
@@ -366,11 +371,61 @@ class BenesApp(tk.Tk):
         else:
             self.after(0, ask)
             ready.wait()
-        if accepted[0]:
-            self._approved_unsafe_voltages.add(voltage)
         return accepted[0]
 
-    def confirm_voltage_sweep(self, voltages, parent=None):
+    def confirm_unsafe_voltage(self, name, voltage):
+        if voltage in self._approved_unsafe_voltages:
+            return True
+        accepted = self._ask_on_main_thread(
+            "Voltage outside 0–5 V",
+            f"{name} is about to receive {voltage:g} V.\n\n"
+            "Disconnect the Arduino sampler from the voltage-board signal "
+            "and check the heater overcurrent limit before continuing.\n\n"
+            "Apply this voltage?",
+        )
+        if accepted:
+            self._approved_unsafe_voltages.add(voltage)
+        return accepted
+
+    def confirm_over_safe_current(self, name, voltage, safe):
+        """Warn before a heater exceeds the safe current density."""
+        if (name, voltage) in self._approved_over_safe:
+            return True
+        broken = self.controller.voltage_limits(name)[1]
+        accepted = self._ask_on_main_thread(
+            "Heater current above the safe limit",
+            f"{name} is about to receive {voltage:g} V, above its {SAFE_CURRENT_DENSITY:g} mA/µm² "
+            f"safe current density ({safe:.2f} V).\n\n"
+            f"The hard limit is {broken:.2f} V ({BREAK_CURRENT_DENSITY:g} mA/µm²).\n\n"
+            "Apply this voltage?",
+            icon=messagebox.WARNING,
+        )
+        if accepted:
+            self._approved_over_safe.add((name, voltage))
+        return accepted
+
+    def confirm_voltage_sweep(self, voltages, parent=None, names=()):
+        """Check a planned sweep against heater limits and the 0–5 V range up front."""
+        # The break limit is never overridable, so refuse the whole sweep before it starts.
+        for name in names:
+            for voltage in voltages:
+                self.controller.check_current_density(name, voltage)
+        over_safe = {(name, voltage) for name in names for voltage in voltages
+                     if self.controller.check_current_density(name, voltage) is not None
+                     and (name, voltage) not in self._approved_over_safe}
+        if over_safe:
+            lines = "\n".join(
+                f"{name}: safe up to {self.controller.voltage_limits(name)[0]:.2f} V, "
+                f"scan reaches {max(abs(v) for n, v in over_safe if n == name):g} V"
+                for name in sorted({name for name, _ in over_safe}))
+            if not messagebox.askyesno(
+                "Heater current above the safe limit",
+                f"This sweep exceeds the {SAFE_CURRENT_DENSITY:g} mA/µm² safe current density:\n\n"
+                f"{lines}\n\nApprove these voltages?",
+                icon=messagebox.WARNING, parent=parent or self,
+            ):
+                raise ValueError("Voltages above the safe current density were not confirmed")
+            self._approved_over_safe.update(over_safe)
         unsafe = {voltage for voltage in voltages
                   if not 0 <= voltage <= 5 and voltage not in self._approved_unsafe_voltages}
         if not unsafe:
@@ -566,7 +621,7 @@ class BenesApp(tk.Tk):
             for name in self.network.switches:
                 if self.controller.settings["mapping"].get(name) is None:
                     raise ValueError(f"Assign a voltage-board pin to every MZI before automatic path calibration ({name} is unassigned)")
-            self.confirm_voltage_sweep(voltages)
+            self.confirm_voltage_sweep(voltages, names=names)
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk  # noqa: F401
             from matplotlib.figure import Figure  # noqa: F401
         except (ImportError, OSError, RuntimeError, ValueError) as error:
@@ -756,7 +811,7 @@ class BenesApp(tk.Tk):
             for name in names:
                 if self.controller.settings["mapping"][name] is None:
                     raise ValueError(f"Assign a voltage-board pin to {name} first")
-            self.confirm_voltage_sweep(voltages)
+            self.confirm_voltage_sweep(voltages, names=names)
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk  # noqa: F401
             from matplotlib.figure import Figure  # noqa: F401
         except (ImportError, OSError, RuntimeError, ValueError) as error:
@@ -945,6 +1000,7 @@ class BenesApp(tk.Tk):
             canvas = FigureCanvasTkAgg(figure, master=tab)
             toolbar = NavigationToolbar2Tk(canvas, tab)
             toolbar.update()
+            canvas.get_tk_widget().configure(**PLOT_MIN_SIZE)
             canvas.get_tk_widget().pack(fill="both", expand=True)
             plot = {"canvas": canvas, "toolbar": toolbar, "response": response, "line": line,
                     "mean_line": mean_line, "means": [],
@@ -1006,9 +1062,9 @@ class BenesApp(tk.Tk):
 
     def plot_x(self, name, voltages):
         """X values and label for a switch's voltages under the selected axis mode."""
-        resistance = (getattr(self, "plot_resistance_override", {}).get(name)
-                      or self.controller.heater_resistance(name))
-        return plot_x_values(voltages, resistance, self.plot_x_mode())
+        resistance, total = (getattr(self, "plot_resistance_override", {}).get(name)
+                             or (self.controller.heater_resistance(name), self.controller.total_resistance(name)))
+        return plot_x_values(voltages, resistance, self.plot_x_mode(), total)
 
     def open_results_folder(self):
         """Replot a saved crosstalk scan or path calibration."""
@@ -1034,7 +1090,9 @@ class BenesApp(tk.Tk):
             messagebox.showinfo("No measurements", f"{folder.name} contains no measured points.", parent=self)
             return
         self.prepare_crosstalk_plots(voltages)
-        self.plot_resistance_override = {name: value for name, value in
+        # Runs saved before R total was recorded used P = V^2 / R heater.
+        totals = context.get("total_resistance_ohm", {})
+        self.plot_resistance_override = {name: (value, totals.get(name)) for name, value in
                                          context.get("heater_resistance_ohm", {}).items() if value}
         self.add_results_setup_tab(folder, context, loaded["comment"])
         for name, points in data.items():
@@ -1152,15 +1210,84 @@ class BenesApp(tk.Tk):
         dialog.configure(bg=BG)
         dialog.transient(self)
         dialog.grab_set()
-        body = ttk.Frame(dialog, padding=18)
-        body.pack(fill="both", expand=True)
+        # Save/Cancel stay visible at the bottom; the table scrolls above them.
+        buttons = ttk.Frame(dialog, padding=(18, 10, 18, 14))
+        buttons.pack(side="bottom", fill="x")
+        scroller = ScrollableFrame(dialog, background=BG, padding=18)
+        scroller.pack(side="top", fill="both", expand=True)
+        body = scroller.inner
         ttk.Label(body, text="Assign each MZI to a unique VoltageTuner pin (0–15).", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(body, text="Save a pin mapping before scanning. Each scan restores the switch voltage; choose which power extreme means straight and cross.", wraplength=650).grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 14))
-        for column, title in enumerate(("MZI", "Pin", "R [Ω]", "Straight [V]", "Cross [V]", "Power scan", "Saved values")):
-            ttk.Label(body, text=title).grid(row=2, column=column, sticky="w", padx=(0, 14), pady=(0, 4))
+        for column, title in enumerate(("MZI", "Pin", "Device", "R heater [Ω]", "R total [Ω]",
+                                        "J peak/V [mA/µm²/V]", "Max V safe / break", "Straight [V]",
+                                        "Cross [V]", "Power scan", "Saved values")):
+            ttk.Label(body, text=title).grid(row=2, column=column, sticky="w", padx=(0, 10), pady=(0, 4))
         pin_vars, straight_vars, cross_vars, resistance_vars = {}, {}, {}, {}
-        resistances = self.controller.settings["heater_resistance_ohm"]
+        device_vars, total_vars, density_vars, limit_labels, device_boxes = {}, {}, {}, {}, []
+        settings = self.controller.settings
         choices = ("Unassigned",) + tuple(str(pin) for pin in range(16))
+
+        def parse_float(text):
+            try:
+                return float(text)
+            except ValueError:
+                return None
+
+        def optional_float(text):
+            value = parse_float(text)
+            return value if value is not None and value > 0 else None
+
+        def update_limits(name):
+            """Show the voltages (and currents) at the safe and break current densities."""
+            density = optional_float(density_vars[name].get())
+            safe = voltage_limit(density, SAFE_CURRENT_DENSITY)
+            if safe is None:
+                limit_labels[name].configure(text="—", foreground=TEXT)
+                return
+            broken = voltage_limit(density, BREAK_CURRENT_DENSITY)
+            text = f"{safe:.2f} / {broken:.2f} V"
+            total = (optional_float(total_vars[name].get()) or optional_float(resistance_vars[name].get())
+                     or optional_float(default_resistance_var.get()))
+            if total:
+                text += f"  ({safe / total * 1000:.1f} / {broken / total * 1000:.1f} mA)"
+            # Flag saved calibration voltages that exceed a limit.
+            saved = [abs(value) for value in map(parse_float, (straight_vars[name].get(), cross_vars[name].get()))
+                     if value is not None]
+            highest = max(saved, default=0.0)
+            color = "#ff6b6b" if highest >= broken else ZERO_VOLT_COLOR if highest > safe else TEXT
+            limit_labels[name].configure(text=text, foreground=color)
+
+        def apply_device(name):
+            device = self.controller.imported_heaters().get(device_vars[name].get())
+            if device is not None:
+                resistance_vars[name].set(f"{device.r_heater_ohm:g}")
+                total_vars[name].set(f"{device.r_total_ohm:g}")
+                density_vars[name].set(f"{device.j_peak_per_v:.4g}")
+
+        def import_heaters():
+            setups = app_dir().parent / "GDS_heater" / "Setups"
+            path = filedialog.askopenfilename(
+                parent=dialog, title="Import heater resistances (GDS_heater CSV)",
+                initialdir=str(setups if setups.exists() else app_dir()),
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+            if not path:
+                return
+            try:
+                devices = load_heater_csv(path)
+                self.controller.set_imported_heaters(devices)
+            except (OSError, ValueError) as error:
+                messagebox.showerror("Could not import heater CSV", str(error), parent=dialog)
+                return
+            names = list(devices)
+            for box in device_boxes:
+                box.configure(values=("",) + tuple(names))
+            # Keep existing assignments that are in the new table; fill the rest in file order.
+            for index, name in enumerate(self.network.switches):
+                if device_vars[name].get() not in devices:
+                    device_vars[name].set(names[index] if index < len(names) else "")
+                apply_device(name)
+            import_status.set(f"Imported {len(devices)} devices from {Path(path).name}. Unassigned rows were "
+                              "filled in file order; check the Device column, then Save.")
 
         def forget_calibration(names, state=None):
             try:
@@ -1193,24 +1320,41 @@ class BenesApp(tk.Tk):
             pin_vars[name] = tk.StringVar(value="Unassigned" if pin is None else str(pin))
             straight_vars[name] = tk.StringVar(value="" if calibration["straight"] is None else f"{calibration['straight']:.2f}")
             cross_vars[name] = tk.StringVar(value="" if calibration["cross"] is None else f"{calibration['cross']:.2f}")
-            ttk.Label(body, text=name).grid(row=row, column=0, sticky="w", padx=(0, 14), pady=2)
-            ttk.Combobox(body, textvariable=pin_vars[name], values=choices, state="readonly", width=12).grid(row=row, column=1, sticky="w", padx=(0, 14), pady=2)
-            # Blank uses the default resistance below.
-            resistance = None if pin is None else resistances.get(str(pin))
-            resistance_vars[name] = tk.StringVar(value="" if resistance is None else f"{resistance:g}")
-            ttk.Entry(body, textvariable=resistance_vars[name], width=8).grid(row=row, column=2, sticky="w", padx=(0, 14), pady=2)
+            ttk.Label(body, text=name).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=2)
+            ttk.Combobox(body, textvariable=pin_vars[name], values=choices, state="readonly", width=11).grid(row=row, column=1, sticky="w", padx=(0, 10), pady=2)
+
+            def pin_value(key, fmt="g", pin=pin):
+                value = None if pin is None else settings[key].get(str(pin))
+                return "" if value is None else format(value, fmt)
+
+            device_vars[name] = tk.StringVar(value=pin_value("heater_device", ""))
+            box = ttk.Combobox(body, textvariable=device_vars[name], state="readonly", width=8,
+                               values=("",) + tuple(settings["imported_heaters"]))
+            box.grid(row=row, column=2, sticky="w", padx=(0, 10), pady=2)
+            box.bind("<<ComboboxSelected>>", lambda event, n=name: apply_device(n))
+            device_boxes.append(box)
+            # Blank R heater uses the default resistance below; blank R total equals R heater.
+            resistance_vars[name] = tk.StringVar(value=pin_value("heater_resistance_ohm"))
+            total_vars[name] = tk.StringVar(value=pin_value("total_resistance_ohm"))
+            density_vars[name] = tk.StringVar(value=pin_value("current_density_per_v", ".4g"))
+            for column, variable in enumerate((resistance_vars, total_vars, density_vars), start=3):
+                ttk.Entry(body, textvariable=variable[name], width=8).grid(row=row, column=column, sticky="w", padx=(0, 10), pady=2)
+            limit_labels[name] = ttk.Label(body, text="—")
+            limit_labels[name].grid(row=row, column=6, sticky="w", padx=(0, 10), pady=2)
             straight_cell = ttk.Frame(body)
-            straight_cell.grid(row=row, column=3, sticky="w", padx=(0, 14), pady=2)
-            ttk.Entry(straight_cell, textvariable=straight_vars[name], width=10).pack(side="left")
+            straight_cell.grid(row=row, column=7, sticky="w", padx=(0, 10), pady=2)
+            ttk.Entry(straight_cell, textvariable=straight_vars[name], width=8).pack(side="left")
             ttk.Button(straight_cell, text="×", width=2,
                        command=lambda n=name: forget_calibration((n,), "straight")).pack(side="left", padx=(3, 0))
             cross_cell = ttk.Frame(body)
-            cross_cell.grid(row=row, column=4, sticky="w", pady=2)
-            ttk.Entry(cross_cell, textvariable=cross_vars[name], width=10).pack(side="left")
+            cross_cell.grid(row=row, column=8, sticky="w", pady=2)
+            ttk.Entry(cross_cell, textvariable=cross_vars[name], width=8).pack(side="left")
             ttk.Button(cross_cell, text="×", width=2,
                        command=lambda n=name: forget_calibration((n,), "cross")).pack(side="left", padx=(3, 0))
-            ttk.Button(body, text="Scan...", command=lambda n=name: self.show_power_scan(dialog, n, pin_vars[n], straight_vars[n], cross_vars[n])).grid(row=row, column=5, sticky="w", padx=(14, 0), pady=2)
-            ttk.Button(body, text="Forget", command=lambda n=name: forget_calibration((n,))).grid(row=row, column=6, sticky="w", padx=(14, 0), pady=2)
+            ttk.Button(body, text="Scan...", command=lambda n=name: self.show_power_scan(dialog, n, pin_vars[n], straight_vars[n], cross_vars[n])).grid(row=row, column=9, sticky="w", padx=(10, 0), pady=2)
+            ttk.Button(body, text="Forget", command=lambda n=name: forget_calibration((n,))).grid(row=row, column=10, sticky="w", padx=(10, 0), pady=2)
+            for variable in (resistance_vars, total_vars, density_vars, straight_vars, cross_vars):
+                variable[name].trace_add("write", lambda *args, n=name: update_limits(n))
 
         def save_mapping():
             try:
@@ -1218,10 +1362,13 @@ class BenesApp(tk.Tk):
                 self.controller.set_mapping(mapping)
                 for name in self.network.switches:
                     self.controller.set_calibration(name, straight_vars[name].get(), cross_vars[name].get())
-                self.controller.set_heater_resistances(
-                    {mapping[name]: resistance_vars[name].get() for name in self.network.switches
-                     if mapping[name] is not None},
+                self.controller.set_heater_parameters(
+                    {mapping[name]: {"r_heater": resistance_vars[name].get(), "r_total": total_vars[name].get(),
+                                     "j_per_v": density_vars[name].get(), "device": device_vars[name].get()}
+                     for name in self.network.switches if mapping[name] is not None},
                     default_resistance_var.get())
+                # The limits may have changed, so earlier approvals no longer apply.
+                self._approved_over_safe.clear()
             except ValueError as error:
                 messagebox.showerror("Invalid mapping or calibration", str(error), parent=dialog)
                 return
@@ -1235,24 +1382,39 @@ class BenesApp(tk.Tk):
         default_resistance = self.controller.settings["default_heater_resistance_ohm"]
         default_resistance_var = tk.StringVar(value="" if default_resistance is None else f"{default_resistance:g}")
         default_row = ttk.Frame(body)
-        default_row.grid(row=3 + len(self.network.switches), column=0, columnspan=7, sticky="w", pady=(12, 0))
+        default_row.grid(row=3 + len(self.network.switches), column=0, columnspan=11, sticky="w", pady=(12, 0))
+        ttk.Button(default_row, text="Import heater CSV...", command=import_heaters).pack(side="left", padx=(0, 16))
         ttk.Label(default_row, text="Default R [Ω]").pack(side="left")
         ttk.Entry(default_row, textvariable=default_resistance_var, width=8).pack(side="left", padx=(8, 12))
-        ttk.Label(default_row, text="Heater resistance for power plots (P = V²/R); used for pins with a blank R.",
+        ttk.Label(default_row, text="Used as R heater and R total for pins with a blank R heater.",
                   foreground="#9baec6").pack(side="left")
-        buttons = ttk.Frame(body)
-        buttons.grid(row=4 + len(self.network.switches), column=0, columnspan=7, sticky="e", pady=(16, 0))
+        import_status = tk.StringVar(value="")
+        ttk.Label(body, textvariable=import_status, foreground=ZERO_VOLT_COLOR, wraplength=900).grid(
+            row=4 + len(self.network.switches), column=0, columnspan=11, sticky="w", pady=(6, 0))
+        ttk.Label(body, foreground="#9baec6", wraplength=900, text=(
+            "Current I = V / R total; the power axis is the heater power I²·R heater. Max V is where the peak "
+            f"current density in the heater reaches the safe {SAFE_CURRENT_DENSITY:g} mA/µm² "
+            f"or break {BREAK_CURRENT_DENSITY:g} mA/µm² limit; the currents at those voltages are in brackets. "
+            "Voltages above the safe limit need confirmation; the break limit is never sent. "
+            "Amber: a saved voltage exceeds the safe limit. Red: it reaches the break limit."
+        )).grid(row=5 + len(self.network.switches), column=0, columnspan=11, sticky="w", pady=(6, 0))
+        for name in self.network.switches:
+            update_limits(name)
+        default_resistance_var.trace_add("write", lambda *args: [update_limits(n) for n in self.network.switches])
         ttk.Button(buttons, text="Forget all calibrations", command=forget_all_calibrations).pack(side="left", padx=(0, 18))
         ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right")
         ttk.Button(buttons, text="Save", command=save_mapping).pack(side="right", padx=6)
+        fit_to_screen(dialog)
 
     def show_power_scan(self, parent, name, pin_var, straight_var, cross_var):
         window = tk.Toplevel(parent)
         window.title(f"Power scan: {name}")
         window.transient(parent)
         window.grab_set()
-        frame = ttk.Frame(window, padding=18)
-        frame.pack(fill="both", expand=True)
+        window.configure(bg=BG)
+        scroller = ScrollableFrame(window, background=BG, padding=18)
+        scroller.pack(fill="both", expand=True)
+        frame = scroller.inner
         fields = {}
         defaults = {"Lower limit [V]": "0", "Upper limit [V]": "5",
                     "Step [V]": "0.5", "Settle [ms]": "50"}
@@ -1262,7 +1424,12 @@ class BenesApp(tk.Tk):
             value = tk.StringVar(value=saved[label])
             ttk.Entry(frame, textvariable=value, width=12).grid(row=row, column=1, sticky="w", padx=8, pady=3)
             fields[label] = value
-        ttk.Label(frame, text=f"Each point uses the Arduino burst ({self.power_meter.settings['duration']:g} s).", wraplength=360).grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 4))
+        note = f"Each point uses the Arduino burst ({self.power_meter.settings['duration']:g} s)."
+        safe, broken = self.controller.voltage_limits(name)
+        if safe is not None:
+            note += (f"\nCurrent-density limits for this heater: {safe:.2f} V safe ({SAFE_CURRENT_DENSITY:g} mA/µm²), "
+                     f"{broken:.2f} V break ({BREAK_CURRENT_DENSITY:g} mA/µm²).")
+        ttk.Label(frame, text=note, wraplength=360).grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 4))
         progress = tk.StringVar(value="Choose a range and start the scan.")
         ttk.Label(frame, textvariable=progress, wraplength=390).grid(row=5, column=0, columnspan=3, sticky="w", pady=6)
         extrema = tk.StringVar(value="")
@@ -1323,7 +1490,7 @@ class BenesApp(tk.Tk):
                 messagebox.showerror("Hardware not connected", "Connect the physical voltage board and Arduino power meter before scanning.", parent=window)
                 return
             try:
-                self.confirm_voltage_sweep(voltages, parent=window)
+                self.confirm_voltage_sweep(voltages, parent=window, names=[name])
             except ValueError as error:
                 messagebox.showerror("Scan cancelled", str(error), parent=window)
                 return
@@ -1370,6 +1537,7 @@ class BenesApp(tk.Tk):
         save_button = ttk.Button(frame, text="Save calibration", command=save_scan, state="disabled")
         save_button.grid(row=9, column=1, sticky="w", pady=(12, 0))
         ttk.Button(frame, text="Close", command=close_scan).grid(row=9, column=2, sticky="e", pady=(12, 0))
+        fit_to_screen(window)
 
     def read_spectrum(self):
         try:
@@ -1428,7 +1596,11 @@ class BenesApp(tk.Tk):
             canvas = FigureCanvasTkAgg(figure, master=window)
             NavigationToolbar2Tk(canvas, window).update()
             ttk.Button(window, text="Export displayed datasets", command=lambda axes=self.osa_axes: self.export_spectra(axes)).pack(anchor="e", padx=8, pady=4)
+            canvas.get_tk_widget().configure(**PLOT_MIN_SIZE)
             canvas.get_tk_widget().pack(fill="both", expand=True)
+            # The figure rescales with the window; start at a size that fits the screen.
+            window.geometry(f"{min(900, window.winfo_screenwidth() - 80)}x"
+                            f"{min(640, window.winfo_screenheight() - 120)}")
         self.osa_axes.plot(wave, power, linewidth=1.2, label=name)
         self.osa_axes.legend(loc="best")
         self.osa_axes.figure.canvas.draw_idle()
@@ -1464,9 +1636,9 @@ class BenesApp(tk.Tk):
         self.destroy()
 
     def build_impulse_tab(self):
-        controls = ttk.Frame(self.impulse_tab, padding=18, width=310)
+        # Natural size (no pack_propagate(False)) so the tab knows when to scroll.
+        controls = ttk.Frame(self.impulse_tab, padding=18)
         controls.pack(side="left", fill="y")
-        controls.pack_propagate(False)
         plot_area = ttk.Frame(self.impulse_tab, padding=(0, 18, 18, 18))
         plot_area.pack(side="left", fill="both", expand=True)
         self.impulse_plot_area = plot_area
@@ -1565,6 +1737,8 @@ class BenesApp(tk.Tk):
                 raise ValueError("Board pin 8 must be unassigned to mirror the pulse")
             if not self.power_meter.connected or self.power_meter.settings["stream_format"] not in ("raw", "dual"):
                 raise RuntimeError("Connect the Arduino with the raw A0/A1 stream selected")
+            # Confirm here: a prompt during the run would stall the pulse timing.
+            self.confirm_voltage_sweep([low, high], names=[switch])
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
             from matplotlib.figure import Figure
             from matplotlib.ticker import EngFormatter, MaxNLocator
@@ -1609,6 +1783,7 @@ class BenesApp(tk.Tk):
         self.impulse_canvas = FigureCanvasTkAgg(figure, master=self.impulse_plot_area)
         self.impulse_toolbar = NavigationToolbar2Tk(self.impulse_canvas, self.impulse_plot_area, pack_toolbar=False)
         self.impulse_toolbar.pack(side="bottom", fill="x")
+        self.impulse_canvas.get_tk_widget().configure(**PLOT_MIN_SIZE)
         self.impulse_canvas.get_tk_widget().pack(fill="both", expand=True)
 
         def refresh_zoom(_axis):

@@ -25,14 +25,18 @@ PLOT_X_VOLTAGE = "voltage"
 PLOT_X_POWER = "power"
 
 
-def plot_x_values(voltages, resistance_ohm, mode):
-    """Return x values and axis label: commanded volts, or heater power V^2/R in mW.
+def plot_x_values(voltages, resistance_ohm, mode, total_resistance_ohm=None):
+    """Return x values and axis label: commanded volts, or heater power in mW.
 
-    Falls back to volts when no resistance is known for the switch.
+    The current is V / R_total and the heater dissipates I^2 R_heater; without
+    a total resistance this is V^2 / R. Falls back to volts when no resistance
+    is known for the switch.
     """
     if mode == PLOT_X_POWER and resistance_ohm:
-        return ([voltage * voltage / resistance_ohm * 1000 for voltage in voltages],
-                f"Heater power [mW] (R = {resistance_ohm:g} Ω)")
+        total = total_resistance_ohm or resistance_ohm
+        label = (f"Heater power [mW] (R = {resistance_ohm:g} Ω)" if total == resistance_ohm else
+                 f"Heater power [mW] (R heater = {resistance_ohm:g} Ω, R total = {total:g} Ω)")
+        return [voltage * voltage * resistance_ohm / (total * total) * 1000 for voltage in voltages], label
     label = "Voltage [V]" if mode != PLOT_X_POWER else "Voltage [V] (no heater resistance set)"
     return list(voltages), label
 
@@ -59,6 +63,8 @@ def scan_context(network, input_port: int, output_port: int, power_meter_port: i
         "scanned_switches": list(names),
         "heater_resistance_ohm": {name: controller.heater_resistance(name) for name in names}
         if hasattr(controller, "heater_resistance") else {},
+        "total_resistance_ohm": {name: controller.total_resistance(name) for name in names}
+        if hasattr(controller, "total_resistance") else {},
         "voltages_v": list(voltages),
         "settle_ms": settle_ms,
         "measurement_source": source,
@@ -151,8 +157,9 @@ def save_scan_artifacts(folder: Path, context: dict, data: dict, source: str,
         figure = Figure(figsize=(10, 5))
         response = figure.add_subplot(121 if source == "OSA" else 111)
         resistance = context.get("heater_resistance_ohm", {}).get(name)
+        total = context.get("total_resistance_ohm", {}).get(name)
         mode = context.get("plot_x_axis", PLOT_X_VOLTAGE)
-        xs, x_label = plot_x_values([point.voltage for point in points], resistance, mode)
+        xs, x_label = plot_x_values([point.voltage for point in points], resistance, mode, total)
         response.plot(xs, [point.power for point in points],
                       marker=".", linewidth=1.4, color=ROUTE_COLOR,
                       label="Peak" if source == "OSA" else "Power")
@@ -173,7 +180,7 @@ def save_scan_artifacts(folder: Path, context: dict, data: dict, source: str,
             for phase, rows in rescans.items():
                 if rows:
                     _, label, color = RESCAN_STYLES[phase]
-                    rescan_axis.plot(plot_x_values([row["voltage_v"] for row in rows], resistance, mode)[0],
+                    rescan_axis.plot(plot_x_values([row["voltage_v"] for row in rows], resistance, mode, total)[0],
                                      [row["power"] for row in rows],
                                      marker=".", linestyle="--", linewidth=1.2, color=color, label=label)
             lines = response.get_lines() + rescan_axis.get_lines()

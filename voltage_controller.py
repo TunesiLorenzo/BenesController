@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from heater_setup import BREAK_CURRENT_DENSITY, SAFE_CURRENT_DENSITY, HeaterDevice, voltage_limit
+
 
 def app_dir() -> Path:
     """Folder for settings and results: beside the exe when frozen, else beside the sources."""
@@ -46,11 +48,14 @@ class BenesVoltageController:
         config_path: Path | None = None,
         board_factory: Callable[..., object] | None = None,
         unsafe_voltage_authorizer: Callable[[str, float], bool] | None = None,
+        current_density_authorizer: Callable[[str, float, float], bool] | None = None,
     ):
         self.switch_names = tuple(switch_names)
         self.config_path = config_path or app_dir() / "benes_voltage_config.json"
         self._board_factory = board_factory
         self.unsafe_voltage_authorizer = unsafe_voltage_authorizer
+        # Asked with (name, voltage, safe limit) before exceeding the safe current density.
+        self.current_density_authorizer = current_density_authorizer
         self.board = None
         self.applied_voltages: dict[str, float] = {}
         self.load_error = ""
@@ -67,9 +72,16 @@ class BenesVoltageController:
                         for index, name in enumerate(self.switch_names)},
             "voltage": {name: 0.0 for name in self.switch_names},
             "calibration": {name: {"straight": None, "cross": None} for name in self.switch_names},
-            # Heater resistances for plotting power = V^2 / R; pins without one use the default.
+            # Per-pin heater data: I = V / R_total and heater power = I^2 * R_heater.
+            # Pins without an R heater use the default; a blank R total equals R heater.
             "heater_resistance_ohm": {},
             "default_heater_resistance_ohm": None,
+            "total_resistance_ohm": {},
+            # Worst peak current density per volt [mA/µm²/V], for the voltage limits.
+            "current_density_per_v": {},
+            "heater_device": {},
+            # Device table from the last GDS_heater CSV import.
+            "imported_heaters": {},
         }
 
     def _load(self) -> dict:
@@ -91,10 +103,20 @@ class BenesVoltageController:
                     for state in ("straight", "cross")
                 }
             self._ensure_unique_pins(settings["mapping"])
-            settings["heater_resistance_ohm"] = {
-                str(self._validate_pin(int(pin))): self._optional_resistance(value)
-                for pin, value in stored.get("heater_resistance_ohm", {}).items()
-                if value is not None
+            for key in ("heater_resistance_ohm", "total_resistance_ohm", "current_density_per_v"):
+                settings[key] = {
+                    str(self._validate_pin(int(pin))): self._optional_resistance(value)
+                    for pin, value in stored.get(key, {}).items()
+                    if value is not None
+                }
+            settings["heater_device"] = {
+                str(self._validate_pin(int(pin))): str(value)
+                for pin, value in stored.get("heater_device", {}).items() if value
+            }
+            settings["imported_heaters"] = {
+                str(name): {key: self._optional_resistance(device.get(key))
+                            for key in ("r_total_ohm", "r_heater_ohm", "j_peak_per_v")}
+                for name, device in stored.get("imported_heaters", {}).items()
             }
             settings["default_heater_resistance_ohm"] = self._optional_resistance(
                 stored.get("default_heater_resistance_ohm"))
@@ -113,35 +135,82 @@ class BenesVoltageController:
             return None
         resistance = float(value)
         if not math.isfinite(resistance) or resistance <= 0:
-            raise ValueError("Heater resistance must be a positive number of ohms")
+            raise ValueError("Heater resistances and current densities must be positive numbers")
         return resistance
 
     def set_heater_resistances(self, per_pin: dict[int, object], default: object) -> None:
         """Store per-pin heater resistances; blank values fall back to the default."""
-        checked = {pin: self._optional_resistance(value)
-                   for pin, value in per_pin.items() if self._validate_pin(pin) is not None}
+        self.set_heater_parameters({pin: {"r_heater": value} for pin, value in per_pin.items()}, default)
+
+    def set_heater_parameters(self, per_pin: dict[int, dict], default: object) -> None:
+        """Store per-pin heater data; keys left out of a pin's entry are unchanged.
+
+        Entry keys are ``r_heater``, ``r_total``, ``j_per_v`` and ``device``;
+        a blank value clears that pin's value.
+        """
+        keys = {"r_heater": "heater_resistance_ohm", "r_total": "total_resistance_ohm",
+                "j_per_v": "current_density_per_v"}
+        checked = {}
+        for pin, values in per_pin.items():
+            self._validate_pin(pin)
+            checked[pin] = {key: self._optional_resistance(values[key]) for key in keys if key in values}
+            if "device" in values:
+                checked[pin]["device"] = str(values["device"] or "").strip() or None
         default = self._optional_resistance(default)
-        stored = dict(self.settings["heater_resistance_ohm"])
-        for pin, resistance in checked.items():
-            if resistance is None:
-                stored.pop(str(pin), None)
-            else:
-                stored[str(pin)] = resistance
-        self.settings["heater_resistance_ohm"] = stored
+        for pin, values in checked.items():
+            for key, value in values.items():
+                stored = self.settings[keys.get(key, "heater_device")]
+                if value is None:
+                    stored.pop(str(pin), None)
+                else:
+                    stored[str(pin)] = value
         self.settings["default_heater_resistance_ohm"] = default
         self.save()
 
-    def heater_resistance(self, name: str) -> float | None:
-        """Resistance of the heater on an MZI's mapped pin, or the global default."""
+    def set_imported_heaters(self, devices: dict[str, HeaterDevice]) -> None:
+        """Remember a GDS_heater device table so it can be assigned to pins later."""
+        self.settings["imported_heaters"] = {
+            name: {"r_total_ohm": device.r_total_ohm, "r_heater_ohm": device.r_heater_ohm,
+                   "j_peak_per_v": device.j_peak_per_v}
+            for name, device in devices.items()
+        }
+        self.save()
+
+    def imported_heaters(self) -> dict[str, HeaterDevice]:
+        return {name: HeaterDevice(name, values["r_total_ohm"], values["r_heater_ohm"], values["j_peak_per_v"])
+                for name, values in self.settings["imported_heaters"].items()}
+
+    def _pin_value(self, name: str, key: str):
         self._require_switch(name)
         pin = self.settings["mapping"][name]
-        resistance = None if pin is None else self.settings["heater_resistance_ohm"].get(str(pin))
+        return None if pin is None else self.settings[key].get(str(pin))
+
+    def heater_resistance(self, name: str) -> float | None:
+        """Resistance of the heater on an MZI's mapped pin, or the global default."""
+        resistance = self._pin_value(name, "heater_resistance_ohm")
         return resistance if resistance is not None else self.settings["default_heater_resistance_ohm"]
 
+    def total_resistance(self, name: str) -> float | None:
+        """Pad-to-pad resistance (heater plus routing); equals R heater when not set."""
+        resistance = self._pin_value(name, "total_resistance_ohm")
+        return resistance if resistance is not None else self.heater_resistance(name)
+
+    def heater_device(self, name: str) -> str | None:
+        return self._pin_value(name, "heater_device")
+
+    def heater_current_ma(self, name: str, voltage: float) -> float | None:
+        resistance = self.total_resistance(name)
+        return None if resistance is None else voltage / resistance * 1000
+
     def heater_power_mw(self, name: str, voltage: float) -> float | None:
-        """Electrical heater power for a commanded voltage, if a resistance is known."""
-        resistance = self.heater_resistance(name)
-        return None if resistance is None else voltage * voltage / resistance * 1000
+        """Power dissipated in the heater, I^2 R_heater with I = V / R_total."""
+        current = self.heater_current_ma(name, voltage)
+        return None if current is None else current * current * self.heater_resistance(name) / 1000
+
+    def voltage_limits(self, name: str) -> tuple[float | None, float | None]:
+        """Voltages at the safe and break current densities, when J per volt is known."""
+        density = self._pin_value(name, "current_density_per_v")
+        return voltage_limit(density, SAFE_CURRENT_DENSITY), voltage_limit(density, BREAK_CURRENT_DENSITY)
 
     @staticmethod
     def _validate_pin(pin: object, allow_none: bool = False) -> int | None:
@@ -303,7 +372,27 @@ class BenesVoltageController:
             self.board.send(pin, voltage)
             self.applied_voltages[name] = voltage
 
+    def check_current_density(self, name: str, voltage: float) -> float | None:
+        """Refuse voltages at the break current density; return the safe limit if it is exceeded.
+
+        The heater current flows either way, so the sign of the voltage is ignored.
+        """
+        safe, broken = self.voltage_limits(name)
+        if broken is not None and abs(voltage) >= broken:
+            raise ValueError(
+                f"{name}: {voltage:g} V would reach the {BREAK_CURRENT_DENSITY:g} mA/µm² break current "
+                f"density (hard limit below {broken:.2f} V); the voltage was not sent"
+            )
+        return safe if safe is not None and abs(voltage) > safe else None
+
     def _check_voltage(self, name: str, voltage: float) -> None:
+        safe = self.check_current_density(name, voltage)
+        if safe is not None and (self.current_density_authorizer is None
+                                 or not self.current_density_authorizer(name, voltage, safe)):
+            raise ValueError(
+                f"{name}: {voltage:g} V exceeds the {SAFE_CURRENT_DENSITY:g} mA/µm² safe current density "
+                f"({safe:.2f} V) and was not confirmed"
+            )
         if 0.0 <= voltage <= 5.0:
             return
         if self.unsafe_voltage_authorizer is None or not self.unsafe_voltage_authorizer(name, voltage):

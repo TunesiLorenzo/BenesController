@@ -34,11 +34,35 @@ class PathProgressTests(unittest.TestCase):
 
     def test_unsafe_voltage_prompt_names_arduino_and_heater_limit(self):
         app = SimpleNamespace(_approved_unsafe_voltages=set())
+        app._ask_on_main_thread = lambda *args, **kwargs: BenesApp._ask_on_main_thread(app, *args, **kwargs)
         with patch("benes_gui.messagebox.askyesno", return_value=True) as ask:
             self.assertTrue(BenesApp.confirm_unsafe_voltage(app, "S1.1", 6.0))
         self.assertIn("Arduino sampler", ask.call_args.args[1])
         self.assertIn("heater overcurrent limit", ask.call_args.args[1])
         self.assertEqual(app._approved_unsafe_voltages, {6.0})
+
+    def test_sweep_refuses_break_density_and_warns_once_above_safe(self):
+        import tempfile
+        from pathlib import Path
+        from voltage_controller import BenesVoltageController
+
+        with tempfile.TemporaryDirectory() as directory:
+            controller = BenesVoltageController(("S1.1",), Path(directory) / "config.json")
+            controller.set_heater_parameters({0: {"r_heater": "150", "j_per_v": "10"}}, "")
+            app = SimpleNamespace(controller=controller, _approved_over_safe=set(),
+                                  _approved_unsafe_voltages=set())
+            # Safe 5 V, break 7 V.
+            with patch("benes_gui.messagebox.askyesno", return_value=True) as ask:
+                with self.assertRaisesRegex(ValueError, "break current"):
+                    BenesApp.confirm_voltage_sweep(app, [0, 7.0], names=["S1.1"])
+                ask.assert_not_called()
+                BenesApp.confirm_voltage_sweep(app, [0, 4.0, 5.5], names=["S1.1"])
+                self.assertIn("safe up to 5.00 V", ask.call_args_list[0].args[1])
+                self.assertEqual(app._approved_over_safe, {("S1.1", 5.5)})
+                # 5.5 V is outside 0–5 V too, so both prompts ran; a repeat asks nothing.
+                self.assertEqual(ask.call_count, 2)
+                BenesApp.confirm_voltage_sweep(app, [5.5], names=["S1.1"])
+                self.assertEqual(ask.call_count, 2)
 
     def test_completion_requires_every_mzi_even_when_last_planned_pair_runs_early(self):
         network = BenesNetwork()

@@ -109,6 +109,10 @@ class CrosstalkResultsTests(unittest.TestCase):
         self.assertEqual(plot_x_values([0, 2], None, PLOT_X_POWER),
                          ([0, 2], "Voltage [V] (no heater resistance set)"))
         self.assertEqual(plot_x_values([0, 2], 1000, PLOT_X_VOLTAGE), ([0, 2], "Voltage [V]"))
+        # With routing resistance, I = V / R_total and the heater dissipates I^2 R_heater.
+        xs, label = plot_x_values([2], 150, PLOT_X_POWER, 200)
+        self.assertAlmostEqual(xs[0], 15.0)
+        self.assertIn("R total = 200", label)
 
     def test_saved_figure_follows_power_axis_mode(self):
         from unittest.mock import patch

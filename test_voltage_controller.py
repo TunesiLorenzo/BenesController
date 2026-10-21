@@ -83,6 +83,58 @@ class VoltageControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "positive"):
             restored.set_heater_resistances({3: "-5"}, "")
 
+    def test_total_resistance_sets_current_and_heater_power_and_limits(self):
+        from heater_setup import HeaterDevice
+
+        controller = self.controller()
+        controller.set_mapping({"S1.1": 3, "S1.2": 5})
+        controller.set_imported_heaters({"mzi1": HeaterDevice("mzi1", 200.0, 150.0, 10.0)})
+        controller.set_heater_parameters(
+            {3: {"r_heater": "150", "r_total": "200", "j_per_v": "10", "device": "mzi1"}}, "")
+        self.assertAlmostEqual(controller.heater_current_ma("S1.1", 2.0), 10.0)
+        # I^2 R_heater = (10 mA)^2 * 150 Ω = 15 mW, not V^2 / R_total = 20 mW.
+        self.assertAlmostEqual(controller.heater_power_mw("S1.1", 2.0), 15.0)
+        self.assertEqual(controller.voltage_limits("S1.1"), (5.0, 7.0))
+        self.assertEqual(controller.voltage_limits("S1.2"), (None, None))
+
+        restored = self.controller()
+        self.assertEqual(restored.heater_device("S1.1"), "mzi1")
+        self.assertEqual(restored.total_resistance("S1.1"), 200.0)
+        self.assertEqual(restored.imported_heaters()["mzi1"].r_heater_ohm, 150.0)
+        # Without R total the current flows through the heater alone.
+        restored.set_heater_parameters({3: {"r_total": ""}}, "")
+        self.assertAlmostEqual(restored.heater_power_mw("S1.1", 3.0), 9 / 150 * 1000)
+
+    def test_break_density_is_a_hard_limit_and_safe_density_needs_approval(self):
+        asked = []
+        controller = BenesVoltageController(
+            self.names, self.path, board_factory=FakeBoard,
+            unsafe_voltage_authorizer=lambda name, voltage: True,
+            current_density_authorizer=lambda name, voltage, safe: asked.append((name, voltage, safe)) or approve)
+        controller.set_heater_parameters({0: {"r_heater": "150", "j_per_v": "10"}}, "")
+        controller.connect()
+        approve = True
+        controller.drive_voltage("S1.1", 4.9)
+        self.assertEqual(asked, [])
+        # Safe 5 V: above it the authorizer decides; negative voltages count too.
+        controller.drive_voltage("S1.1", -6.0)
+        self.assertEqual(asked, [("S1.1", -6.0, 5.0)])
+        approve = False
+        with self.assertRaisesRegex(ValueError, "safe current density"):
+            controller.set_voltage("S1.1", 6.0)
+        self.assertEqual(controller.settings["voltage"]["S1.1"], 0.0)
+        # Break 7 V can never be sent, even when approval would be given.
+        approve = True
+        for send in (lambda: controller.drive_voltage("S1.1", 7.0),
+                     lambda: controller.drive_with_mirror("S1.1", -7.5, 8)):
+            with self.assertRaisesRegex(ValueError, "break current density"):
+                send()
+        self.assertNotIn((0, 7.0), controller.board.sent)
+        self.assertNotIn((0, -7.5), controller.board.sent)
+        # Switches without a current density keep only the 0–5 V rule.
+        controller.drive_voltage("S1.2", 9.0)
+        self.assertEqual(controller.board.sent[-1], (1, 9.0))
+
     def test_new_default_mapping_reserves_pin_8(self):
         names = tuple(BenesNetwork().switches)
         controller = BenesVoltageController(names, self.path, board_factory=FakeBoard)
