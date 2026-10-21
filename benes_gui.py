@@ -1,5 +1,6 @@
 """Run with: python benes_gui.py"""
 
+import csv
 import json
 import random
 import threading
@@ -15,6 +16,8 @@ from calibration_scan import (ScanPoint, calibrate_default_cross_path, minimum_d
                               scan_voltages, spectrum_scan_point, zero_voltage_paths)
 from crosstalk_results import (PLOT_X_POWER, PLOT_X_VOLTAGE, RESCAN_STYLES, create_result_folder,
                                load_scan_folder, plot_x_values, save_scan_artifacts, scan_context)
+from dataset_registry import (analyze_dataset, create_dataset, save_measurement,
+                              write_coverage_report)
 from impulse_test import (LIVE_PLOT_WINDOW_S, plot_trace_samples, received_pair_rate,
                           run_impulse_test,
                           validate_impulse_settings, write_impulse_csv)
@@ -114,6 +117,7 @@ class BenesApp(tk.Tk):
         self.osa_plot_mode = tk.StringVar(value="Overlay")
         self.osa_axes = None
         self.trace_count = 0
+        self.osa_trace_records = []
         self.osa_switch_port_var = tk.StringVar(value=self.osa_output_switch.settings["port"])
         self.osa_switch_baud_var = tk.StringVar(value=str(self.osa_output_switch.settings["baud"]))
         self.osa_switch_dry_run_var = tk.BooleanVar(value=self.osa_output_switch.settings["dry_run"])
@@ -170,9 +174,11 @@ class BenesApp(tk.Tk):
         self.hardware_tab = ttk.Frame(self.notebook)
         self.crosstalk_tab = ttk.Frame(self.notebook)
         self.impulse_tab = ttk.Frame(self.notebook)
+        self.dataset_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.route_tab, text="Routing")
         self.notebook.add(self.hardware_tab, text="Hardware & OSA")
         self.notebook.add(self.crosstalk_tab, text="Calibration scans")
+        self.notebook.add(self.dataset_tab, text="Dataset coverage")
         self.notebook.add(self.impulse_tab, text="Impulse test")
 
         controls = ttk.Frame(self.route_tab, padding=(24, 8))
@@ -403,6 +409,7 @@ class BenesApp(tk.Tk):
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda event: self.draw())
         ttk.Label(diagram, text="Green switches have saved bar and cross voltages. Click a switch to toggle it; type a voltage and press Enter to send it.", padding=(4, 5), wraplength=680).pack(anchor="w", fill="x")
+        self.build_dataset_tab()
         self.build_impulse_tab()
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.refresh()
@@ -709,7 +716,8 @@ class BenesApp(tk.Tk):
             self.osa_switch_status_var.set(
                 f"OSA routed to output {output} (fiber {output + 3}); spectrum acquired."
             )
-        self.show_spectrum(*data, name=None if output is None else self.osa_trace_name(output))
+        self.show_spectrum(*data, name=None if output is None else self.osa_trace_name(output),
+                           output_port=output)
 
     def read_selected_osa_output(self):
         self.start_osa_read(self.osa_switch_output_var.get())
@@ -742,7 +750,8 @@ class BenesApp(tk.Tk):
     def show_all_osa_spectra(self, spectra):
         self.set_osa_reading(False)
         for output, (wave, power) in spectra:
-            self.show_spectrum(wave, power, name=self.osa_trace_name(output), restore_buttons=False)
+            self.show_spectrum(wave, power, name=self.osa_trace_name(output), restore_buttons=False,
+                               output_port=output)
         if spectra:
             self.osa_output_var.set(str(spectra[-1][0]))
         self.osa_switch_status_var.set(f"Read {len(spectra)} OSA output spectra; export them from the plot window.")
@@ -1624,7 +1633,7 @@ class BenesApp(tk.Tk):
         self.osa_switch_status_var.set(f"OSA read failed: {error}")
         messagebox.showerror("OSA read failed", error, parent=self)
 
-    def show_spectrum(self, wave, power, name=None, restore_buttons=True):
+    def show_spectrum(self, wave, power, name=None, restore_buttons=True, output_port=None):
         if restore_buttons:
             self.set_osa_reading(False)
         try:
@@ -1644,6 +1653,17 @@ class BenesApp(tk.Tk):
             if name is None:
                 return
         name = name.strip() or f"Trace {self.trace_count}"
+        if output_port is None:
+            selected_output = self.detector_port(self.osa_output_var)
+            output_port = None if selected_output is None else selected_output + 1
+        # Dataset saves use the current acquisition for each output, not every
+        # historical overlay trace that happens to share the same port.
+        if output_port is not None:
+            self.osa_trace_records = [item for item in self.osa_trace_records
+                                      if item["output_port"] != output_port]
+        self.osa_trace_records.append({
+            "name": name, "wave": list(wave), "power": list(power), "output_port": output_port,
+        })
         new_window = self.osa_plot_mode.get() == "New window" or self.osa_axes is None
         if not new_window:
             try:
@@ -1683,6 +1703,244 @@ class BenesApp(tk.Tk):
             messagebox.showerror("Export failed", str(error), parent=parent)
             return
         messagebox.showinfo("Export complete", f"Saved {len(traces)} trace(s) to:\n{path}", parent=parent)
+
+    def build_dataset_tab(self):
+        """Build the durable measurement index and coverage view.
+
+        The raw OSA/power-meter CSV is deliberately stored next to a small
+        metadata file.  File names alone cannot tell whether a trace represents
+        one route, a fan-in measurement, or a full parallel acquisition.
+        """
+        controls_column = ttk.Frame(self.dataset_tab, padding=(18, 18, 8, 18), width=335)
+        controls_column.pack(side="left", fill="y")
+        controls_column.pack_propagate(False)
+        control_scroll = VerticalScrolledFrame(controls_column)
+        control_scroll.pack(fill="both", expand=True)
+        controls = ttk.Frame(control_scroll.content, padding=(0, 0, 12, 0))
+        controls.pack(anchor="nw", fill="x")
+        summary = ttk.Frame(self.dataset_tab, padding=(8, 18, 18, 18))
+        summary.pack(side="left", fill="both", expand=True)
+
+        self.dataset_folder_var = tk.StringVar()
+        self.dataset_mode_var = tk.StringVar(value="Routed pairs")
+        self.dataset_comment_var = tk.StringVar()
+        self.dataset_status_var = tk.StringVar(value="Choose or initialize a dataset folder.")
+
+        ttk.Label(controls, text="MEASUREMENT DATASET", foreground=ACCENT,
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(controls, text="Each saved record includes the active permutation and the input/output ports it represents.",
+                  wraplength=285).pack(anchor="w", pady=(4, 12))
+
+        folder_box = ttk.LabelFrame(controls, text="Dataset folder", padding=10)
+        folder_box.pack(fill="x")
+        ttk.Entry(folder_box, textvariable=self.dataset_folder_var, width=34).pack(fill="x")
+        folder_buttons = ttk.Frame(folder_box)
+        folder_buttons.pack(fill="x", pady=(8, 0))
+        ttk.Button(folder_buttons, text="Choose folderâ€¦", command=self.choose_dataset_folder).pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(folder_buttons, text="Analyse", style="Accent.TButton",
+                   command=self.analyze_linked_dataset).pack(side="left", padx=(6, 0))
+        ttk.Button(folder_box, text="Initialize full 720-permutation set",
+                   command=lambda: self.initialize_dataset("full_permutations")).pack(
+            fill="x", pady=(8, 0))
+        ttk.Button(folder_box, text="Initialize active permutation only",
+                   command=lambda: self.initialize_dataset("active_permutation")).pack(
+            fill="x", pady=(4, 0))
+
+        selection = ttk.LabelFrame(controls, text="What this measurement represents", padding=10)
+        selection.pack(fill="x", pady=(12, 0))
+        ttk.Label(selection, text="Select one or many ports. Ctrl-click selects several.").grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(selection, text="Inputs").grid(row=1, column=0, sticky="w", pady=(8, 3))
+        ttk.Label(selection, text="Outputs").grid(row=1, column=1, sticky="w", padx=(12, 0), pady=(8, 3))
+        self.dataset_input_list = tk.Listbox(selection, selectmode="extended", exportselection=False,
+                                             height=6, width=12, bg=PANEL, fg=TEXT,
+                                             selectbackground="#2c796b", selectforeground=TEXT,
+                                             highlightthickness=1, highlightbackground=WIRE,
+                                             activestyle="none", borderwidth=0)
+        self.dataset_output_list = tk.Listbox(selection, selectmode="extended", exportselection=False,
+                                              height=6, width=12, bg=PANEL, fg=TEXT,
+                                              selectbackground="#2c796b", selectforeground=TEXT,
+                                              highlightthickness=1, highlightbackground=WIRE,
+                                              activestyle="none", borderwidth=0)
+        for port in range(1, 7):
+            self.dataset_input_list.insert("end", f"In {port}")
+            self.dataset_output_list.insert("end", f"Out {port}")
+        self.dataset_input_list.selection_set(0)
+        self.dataset_output_list.selection_set(0)
+        self.dataset_input_list.grid(row=2, column=0, sticky="w")
+        self.dataset_output_list.grid(row=2, column=1, sticky="w", padx=(12, 0))
+        ttk.Label(selection, text="Connection rule").grid(row=3, column=0, sticky="w", pady=(10, 3))
+        ttk.Combobox(selection, textvariable=self.dataset_mode_var,
+                     values=("Routed pairs", "All selected pairs"), state="readonly", width=22).grid(
+            row=4, column=0, columnspan=2, sticky="ew")
+        ttk.Label(selection, text="Routed pairs records only active Benes routes. All selected pairs is for a future fan-in/fan-out fixture.",
+                  wraplength=280).grid(row=5, column=0, columnspan=2, sticky="w", pady=(5, 0))
+
+        save_box = ttk.LabelFrame(controls, text="Save latest acquisition", padding=10)
+        save_box.pack(fill="x", pady=(12, 0))
+        ttk.Label(save_box, text="Comment (saved inside the record and CSV)").pack(anchor="w")
+        ttk.Entry(save_box, textvariable=self.dataset_comment_var).pack(fill="x", pady=(3, 8))
+        ttk.Button(save_box, text="Save latest OSA trace(s)", style="Accent.TButton",
+                   command=self.save_dataset_osa).pack(fill="x")
+        ttk.Button(save_box, text="Save latest power reading", command=self.save_dataset_power).pack(
+            fill="x", pady=(5, 0))
+        ttk.Label(save_box, text="Use Route + read / Read all outputs before saving OSA data. The selected ports define its coverage.",
+                  wraplength=280).pack(anchor="w", pady=(8, 0))
+        ttk.Label(controls, textvariable=self.dataset_status_var, wraplength=285,
+                  foreground="#9baec6").pack(anchor="w", pady=(12, 4))
+
+        ttk.Label(summary, text="Coverage", foreground=ACCENT,
+                  font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        ttk.Label(summary, text="The report counts the six routed inputâ†’output paths required for each expected permutation.",
+                  wraplength=700).pack(anchor="w", pady=(2, 8))
+        report_frame = ttk.Frame(summary)
+        report_frame.pack(fill="both", expand=True)
+        report_scroll = ttk.Scrollbar(report_frame, orient="vertical", style="Accent.Vertical.TScrollbar")
+        self.dataset_report = tk.Text(report_frame, wrap="word", bg=PANEL, fg=TEXT, insertbackground=TEXT,
+                                      font=("Consolas", 10), borderwidth=0, highlightthickness=1,
+                                      highlightbackground=WIRE, padx=12, pady=10, state="disabled")
+        report_scroll.configure(command=self.dataset_report.yview)
+        self.dataset_report.configure(yscrollcommand=report_scroll.set)
+        self.dataset_report.pack(side="left", fill="both", expand=True)
+        report_scroll.pack(side="right", fill="y")
+        self.set_dataset_report("No dataset linked. Choose a folder, initialize its expected permutation set, then save OSA or power-meter acquisitions.")
+
+    def choose_dataset_folder(self):
+        folder = filedialog.askdirectory(parent=self, title="Choose Benes measurement dataset")
+        if not folder:
+            return
+        self.dataset_folder_var.set(folder)
+        path = Path(folder) / "benes_dataset.json"
+        if path.exists():
+            self.analyze_linked_dataset()
+        else:
+            self.dataset_status_var.set("Folder selected. Initialize the full set or the active permutation.")
+
+    def active_dataset_permutation(self):
+        return tuple(output + 1 for output in self.network.mapping())
+
+    def dataset_selection(self):
+        inputs = [index + 1 for index in self.dataset_input_list.curselection()]
+        outputs = [index + 1 for index in self.dataset_output_list.curselection()]
+        if not inputs or not outputs:
+            raise ValueError("Select at least one input and one output port")
+        mode = "routed_pairs" if self.dataset_mode_var.get() == "Routed pairs" else "cartesian"
+        return inputs, outputs, mode
+
+    def dataset_root(self):
+        value = self.dataset_folder_var.get().strip()
+        if not value:
+            raise ValueError("Choose a dataset folder first")
+        return Path(value)
+
+    def initialize_dataset(self, scope):
+        try:
+            root = self.dataset_root()
+            expected = None if scope == "full_permutations" else [self.active_dataset_permutation()]
+            dataset = create_dataset(root, scope=scope, expected_permutations=expected)
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Dataset setup failed", str(error), parent=self)
+            return
+        self.dataset_status_var.set(
+            f"Dataset ready: {len(dataset['expected_permutations'])} expected permutation(s).")
+        self.analyze_linked_dataset()
+
+    def save_dataset_osa(self):
+        try:
+            root = self.dataset_root()
+            inputs, outputs, mode = self.dataset_selection()
+            traces = [item for item in self.osa_trace_records if item["output_port"] in outputs]
+            recorded_outputs = {item["output_port"] for item in traces}
+            missing_outputs = sorted(set(outputs) - recorded_outputs)
+            if missing_outputs:
+                ports = ", ".join(f"Out {port}" for port in missing_outputs)
+                raise ValueError(f"No current OSA trace is available for {ports}. Read each selected output first.")
+            files = ["osa_spectra.csv"]
+            folder = save_measurement(
+                root, source="OSA", permutation=self.active_dataset_permutation(), input_ports=inputs,
+                output_ports=outputs, mode=mode, files=files, comment=self.dataset_comment_var.get(),
+                extra={"trace_count": len(traces),
+                       "trace_outputs": [item["output_port"] for item in traces]},
+            )
+            write_spectra(folder / files[0], [(item["name"], item["wave"], item["power"]) for item in traces],
+                          self.dataset_comment_var.get())
+        except (OSError, ValueError) as error:
+            messagebox.showerror("OSA dataset save failed", str(error), parent=self)
+            return
+        self.dataset_status_var.set(f"Saved {len(traces)} OSA trace(s) in {folder.name}.")
+        self.analyze_linked_dataset()
+
+    def save_dataset_power(self):
+        try:
+            root = self.dataset_root()
+            inputs, outputs, mode = self.dataset_selection()
+            reading = self.power_meter.last_reading
+            if reading is None:
+                raise ValueError("Read the current Arduino power first")
+            files = ["power_reading.csv"]
+            folder = save_measurement(
+                root, source="Power meter", permutation=self.active_dataset_permutation(), input_ports=inputs,
+                output_ports=outputs, mode=mode, files=files, comment=self.dataset_comment_var.get(),
+                extra={"value": reading.value, "unit": reading.unit, "raw_mean": reading.raw_mean,
+                       "sample_count": reading.sample_count},
+            )
+            with (folder / files[0]).open("w", encoding="utf-8", newline="") as file:
+                for line in self.dataset_comment_var.get().splitlines() or [""]:
+                    file.write(f"# Comment: {line}\n")
+                writer = csv.writer(file)
+                writer.writerow(["value", "unit", "raw_mean", "sample_count"])
+                writer.writerow([reading.value, reading.unit, reading.raw_mean, reading.sample_count])
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Power dataset save failed", str(error), parent=self)
+            return
+        self.dataset_status_var.set(f"Saved power reading in {folder.name}.")
+        self.analyze_linked_dataset()
+
+    def analyze_linked_dataset(self):
+        try:
+            root = self.dataset_root()
+            report = analyze_dataset(root)
+            csv_path = write_coverage_report(root, report)
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Dataset analysis failed", str(error), parent=self)
+            return
+        active = self.active_dataset_permutation()
+        active_item = next((item for item in report["configurations"] if item["permutation"] == active), None)
+        format_pair = lambda pair: f"In{pair[0]}â†’Out{pair[1]}"
+        lines = [
+            f"Dataset: {root}",
+            f"Measurements saved: {report['measurement_count']}",
+            f"Configurations complete: {report['complete_configurations']} / {report['expected_configurations']}",
+            f"Routed paths covered: {report['covered_paths']} / {report['expected_paths']}  â€¢  missing {report['missing_paths']}",
+            f"Detailed CSV: {csv_path.name}",
+            "",
+        ]
+        if active_item is None:
+            lines.extend((f"Active permutation: {' '.join(map(str, active))}",
+                          "It is not in this dataset's expected scope."))
+        elif active_item["complete"]:
+            lines.extend((f"Active permutation: {' '.join(map(str, active))}", "All six routed paths are covered."))
+        else:
+            lines.extend((f"Active permutation: {' '.join(map(str, active))}",
+                          "Still required: " + ", ".join(map(format_pair, active_item["missing"]))))
+        incomplete = [item for item in report["configurations"] if not item["complete"]]
+        if incomplete:
+            lines.extend(("", "Other incomplete configurations (first 30):"))
+            for item in incomplete[:30]:
+                permutation = " ".join(map(str, item["permutation"]))
+                missing = ", ".join(map(format_pair, item["missing"]))
+                lines.append(f"  {permutation}: {missing}")
+            if len(incomplete) > 30:
+                lines.append(f"  â€¦ plus {len(incomplete) - 30} more in {csv_path.name}")
+        self.set_dataset_report("\n".join(lines))
+        self.dataset_status_var.set(f"Coverage analysed: {report['missing_paths']} routed path(s) still missing.")
+
+    def set_dataset_report(self, text):
+        self.dataset_report.configure(state="normal")
+        self.dataset_report.delete("1.0", "end")
+        self.dataset_report.insert("1.0", text)
+        self.dataset_report.configure(state="disabled")
 
     def close(self):
         if self.impulse_running:
