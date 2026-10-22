@@ -924,9 +924,11 @@ class BenesApp(tk.Tk):
 
     def show_all_osa_spectra(self, spectra):
         self.set_osa_reading(False)
+        # Each "Read all" sweep gets its own figure, with every output overlaid in it.
+        opened = False
         for output, (wave, power) in spectra:
-            self.show_spectrum(wave, power, name=self.osa_trace_name(output), restore_buttons=False,
-                               output_port=output)
+            opened = self.show_spectrum(wave, power, name=self.osa_trace_name(output), restore_buttons=False,
+                                        output_port=output, new_window=not opened) or opened
         if spectra:
             self.osa_output_var.set(str(spectra[-1][0]))
         self.osa_switch_status_var.set(f"Read {len(spectra)} OSA output spectra; export them from the plot window.")
@@ -1918,8 +1920,12 @@ class BenesApp(tk.Tk):
         messagebox.showerror("OSA read failed", error, parent=self)
 
     def show_spectrum(self, wave, power, name=None, restore_buttons=True, output_port=None, trimmed=False,
-                      markers=()):
-        """Plot an OSA trace; ``markers`` are (wavelength nm, colour, label) drawn as vertical lines."""
+                      markers=(), new_window=None):
+        """Plot an OSA trace; ``markers`` are (wavelength nm, colour, label) drawn as vertical lines.
+
+        ``new_window`` forces (True) or suppresses (False) a new plot window; None follows the plot mode.
+        Returns True when the trace was plotted.
+        """
         if restore_buttons:
             self.set_osa_reading(False)
         try:
@@ -1951,7 +1957,9 @@ class BenesApp(tk.Tk):
         self.osa_trace_records.append({
             "name": name, "wave": list(wave), "power": list(power), "output_port": output_port,
         })
-        new_window = self.osa_plot_mode.get() == "New window" or self.osa_axes is None
+        if new_window is None:
+            new_window = self.osa_plot_mode.get() == "New window"
+        new_window = new_window or self.osa_axes is None
         if not new_window:
             try:
                 new_window = not self.osa_axes.figure.canvas.get_tk_widget().winfo_exists()
@@ -1982,6 +1990,7 @@ class BenesApp(tk.Tk):
                                transform=self.osa_axes.get_xaxis_transform())
         self.osa_axes.legend(loc="best")
         self.osa_axes.figure.canvas.draw_idle()
+        return True
 
     def export_spectra(self, axes):
         parent = axes.figure.canvas.get_tk_widget().winfo_toplevel()

@@ -2,14 +2,14 @@
   "channel_map": {
     "1": 14,
     "2": 15,
-    "3": 16,
+    "3": 13,
     "4": 6,
     "5": 7,
     "6": 8
   },
   "dry_run": false,
   "resource": "GPIB0::25::INSTR",
-  "selected_output": 2,
+  "selected_output": 6,
   "settle_s": 3.0,
   "timeout_s": 5.0
 }
