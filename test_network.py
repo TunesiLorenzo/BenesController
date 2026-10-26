@@ -67,6 +67,25 @@ class NetworkTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 network.solve(invalid)
 
+    def test_constrained_solver_keeps_a_requested_path_and_permutation(self):
+        network = BenesNetwork()
+        target = (5, 2, 4, 0, 3, 1)
+        self.assertTrue(network.solve(target))
+        active_path = network.trace(0)
+        states = network.states_for_permutation(target, dict(active_path.states), prefer_states=network.states)
+        self.assertIsNotNone(states)
+        self.assertEqual(network.mapping(states), target)
+        self.assertTrue(all(states[name] == crossed for name, crossed in active_path.states))
+        self.assertEqual(states, network.states)
+
+    def test_equivalent_permutation_states_lists_every_full_routing(self):
+        network = BenesNetwork()
+        target = (5, 2, 4, 0, 3, 1)
+        states = network.equivalent_permutation_states(target)
+        self.assertGreater(len(states), 1)
+        self.assertEqual(len({tuple(item[name] for name in network.switches) for item in states}), len(states))
+        self.assertTrue(all(network.mapping(item) == target for item in states))
+
 
 if __name__ == "__main__":
     unittest.main()

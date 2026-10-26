@@ -87,12 +87,42 @@ class BenesNetwork:
         return found
 
     def solve(self, permutation):
+        states = self.states_for_permutation(permutation)
+        if states is None:
+            return False
+        self.states.update(states)
+        return True
+
+    def states_for_permutation(self, permutation, required_states=None, prefer_states=None):
+        """Return states for ``permutation`` that honour requirements and minimise changes."""
+        if sorted(permutation) != list(range(self.size)):
+            raise ValueError("Use each output from 1 to 6 exactly once.")
+        required_states = required_states or {}
+        unknown = set(required_states) - set(self.switches)
+        if unknown:
+            raise ValueError(f"Unknown switch: {sorted(unknown)[0]}")
+        names = tuple(self.switches)
+        best = None
+        fewest_changes = len(names) + 1
+        for bits in product((False, True), repeat=len(names)):
+            states = dict(zip(names, bits))
+            if (all(states[name] == crossed for name, crossed in required_states.items()) and
+                    self.mapping(states) == tuple(permutation)):
+                if prefer_states is None:
+                    return states
+                changes = sum(states[name] != prefer_states[name] for name in names)
+                if changes < fewest_changes:
+                    best, fewest_changes = states, changes
+        return best
+
+    def equivalent_permutation_states(self, permutation):
+        """Return every full switch-state configuration that realizes ``permutation``."""
         if sorted(permutation) != list(range(self.size)):
             raise ValueError("Use each output from 1 to 6 exactly once.")
         names = tuple(self.switches)
+        matches = []
         for bits in product((False, True), repeat=len(names)):
             states = dict(zip(names, bits))
             if self.mapping(states) == tuple(permutation):
-                self.states.update(states)
-                return True
-        return False
+                matches.append(states)
+        return matches

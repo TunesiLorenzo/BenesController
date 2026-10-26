@@ -10,14 +10,16 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from network import BenesNetwork
-from calibration_scan import (ScanPoint, calibrate_default_cross_path, minimum_default_cross_pairs,
-                              next_default_cross_pair,
-                              scan_switch, scan_switches, scan_switches_with_reader,
-                              scan_voltages, spectrum_scan_point, zero_voltage_paths)
+from calibration_scan import (ScanPoint, scan_switch, scan_switches, scan_switches_with_reader,
+                              scan_voltages, spectrum_scan_point)
 from crosstalk_results import (PLOT_X_POWER, PLOT_X_VOLTAGE, RESCAN_STYLES, create_result_folder,
                                load_scan_folder, plot_x_values, save_scan_artifacts, scan_context)
 from dataset_registry import (analyze_dataset, create_dataset, save_measurement,
                               write_coverage_report)
+from laser_calibration import (DEFAULT_PASS_DB, CalibrationStopped, CompleteCalibration, SimulatedChip,
+                               calibrate_all, calibrate_switch, check_alignment, check_calibrated_states,
+                               create_calibration_folder, reference_states, save_calibration_results,
+                               strongest_input, switch_probes, wavelengths_from_assignment)
 from impulse_test import (LIVE_PLOT_WINDOW_S, plot_trace_samples, received_pair_rate,
                           run_impulse_test,
                           validate_impulse_settings, write_impulse_csv)
@@ -51,6 +53,22 @@ ZERO_VOLT_COLOR = "#ffd84d"
 WDM_COLORS = ("#ff6b6b", "#ffa94d", "#4dabf7", "#f06595", "#b197fc", "#c0eb75")
 # Tags comb-line marker lines so spectrum export skips them.
 WDM_MARKER_GID = "wdm-comb-line"
+# MZI calibration status: (diagram/table colour, description).
+CAL_STATUS = {
+    "pending": ("#7790ad", "not calibrated"),
+    "saved": ("#2f9e80", "saved voltages"),
+    "active": (ZERO_VOLT_COLOR, "sweeping"),
+    "calibrated": (ACCENT, "calibrated"),
+    "ok": (ACCENT, "state OK"),
+    "partial": ("#ffa94d", "low extinction"),
+    "inverted": ("#ff6b6b", "wrong state"),
+    "unknown": ("#9baec6", "no line"),
+    "failed": ("#ff6b6b", "sweep failed"),
+}
+# Worst first, to combine the verdicts of several state checks.
+VERDICT_ORDER = ("inverted", "partial", "unknown", "ok")
+CHECK_SHORT = {"Alignment (all 0 V)": "0 V", "All cross (calibrated)": "all X",
+               "All bar (calibrated)": "all =", "Routed states": "routed"}
 
 
 class VerticalScrolledFrame(ttk.Frame):
@@ -111,17 +129,21 @@ class BenesApp(tk.Tk):
         self.crosstalk_data_unit = None
         self.crosstalk_result_folder = None
         self.active_scan_kind = "Crosstalk scan"
-        self.next_connection_prompt = None
-        self.path_calibrated_switches = set()
         # Switches clicked to 0 V; they route as cross, the chip's unbiased state.
         self.zero_volt_switches = set()
+        self.mzi_calibration_running = False
+        self.calibration_stop_event = None
         self.impulse_running = False
         self.impulse_stop_event = None
         self.impulse_trace = None
         self.source = 0
-        self.destination = None
+        self.destination = 0
         self.routes = []
         self.selected_route = 0
+        self.permutation_route_states = ()
+        self.permutation_preview_states = None
+        self.selected_permutation_route = 0
+        self.keep_permutation_var = tk.BooleanVar(value=False)
         self.all_paths = tk.BooleanVar(value=True)
         self.power_meter_output_var = tk.StringVar(value="None")
         self.osa_output_var = tk.StringVar(value="None")
@@ -201,13 +223,13 @@ class BenesApp(tk.Tk):
         self.notebook.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         # Each tab fills the window when it fits and scrolls when the window is smaller.
         tabs = []
-        for text in ("Routing", "Hardware & OSA", "Calibration scans", "WDM comb", "Dataset coverage",
-                     "Impulse test"):
+        for text in ("Routing", "Hardware & OSA", "MZI calibration", "Crosstalk scans", "WDM comb",
+                     "Dataset coverage", "Impulse test"):
             scroller = ScrollableFrame(self.notebook, background=BG)
             self.notebook.add(scroller, text=text)
             tabs.append(scroller.inner)
-        (self.route_tab, self.hardware_tab, self.crosstalk_tab, self.wdm_tab, self.dataset_tab,
-         self.impulse_tab) = tabs
+        (self.route_tab, self.hardware_tab, self.calibration_tab, self.crosstalk_tab, self.wdm_tab,
+         self.dataset_tab, self.impulse_tab) = tabs
 
         controls = ttk.Frame(self.route_tab, padding=(24, 8))
         controls.pack(fill="x")
@@ -216,8 +238,8 @@ class BenesApp(tk.Tk):
         self.input_box.current(0)
         self.input_box.pack(side="left", padx=(8, 20))
         self.input_box.bind("<<ComboboxSelected>>", self.choose_input)
-        ttk.Label(controls, text="Destination").pack(side="left")
-        self.output_box = ttk.Combobox(controls, values=["Trace current"] + list(range(1, 7)), width=14, state="readonly")
+        ttk.Label(controls, text="Output").pack(side="left")
+        self.output_box = ttk.Combobox(controls, values=list(range(1, 7)), width=5, state="readonly")
         self.output_box.current(0)
         self.output_box.pack(side="left", padx=8)
         self.output_box.bind("<<ComboboxSelected>>", self.choose_output)
@@ -322,15 +344,8 @@ class BenesApp(tk.Tk):
         ttk.Label(arduino, textvariable=self.power_reading_var, font=("Segoe UI", 10, "bold")).grid(
             row=3, column=0, columnspan=8, sticky="w", pady=(12, 0))
 
-        # Keep the two workflows in separate panels.  Appending automatic
-        # calibration below the sequential form made its start button fall off
-        # the bottom of a normal laptop window.
-        scan_tabs = ttk.Notebook(self.crosstalk_tab)
-        scan_tabs.pack(side="left", fill="y", padx=(24, 12), pady=18)
-        scan_controls = ttk.Frame(scan_tabs, padding=18)
-        path_controls = ttk.Frame(scan_tabs, padding=18)
-        scan_tabs.add(scan_controls, text="Sequential scan")
-        scan_tabs.add(path_controls, text="Automatic path")
+        scan_controls = ttk.Frame(self.crosstalk_tab, padding=18)
+        scan_controls.pack(side="left", fill="y", padx=(24, 12), pady=18)
         ttk.Label(scan_controls, text="Select switches (Ctrl or Shift for multiple)").grid(row=0, column=0, columnspan=2, sticky="w")
         self.crosstalk_switches = tk.Listbox(scan_controls, selectmode="extended", exportselection=False,
                                              height=len(self.network.switches), width=18, bg=PANEL, fg=TEXT,
@@ -361,23 +376,6 @@ class BenesApp(tk.Tk):
         self.crosstalk_status = tk.StringVar(value="Connect the voltage board and select a measurement source.")
         ttk.Label(scan_controls, textvariable=self.crosstalk_status, wraplength=245).grid(row=11, column=0, columnspan=2, sticky="w")
 
-        self.default_cross_plan = minimum_default_cross_pairs(self.network)
-        plan = self.default_cross_plan
-        plan_text = ", ".join(f"{source + 1}→{output + 1}" for source, output, _ in plan)
-        ttk.Label(path_controls, text="Automatic default-cross calibration", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Label(path_controls, text=("Choose an input and its 0 V output in Route explorer. The sweep starts at the end switch; every non-target MZI remains at 0 V."), wraplength=270).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 10))
-        for row, label in enumerate(("Lower limit [V]", "Upper limit [V]", "Step [V]", "Settle [ms]"), start=2):
-            ttk.Label(path_controls, text=label).grid(row=row, column=0, sticky="w", pady=3)
-            ttk.Entry(path_controls, textvariable=self.crosstalk_fields[label], width=12).grid(row=row, column=1, sticky="w", padx=(10, 0), pady=3)
-        self.path_averages_var = tk.StringVar(value="3")
-        ttk.Label(path_controls, text="Burst averages / point").grid(row=6, column=0, sticky="w", pady=(8, 5))
-        ttk.Entry(path_controls, textvariable=self.path_averages_var, width=7).grid(row=6, column=1, sticky="w", padx=(10, 0), pady=(8, 5))
-        ttk.Label(path_controls, text="Scan comment").grid(row=7, column=0, sticky="w", pady=3)
-        ttk.Entry(path_controls, textvariable=self.crosstalk_comment_var, width=19).grid(row=7, column=1, sticky="w", padx=(10, 0), pady=3)
-        self.path_calibration_button = ttk.Button(path_controls, text="Calibrate selected default-cross path", command=self.start_path_calibration)
-        self.path_calibration_button.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 6))
-        ttk.Label(path_controls, text=f"Minimum all-switch plan: {len(plan)} pairs — {plan_text}", wraplength=270).grid(row=9, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        ttk.Label(path_controls, textvariable=self.crosstalk_status, wraplength=270).grid(row=10, column=0, columnspan=2, sticky="w")
         plot_area = ttk.Frame(self.crosstalk_tab, padding=(0, 18, 18, 18))
         plot_area.pack(side="left", fill="both", expand=True)
         plot_bar = ttk.Frame(plot_area)
@@ -424,7 +422,11 @@ class BenesApp(tk.Tk):
         self.route_list.pack(side="left", fill="both", expand=True)
         route_scrollbar.pack(side="right", fill="y")
         self.route_list.bind("<<ListboxSelect>>", self.select_route)
-        ttk.Button(route_sidebar, text="Apply selected path", command=self.apply_route).pack(anchor="w", fill="x")
+        ttk.Button(route_sidebar, text="Apply path (drive bar/cross)", command=self.apply_route).pack(anchor="w", fill="x")
+        ttk.Checkbutton(route_sidebar, text="Keep complete output permutation",
+                        variable=self.keep_permutation_var).pack(anchor="w", pady=(6, 0))
+        ttk.Label(route_sidebar, text="Off: drive only the selected path's MZIs. On: adjust other MZIs as needed while retaining every current input → output connection.",
+                  wraplength=255, foreground="#9baec6").pack(anchor="w", fill="x", pady=(2, 0))
 
         ttk.Separator(route_sidebar, orient="horizontal").pack(fill="x", pady=10)
         ttk.Label(route_sidebar, text="Route complete permutation", font=("Segoe UI", 10, "bold")).pack(anchor="w")
@@ -436,28 +438,44 @@ class BenesApp(tk.Tk):
         buttons.pack(anchor="w", fill="x")
         ttk.Button(buttons, text="Route permutation", command=self.route_permutation).pack(side="left", fill="x", expand=True)
         ttk.Button(buttons, text="Shuffle", command=self.shuffle).pack(side="left", padx=(6, 0))
+        ttk.Label(route_sidebar, text="Equivalent full-network routings").pack(anchor="w", pady=(10, 2))
+        self.permutation_route_list = tk.Listbox(route_sidebar, height=5, bg=PANEL, fg=TEXT,
+                                                 selectbackground="#315b78", selectforeground="white",
+                                                 exportselection=False, state="disabled", borderwidth=0,
+                                                 highlightthickness=0)
+        self.permutation_route_list.pack(anchor="w", fill="x")
+        self.permutation_route_list.bind("<<ListboxSelect>>", self.show_permutation_route)
 
         diagram = ttk.Frame(route_body)
         diagram.pack(side="left", fill="both", expand=True)
         self.canvas = tk.Canvas(diagram, bg=BG, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda event: self.draw())
-        ttk.Label(diagram, text="Green switches have saved bar and cross voltages. Click a switch to toggle it; type a voltage and press Enter to send it.", padding=(4, 5), wraplength=680).pack(anchor="w", fill="x")
+        ttk.Label(diagram, text="Green switches have saved bar and cross voltages. Use the X, =, and 0 controls beside each MZI to set cross, bar, or 0 V; clicking an MZI still cycles the states. Type a voltage and press Enter to send it.", padding=(4, 5), wraplength=680).pack(anchor="w", fill="x")
         self.build_wdm_tab()
+        self.build_calibration_tab()
         self.build_dataset_tab()
         self.build_impulse_tab()
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.refresh()
         self.after(200, self.auto_connect_osa_output_switch)
 
+    @staticmethod
+    def tab_page(tab):
+        """The notebook page that holds a scrollable tab's content frame."""
+        return tab.master.master
+
+    def set_tab_state(self, tab, state):
+        self.notebook.tab(self.tab_page(tab), state=state)
+
     def choose_input(self, event=None):
+        self.clear_permutation_preview()
         self.source = self.input_box.current()
         self.refresh()
 
     def choose_output(self, event=None):
-        self.destination = self.output_box.current() - 1
-        if self.destination < 0:
-            self.destination = None
+        self.clear_permutation_preview()
+        self.destination = self.output_box.current()
         self.refresh()
 
     @staticmethod
@@ -563,11 +581,13 @@ class BenesApp(tk.Tk):
         self.choose_input()
 
     def click_output(self, row):
-        self.output_box.current(row + 1)
+        self.output_box.current(row)
         self.choose_output()
 
     def toggle(self, name):
         """Cycle a switch: cross -> straight -> 0 V -> cross."""
+        if hasattr(self, "clear_permutation_preview"):
+            self.clear_permutation_preview()
         to_zero = name not in self.zero_volt_switches and not self.network.states[name]
         crossed = to_zero or name in self.zero_volt_switches
         try:
@@ -590,6 +610,30 @@ class BenesApp(tk.Tk):
             state = "0 V (unbiased)" if to_zero else "cross" if crossed else "bar"
             self.update_hardware_status(f"{name} {state}: {voltage:.2f} V")
 
+    def set_switch_state(self, name, state):
+        """Set one MZI directly to cross, bar, or its unbiased 0 V state."""
+        if hasattr(self, "clear_permutation_preview"):
+            self.clear_permutation_preview()
+        try:
+            if state == "zero":
+                crossed, voltage = True, self.controller.drive_voltage(name, 0.0)
+            else:
+                crossed = state == "cross"
+                voltage = self.controller.apply_calibrated_state(name, crossed)
+        except (OSError, RuntimeError, ValueError) as error:
+            messagebox.showerror("Calibration command failed", str(error), parent=self)
+            return
+        self.network.states[name] = crossed
+        if state == "zero":
+            self.zero_volt_switches.add(name)
+        else:
+            self.zero_volt_switches.discard(name)
+        if voltage is not None:
+            self.voltage_vars[name].set(f"{voltage:.2f}")
+        self.refresh(keep_selection=True)
+        if voltage is not None:
+            self.update_hardware_status(f"{name} {'0 V (unbiased)' if state == 'zero' else state}: {voltage:.2f} V")
+
     def reset(self):
         self.network.states = dict.fromkeys(self.network.switches, True)
         self.apply_calibration()
@@ -608,10 +652,77 @@ class BenesApp(tk.Tk):
             self.draw()
 
     def apply_route(self):
-        if self.routes:
-            self.network.states.update(dict(self.routes[self.selected_route].states))
-            self.apply_calibration()
+        if not self.routes:
+            return
+        self.clear_permutation_preview()
+        route_states = dict(self.routes[self.selected_route].states)
+        if self.keep_permutation_var.get():
+            target_states = self.network.states_for_permutation(
+                self.network.mapping(), route_states, prefer_states=self.network.states,
+            )
+            if target_states is None:
+                messagebox.showerror(
+                    "Equivalent path unavailable",
+                    "This alternative path cannot be used while retaining the current complete output permutation.",
+                    parent=self,
+                )
+                return
+            names = [name for name in self.network.switches
+                     if target_states[name] != self.network.states[name] or name in self.zero_volt_switches]
+        else:
+            target_states = {**self.network.states, **route_states}
+            # Only the MZIs used by this physical route are commanded.
+            names = list(route_states)
+        if self.drive_route_states(target_states, names):
             self.refresh(keep_selection=True)
+
+    def drive_route_states(self, states, names):
+        """Drive only ``names`` to their requested calibrated bar/cross states."""
+        try:
+            for name in names:
+                voltage = self.controller.apply_calibrated_state(name, states[name])
+                self.network.states[name] = states[name]
+                self.zero_volt_switches.discard(name)
+                if voltage is not None:
+                    self.voltage_vars[name].set(f"{voltage:.2f}")
+        except (OSError, RuntimeError, ValueError) as error:
+            messagebox.showerror("Path command failed", str(error), parent=self)
+            return False
+        mode = "while retaining the complete permutation" if self.keep_permutation_var.get() else "on the selected path only"
+        self.update_hardware_status(f"Applied {len(names)} MZI state(s) {mode}")
+        return True
+
+    def clear_permutation_preview(self):
+        self.permutation_preview_states = None
+        if hasattr(self, "permutation_route_list"):
+            self.permutation_route_list.selection_clear(0, "end")
+
+    def set_permutation_route_options(self, permutation):
+        """List every whole-network routing that produces one output permutation."""
+        states = self.network.equivalent_permutation_states(permutation)
+        current = self.network.states
+        self.permutation_route_states = tuple(sorted(
+            states,
+            key=lambda candidate: sum(candidate[name] != current[name] for name in self.network.switches),
+        ))
+        self.permutation_route_list.configure(state="normal")
+        self.permutation_route_list.delete(0, "end")
+        for index, candidate in enumerate(self.permutation_route_states):
+            changes = sum(candidate[name] != current[name] for name in self.network.switches)
+            suffix = "current states" if changes == 0 else f"{changes} MZI state changes"
+            self.permutation_route_list.insert("end", f"Routing {index + 1} — {suffix}")
+        self.selected_permutation_route = 0
+        self.permutation_route_list.selection_set(0)
+        self.permutation_route_list.see(0)
+        self.permutation_preview_states = self.permutation_route_states[0]
+
+    def show_permutation_route(self, event=None):
+        selection = self.permutation_route_list.curselection()
+        if not selection or selection[0] >= len(self.permutation_route_states):
+            return
+        self.selected_permutation_route = selection[0]
+        self.permutation_preview_states = self.permutation_route_states[self.selected_permutation_route]
+        self.draw()
 
     def route_permutation(self):
         try:
@@ -622,6 +733,7 @@ class BenesApp(tk.Tk):
             messagebox.showerror("Invalid permutation", str(error), parent=self)
             return
         self.apply_calibration()
+        self.set_permutation_route_options(values)
         self.refresh(keep_selection=True)
 
     def shuffle(self):
@@ -957,203 +1069,12 @@ class BenesApp(tk.Tk):
             f"(ADC mean {reading.raw_mean:.2f}, {reading.sample_count} samples)"
         )
 
-    def start_path_calibration(self):
-        """Sweep the selected zero-volt optical path, starting at its final MZI."""
-        try:
-            if self.destination is None:
-                raise ValueError("Choose both an input and a destination output in Route explorer")
-            if not self.controller.connected or self.controller.settings["dry_run"]:
-                raise RuntimeError("Connect the physical voltage board first")
-            if not self.power_meter.connected:
-                raise RuntimeError("Connect the Arduino power meter first")
-            if self.read_power_button.instate(["disabled"]):
-                raise RuntimeError("Wait for the current Arduino power reading to finish")
-            meter_output = self.detector_port(self.power_meter_output_var)
-            if meter_output != self.destination:
-                raise ValueError("Set Power Meter output to the selected destination output before calibrating")
-            fields = self.crosstalk_fields
-            voltages = scan_voltages(*(float(fields[key].get()) for key in
-                                       ("Lower limit [V]", "Upper limit [V]", "Step [V]")))
-            if 0.0 not in voltages:
-                raise ValueError("Include 0 V in the calibration range to verify the default cross state")
-            settle_ms = float(fields["Settle [ms]"].get())
-            if not 0 <= settle_ms <= 10000:
-                raise ValueError("Settling time must be between 0 and 10000 ms")
-            averages = int(self.path_averages_var.get())
-            if not 1 <= averages <= 100:
-                raise ValueError("Burst averages must be an integer from 1 to 100")
-            zero_route = zero_voltage_paths(self.network)[self.source]
-            if zero_route.rows[-1] != self.destination:
-                raise ValueError(
-                    f"At 0 V, input {self.source + 1} reaches output {zero_route.rows[-1] + 1}; "
-                    "select that output so all non-target MZIs can remain at 0 V"
-                )
-            names = [name for name, _ in reversed(zero_route.states)]
-            for name in self.network.switches:
-                if self.controller.settings["mapping"].get(name) is None:
-                    raise ValueError(f"Assign a voltage-board pin to every MZI before automatic path calibration ({name} is unassigned)")
-            self.confirm_voltage_sweep(voltages, names=names)
-            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk  # noqa: F401
-            from matplotlib.figure import Figure  # noqa: F401
-        except (ImportError, OSError, RuntimeError, ValueError) as error:
-            messagebox.showerror("Path calibration unavailable", str(error), parent=self)
-            return
-
-        zero_states = dict.fromkeys(self.network.switches, True)
-        context = scan_context(
-            self.network, self.source, self.destination,
-            meter_output, self.detector_port(self.osa_output_var), self.controller,
-            names, voltages, settle_ms, "Arduino", self.crosstalk_comment_var.get().strip(),
-            states=zero_states,
-        )
-        context["calibration_mode"] = "default_cross_path"
-        context["burst_averages_per_point"] = averages
-        context["sensitive_range_rescans"] = {}
-        context["wide_range_rescans"] = {}
-        try:
-            result_folder = create_result_folder(app_dir(), context)
-            save_scan_artifacts(result_folder, context, {}, "Arduino", self.power_meter.settings["unit"],
-                                self.network, status="in_progress")
-        except (OSError, RuntimeError, ValueError) as error:
-            messagebox.showerror("Calibration results unavailable", str(error), parent=self)
-            return
-
-        self.active_scan_kind = "Path calibration"
-        self.crosstalk_running = True
-        self.crosstalk_data = {}
-        self.crosstalk_data_source = None
-        self.crosstalk_data_unit = None
-        self.crosstalk_result_folder = result_folder
-        self.crosstalk_button.configure(state="disabled")
-        self.path_calibration_button.configure(state="disabled")
-        self.crosstalk_export_button.configure(state="disabled")
-        self.crosstalk_switches.configure(state="disabled")
-        self.crosstalk_source_box.configure(state="disabled")
-        self.notebook.tab(self.route_tab, state="disabled")
-        self.notebook.tab(self.hardware_tab, state="disabled")
-        self.crosstalk_status.set(
-            f"Calibrating {len(names)} MZI(s), from output back to input; "
-            f"{averages} burst average(s) per point..."
-        )
-        self.prepare_crosstalk_plots(voltages)
-        data = {}
-
-        def on_point(name, index, total, point):
-            data.setdefault(name, []).append(point)
-            self.after(0, lambda: self.add_crosstalk_point(
-                name, point, index, total, "Arduino", self.power_meter.settings["unit"]
-            ))
-
-        def on_sensitive_point(name, index, total, point):
-            context["sensitive_range_rescans"].setdefault(name, []).append({
-                "voltage_v": point.voltage, "power": point.power,
-            })
-            self.after(0, lambda: self.add_rescan_point(name, "sensitive", point, index, total))
-
-        def on_wide_point(name, index, total, point):
-            context["wide_range_rescans"].setdefault(name, []).append({
-                "voltage_v": point.voltage, "power": point.power,
-            })
-            self.after(0, lambda: self.add_rescan_point(name, "wide", point, index, total))
-
-        def on_range_change(name, phase, limit_count):
-            ready = threading.Event()
-            confirmed = [False]
-
-            def ask_user():
-                try:
-                    if phase == "sensitive":
-                        self.crosstalk_status.set(f"{name}: waiting for a more sensitive meter range...")
-                        message = (
-                            f"{name} had {limit_count} readings at the meter floor. The switch is now at 0 V.\n\n"
-                            "Change the power meter to its more sensitive (low) range, "
-                            "then click OK to rescan for the minimum (straight state).\n\n"
-                            "Cancel stops calibration without saving this switch."
-                        )
-                    elif phase == "wide":
-                        self.crosstalk_status.set(f"{name}: waiting for a wider meter range...")
-                        message = (
-                            f"{name} had {limit_count} readings at or above the meter ceiling "
-                            f"({self.power_meter.ceiling:g} ADC counts). The switch is now at 0 V.\n\n"
-                            "Change the power meter to its less sensitive (high) range, "
-                            "then click OK to rescan for the maximum (cross state).\n\n"
-                            "Cancel stops calibration without saving this switch."
-                        )
-                    else:
-                        self.crosstalk_status.set(f"{name}: waiting for the original meter range...")
-                        finished = "minimum" if phase == "restore_sensitive" else "maximum"
-                        message = (
-                            f"The {finished} rescan of {name} is finished. The switch is at 0 V.\n\n"
-                            "Return the power meter to the range used at the start of this switch, "
-                            "then click OK before calibration continues.\n\n"
-                            "Cancel stops calibration."
-                        )
-                    confirmed[0] = messagebox.askokcancel(
-                        "Change power meter range", message, parent=self,
-                    )
-                finally:
-                    ready.set()
-
-            self.after(0, ask_user)
-            ready.wait()
-            return confirmed[0]
-
-        def worker():
-            try:
-                results = calibrate_default_cross_path(
-                    self.controller, self.power_meter, self.network, self.source, self.destination,
-                    voltages, settle_ms / 1000, averages, on_point,
-                    on_range_change=on_range_change, on_sensitive_point=on_sensitive_point,
-                    on_wide_point=on_wide_point,
-                )
-                context["calibration_results"] = {
-                    name: {
-                        "cross_voltage_v": result.cross.voltage,
-                        "cross_power": result.cross.power,
-                        "cross_measurement_range": "wide" if result.wide_points else "original",
-                        "straight_voltage_v": result.straight.voltage,
-                        "straight_power": result.straight.power,
-                        "straight_measurement_range": "sensitive" if result.sensitive_points else "original",
-                        "straight_at_noise_floor": result.straight_at_floor,
-                    }
-                    for name, result in results.items()
-                }
-            except Exception as error:
-                self.after(0, lambda message=str(error): self.finish_path_calibration(
-                    names, data, result_folder, context, message
-                ))
-            else:
-                self.after(0, lambda: self.finish_path_calibration(names, data, result_folder, context))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def finish_path_calibration(self, names, data, folder, context, error=None):
-        # The worker has forced every hardware output to 0 V, which is cross.
-        self.network.states = dict.fromkeys(self.network.switches, True)
-        self.zero_volt_switches = set(self.network.switches)
-        for name in self.network.switches:
-            self.voltage_vars[name].set("0.00")
-        self.refresh(keep_selection=True)
-        self.next_connection_prompt = None
-        if error is None:
-            self.path_calibrated_switches.update(context["calibration_results"])
-            next_pair = next_default_cross_pair(self.default_cross_plan, self.path_calibrated_switches)
-            self.next_connection_prompt = next_pair if next_pair is not None else "complete"
-        self.finish_crosstalk_scan(names, data, "Arduino", self.power_meter.settings["unit"],
-                                   folder, context, error)
-        at_floor = [name for name, result in context.get("calibration_results", {}).items()
-                    if (result or {}).get("straight_at_noise_floor")]
-        if error is None and at_floor:
-            messagebox.showwarning(
-                "Straight state at noise floor",
-                f"{', '.join(at_floor)} still reached the noise floor on the sensitive range. "
-                "Their straight voltages are the lowest reading found and may be imprecise; "
-                "check them or recalibrate with more light.", parent=self)
-
     def start_crosstalk_scan(self):
         names = [self.crosstalk_switches.get(index) for index in self.crosstalk_switches.curselection()]
         source = self.crosstalk_source.get()
         try:
+            if self.mzi_calibration_running:
+                raise RuntimeError("Wait for the MZI calibration to finish")
             if not names:
                 raise ValueError("Select at least one switch")
             fields = self.crosstalk_fields
@@ -1190,7 +1111,7 @@ class BenesApp(tk.Tk):
             return
 
         response_unit = "dBm" if source == "OSA" else self.power_meter.settings["unit"]
-        output_port = self.destination if self.destination is not None else self.network.trace(self.source).rows[-1]
+        output_port = self.destination
         context = scan_context(
             self.network, self.source, output_port,
             self.detector_port(self.power_meter_output_var), self.detector_port(self.osa_output_var),
@@ -1211,12 +1132,11 @@ class BenesApp(tk.Tk):
         self.crosstalk_data_unit = None
         self.crosstalk_result_folder = result_folder
         self.crosstalk_button.configure(state="disabled")
-        self.path_calibration_button.configure(state="disabled")
         self.crosstalk_export_button.configure(state="disabled")
         self.crosstalk_switches.configure(state="disabled")
         self.crosstalk_source_box.configure(state="disabled")
-        self.notebook.tab(self.route_tab, state="disabled")
-        self.notebook.tab(self.hardware_tab, state="disabled")
+        self.set_tab_state(self.route_tab, "disabled")
+        self.set_tab_state(self.hardware_tab, "disabled")
         self.crosstalk_status.set(f"Scanning {len(names)} switch(es), {len(voltages)} points each...")
         self.prepare_crosstalk_plots(voltages)
         data = {}
@@ -1276,11 +1196,10 @@ class BenesApp(tk.Tk):
     def complete_crosstalk_scan(self, data, folder, scan_error=None, save_error=None):
         self.crosstalk_running = False
         self.crosstalk_button.configure(state="normal")
-        self.path_calibration_button.configure(state="normal")
         self.crosstalk_switches.configure(state="normal")
         self.crosstalk_source_box.configure(state="readonly")
-        self.notebook.tab(self.route_tab, state="normal")
-        self.notebook.tab(self.hardware_tab, state="normal")
+        self.set_tab_state(self.route_tab, "normal")
+        self.set_tab_state(self.hardware_tab, "normal")
         if data:
             self.crosstalk_export_button.configure(state="normal")
         if scan_error:
@@ -1288,39 +1207,10 @@ class BenesApp(tk.Tk):
             messagebox.showerror(f"{self.active_scan_kind} failed", scan_error, parent=self)
         elif save_error:
             self.crosstalk_status.set(f"{self.active_scan_kind} finished, but automatic export failed: {save_error}")
-        elif self.active_scan_kind == "Path calibration":
-            covered = len(self.path_calibrated_switches)
-            total = len(self.network.switches)
-            progress = ("Default-cross calibration complete" if covered == total else "Path scan finished")
-            self.crosstalk_status.set(
-                f"{progress}; {covered}/{total} MZIs calibrated this session. Results: {folder}"
-            )
         else:
             self.crosstalk_status.set(f"{self.active_scan_kind} complete. Results: {folder}")
         if save_error:
             messagebox.showerror("Crosstalk export failed", f"{save_error}\nFolder: {folder}", parent=self)
-        if self.next_connection_prompt is not None:
-            next_connection = self.next_connection_prompt
-            self.next_connection_prompt = None
-            if next_connection == "complete":
-                messagebox.showinfo(
-                    "Default-cross plan complete",
-                    "All MZIs have been calibrated by path scans this session. "
-                    "All MZIs are currently at 0 V.",
-                    parent=self,
-                )
-            else:
-                input_port, output_port = next_connection
-                messagebox.showinfo(
-                    "Select the next fiber connection",
-                    f"{len(self.path_calibrated_switches)}/{len(self.network.switches)} MZIs calibrated "
-                    f"this session. Next default-cross path:\n\n"
-                    f"Input {input_port + 1} — Fiber {15 - input_port}\n"
-                    f"Output {output_port + 1} — Fiber {4 + output_port}\n\n"
-                    f"Select In {input_port + 1} and Out {output_port + 1} in Route explorer, "
-                    f"then set Power Meter output to Out {output_port + 1}.",
-                    parent=self,
-                )
 
     def prepare_crosstalk_plots(self, voltages):
         for child in self.crosstalk_plot_frame.winfo_children():
@@ -1671,7 +1561,6 @@ class BenesApp(tk.Tk):
                     straight_vars[name].set("")
                 if state in (None, "cross"):
                     cross_vars[name].set("")
-            self.path_calibrated_switches.difference_update(names)
             self.draw()
             detail = (f"{names[0]} {state or 'straight/cross'} calibration forgotten"
                       if len(names) == 1 else "All calibrations forgotten")
@@ -2012,6 +1901,724 @@ class BenesApp(tk.Tk):
             return
         messagebox.showinfo("Export complete", f"Saved {len(traces)} trace(s) to:\n{path}", parent=parent)
 
+    def build_calibration_tab(self):
+        """Six-laser MZI calibration: single-MZI sweeps, the complete routine and state checks."""
+        controls_column = ttk.Frame(self.calibration_tab, padding=(18, 18, 8, 18), width=370)
+        controls_column.pack(side="left", fill="y")
+        controls_column.pack_propagate(False)
+        control_scroll = VerticalScrolledFrame(controls_column)
+        control_scroll.pack(fill="both", expand=True)
+        controls = ttk.Frame(control_scroll.content, padding=(0, 0, 12, 0))
+        controls.pack(anchor="nw", fill="x")
+        results = ttk.Frame(self.calibration_tab, padding=(8, 18, 18, 18))
+        results.pack(side="left", fill="both", expand=True)
+
+        ttk.Label(controls, text="SIX-LASER CALIBRATION", foreground=ACCENT,
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(controls, wraplength=330, text=(
+            "Every input carries a laser at its WDM comb wavelength, so every MZI carries two lines. The OSA "
+            "reads the outputs through the JDSU switch; which line arrives where shows the state of each MZI. "
+            "MZIs not being swept stay at 0 V (cross).")).pack(anchor="w", pady=(4, 10))
+
+        lasers = ttk.LabelFrame(controls, text="Lasers (WDM comb plan)", padding=10)
+        lasers.pack(fill="x")
+        self.cal_laser_labels = []
+        for port in INPUTS:
+            label = ttk.Label(lasers)
+            label.grid(row=(port - 1) % 3, column=(port - 1) // 3, sticky="w", padx=(0, 18), pady=1)
+            self.cal_laser_labels.append(label)
+        ttk.Button(lasers, text="Edit wavelengths…", command=lambda: self.notebook.select(
+            self.tab_page(self.wdm_tab))).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        sweep = ttk.LabelFrame(controls, text="Sweep", padding=10)
+        sweep.pack(fill="x", pady=(12, 0))
+        self.cal_fields = {}
+        for row, (label, default) in enumerate((("Lower limit [V]", "0"), ("Upper limit [V]", "5"),
+                                                 ("Step [V]", "0.1"), ("Settle [ms]", "50"),
+                                                 ("Pass margin [dB]", f"{DEFAULT_PASS_DB:g}"))):
+            ttk.Label(sweep, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            variable = tk.StringVar(value=default)
+            ttk.Entry(sweep, textvariable=variable, width=9).grid(row=row, column=1, sticky="w", padx=(10, 0), pady=2)
+            self.cal_fields[label] = variable
+        ttk.Label(sweep, foreground="#9baec6", wraplength=320, text=(
+            "Each point waits the settle time, then for two fresh OSA sweeps. Lines are measured within the "
+            "WDM tab's line window. A state passes when the expected line beats the other by the margin.")).grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        single = ttk.LabelFrame(controls, text="Single MZI", padding=10)
+        single.pack(fill="x", pady=(12, 0))
+        self.cal_switch_var = tk.StringVar(value=next(iter(self.network.switches)))
+        self.cal_watch_var = tk.StringVar(value="Auto")
+        self.cal_save_var = tk.BooleanVar(value=True)
+        ttk.Label(single, text="MZI").grid(row=0, column=0, sticky="w")
+        switch_box = ttk.Combobox(single, textvariable=self.cal_switch_var, values=tuple(self.network.switches),
+                                  state="readonly", width=8)
+        switch_box.grid(row=0, column=1, sticky="w", padx=(10, 0))
+        switch_box.bind("<<ComboboxSelected>>", lambda event: self.update_calibration_watch_choices())
+        ttk.Label(single, text="Watch").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.cal_watch_box = ttk.Combobox(single, textvariable=self.cal_watch_var, state="readonly", width=30)
+        self.cal_watch_box.grid(row=1, column=1, sticky="w", padx=(10, 0), pady=(6, 0))
+        self.cal_watch_box.bind("<<ComboboxSelected>>", lambda event: self.draw_calibration_diagram())
+        ttk.Checkbutton(single, text="Save the voltages found", variable=self.cal_save_var).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.cal_single_button = ttk.Button(single, text="Sweep selected MZI", command=self.start_single_calibration)
+        self.cal_single_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+        complete = ttk.LabelFrame(controls, text="Complete calibration", padding=10)
+        complete.pack(fill="x", pady=(12, 0))
+        ttk.Label(complete, wraplength=320, text=(
+            "1. Alignment: read all outputs at 0 V.  2. Sweep every MZI, grouped by watched output so the "
+            "JDSU moves as little as possible.  3. Check the calibrated all-cross and all-bar states.")).grid(
+            row=0, column=0, sticky="w")
+        self.cal_verify_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(complete, text="Verify all-cross and all-bar states", variable=self.cal_verify_var).grid(
+            row=1, column=0, sticky="w", pady=(6, 0))
+        self.cal_all_button = ttk.Button(complete, text="Calibrate all MZIs", style="Accent.TButton",
+                                         command=self.start_complete_calibration)
+        self.cal_all_button.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+
+        checks = ttk.LabelFrame(controls, text="State checks", padding=10)
+        checks.pack(fill="x", pady=(12, 0))
+        self.cal_alignment_button = ttk.Button(checks, text="Alignment check (all 0 V)",
+                                               command=self.start_alignment_check)
+        self.cal_alignment_button.pack(fill="x")
+        self.cal_routed_button = ttk.Button(checks, text="Check routed states", command=self.start_routed_check)
+        self.cal_routed_button.pack(fill="x", pady=(6, 0))
+        ttk.Label(checks, foreground="#9baec6", wraplength=320, text=(
+            "Routed states applies the Routing tab's switch states with their saved voltages and leaves them "
+            "applied.")).pack(anchor="w", pady=(6, 0))
+
+        self.cal_comment_var = tk.StringVar()
+        ttk.Label(controls, text="Comment").pack(anchor="w", pady=(12, 0))
+        ttk.Entry(controls, textvariable=self.cal_comment_var).pack(fill="x")
+        self.cal_stop_button = ttk.Button(controls, text="Stop", command=self.stop_mzi_calibration, state="disabled")
+        self.cal_stop_button.pack(fill="x", pady=(10, 0))
+        ttk.Label(controls, text="Uses the voltage board, OSA and JDSU from Hardware & OSA. For a rehearsal, use a "
+                                 "dry-run board with OSA Simulate.", foreground="#9baec6",
+                  wraplength=330).pack(anchor="w", pady=(10, 0))
+        self.cal_status_var = tk.StringVar(value="Assign a comb wavelength to every input, then start a check.")
+        ttk.Label(controls, textvariable=self.cal_status_var, wraplength=330).pack(anchor="w", pady=(8, 4))
+
+        # Live view: expected light in each input's colour, MZI status colours, OSA ring on the read output.
+        self.cal_canvas = tk.Canvas(results, bg=BG, highlightthickness=0, height=330)
+        self.cal_canvas.pack(fill="x")
+        self.cal_canvas.bind("<Configure>", lambda event: self.draw_calibration_diagram())
+        legend = ttk.Frame(results)
+        legend.pack(fill="x", pady=(2, 8))
+        for status in ("pending", "saved", "active", "calibrated", "partial", "inverted"):
+            color, text = CAL_STATUS[status]
+            ttk.Label(legend, text=f"■ {text}", foreground=color).pack(side="left", padx=(0, 12))
+        ttk.Label(legend, text="Solid: expected light · dashes: where it goes in the other state",
+                  foreground="#9baec6").pack(side="left")
+
+        views = ttk.Notebook(results)
+        views.pack(fill="both", expand=True)
+        table_page, matrix_page, sweep_page = ttk.Frame(views), ttk.Frame(views), ttk.Frame(views)
+        views.add(table_page, text="MZIs")
+        views.add(matrix_page, text="Output matrix")
+        views.add(sweep_page, text="Sweeps")
+        style = ttk.Style(self)
+        style.configure("Treeview", background=PANEL, fieldbackground=PANEL, foreground=TEXT, rowheight=24)
+        style.configure("Treeview.Heading", background="#263650", foreground=TEXT, font=("Segoe UI", 9, "bold"))
+        columns = (("mzi", "MZI", 60), ("status", "Status", 110), ("watch", "Watched output", 170),
+                   ("cross", "Cross [V]", 75), ("bar", "Bar [V]", 75), ("cross_margin", "Cross margin [dB]", 115),
+                   ("bar_margin", "Bar margin [dB]", 110), ("check", "State checks", 230))
+        self.cal_table = ttk.Treeview(table_page, columns=[name for name, _, _ in columns], show="headings",
+                                      height=12)
+        for name, heading, width in columns:
+            self.cal_table.heading(name, text=heading)
+            self.cal_table.column(name, width=width, anchor="center")
+        for status, (color, _) in CAL_STATUS.items():
+            self.cal_table.tag_configure(status, foreground=color)
+        self.cal_table.pack(fill="both", expand=True)
+        self.cal_table.bind("<<TreeviewSelect>>", self.select_calibration_row)
+
+        ttk.Label(matrix_page, foreground="#9baec6", wraplength=760, text=(
+            "Peak power [dBm] of each input's line at each output for the last readout. ● marks the line "
+            "expected at that output; the row colour is the strongest line.")).pack(anchor="w", pady=(6, 4))
+        self.cal_matrix_title = tk.StringVar(value="No readout yet")
+        ttk.Label(matrix_page, textvariable=self.cal_matrix_title, font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        matrix_columns = ["output"] + [f"in{port}" for port in INPUTS] + ["strongest"]
+        self.cal_matrix = ttk.Treeview(matrix_page, columns=matrix_columns, show="headings", height=6)
+        for name in matrix_columns:
+            heading = ("Output" if name == "output" else "Strongest" if name == "strongest"
+                       else f"In {name[2:]}")
+            self.cal_matrix.heading(name, text=heading)
+            self.cal_matrix.column(name, width=90, anchor="center")
+        for port in INPUTS:
+            self.cal_matrix.tag_configure(f"input{port}", foreground=WDM_COLORS[port - 1])
+        self.cal_matrix.pack(fill="both", expand=True)
+
+        self.cal_plots = ttk.Notebook(sweep_page)
+        self.cal_plots.pack(fill="both", expand=True)
+        self.cal_plot_items = {}
+        self.cal_plot_hint = ttk.Label(sweep_page, text="Sweep plots appear here, one tab per MZI.")
+        self.cal_plot_hint.place(relx=0.5, rely=0.5, anchor="center")
+
+        self.cal_rows = {}
+        self.cal_view = {"states": reference_states(self.network), "probe": None, "reading": None,
+                         "dominant": {}, "note": "All MZIs shown at 0 V (cross)."}
+        self.reset_calibration_rows()
+        self.update_calibration_watch_choices()
+        self.update_calibration_lasers()
+
+    def calibration_wavelengths(self):
+        """{0-based input: nm} from the WDM tab fields, as typed."""
+        return {row: wavelength for row, wavelength, _ in self.wdm_routes()}
+
+    def update_calibration_lasers(self):
+        wavelengths = self.calibration_wavelengths()
+        for row, label in enumerate(self.cal_laser_labels):
+            wavelength = wavelengths.get(row)
+            label.configure(text=f"In {row + 1} · " + ("no line" if wavelength is None else f"{wavelength:g} nm"),
+                            foreground="#71829a" if wavelength is None else WDM_COLORS[row])
+        self.update_calibration_watch_choices()
+
+    def update_calibration_watch_choices(self):
+        """Offer the two outputs whose arriving line the selected MZI decides."""
+        self.cal_watch_probes = switch_probes(self.network, reference_states(self.network), self.cal_switch_var.get())
+        wavelengths = self.calibration_wavelengths()
+        choices = ["Auto"]
+        for probe in self.cal_watch_probes:
+            dark = [source + 1 for source in (probe.cross_input, probe.straight_input) if source not in wavelengths]
+            choices.append(f"Out {probe.output + 1}: In {probe.cross_input + 1} if X, In {probe.straight_input + 1} if ="
+                           + (f" (no line on In {', '.join(map(str, dark))})" if dark else ""))
+        self.cal_watch_box.configure(values=choices)
+        if self.cal_watch_var.get() not in choices:
+            self.cal_watch_var.set("Auto")
+        self.draw_calibration_diagram()
+
+    def selected_watch_probe(self):
+        choice = self.cal_watch_box.current()
+        return None if choice <= 0 else self.cal_watch_probes[choice - 1]
+
+    def select_calibration_row(self, _event=None):
+        selection = self.cal_table.selection()
+        if selection and not self.mzi_calibration_running:
+            self.cal_switch_var.set(selection[0])
+            self.update_calibration_watch_choices()
+
+    def reset_calibration_rows(self):
+        """Show each MZI's saved voltages; clears this session's sweep and check results."""
+        for name in self.network.switches:
+            calibration = self.controller.settings["calibration"][name]
+            saved = calibration["straight"] is not None and calibration["cross"] is not None
+            self.cal_rows[name] = {"status": "saved" if saved else "pending", "watch": "", "cross": calibration["cross"],
+                                   "bar": calibration["straight"], "cross_margin": None, "bar_margin": None,
+                                   "checks": []}
+            self.show_calibration_row(name)
+
+    def show_calibration_row(self, name):
+        row = self.cal_rows[name]
+        number = lambda value, digits=2: "—" if value is None else f"{value:.{digits}f}"
+        checks = " · ".join(f"{label} {verdict}" + ("" if margin is None else f" {margin:.1f}")
+                            for label, verdict, margin in row["checks"])
+        values = (name, CAL_STATUS[row["status"]][1], row["watch"], number(row["cross"]), number(row["bar"]),
+                  number(row["cross_margin"], 1), number(row["bar_margin"], 1), checks)
+        if self.cal_table.exists(name):
+            self.cal_table.item(name, values=values, tags=(row["status"],))
+        else:
+            self.cal_table.insert("", "end", iid=name, values=values, tags=(row["status"],))
+
+    def calibration_settings(self):
+        """Voltages, settle time [s] and pass margin [dB] from the Sweep fields."""
+        fields = self.cal_fields
+        voltages = scan_voltages(*(float(fields[key].get()) for key in
+                                   ("Lower limit [V]", "Upper limit [V]", "Step [V]")))
+        settle_ms = float(fields["Settle [ms]"].get())
+        if not 0 <= settle_ms <= 10000:
+            raise ValueError("Settling time must be between 0 and 10000 ms")
+        pass_db = float(fields["Pass margin [dB]"].get())
+        if not 0 < pass_db <= 60:
+            raise ValueError("The pass margin must be between 0 and 60 dB")
+        return voltages, settle_ms / 1000, pass_db
+
+    def calibration_hardware(self):
+        """Validate the instruments and wavelength plan; return (read_spectrum, wavelengths, half window, simulated)."""
+        if self.mzi_calibration_running:
+            raise RuntimeError("A calibration is already running")
+        if self.crosstalk_running or self.wdm_running or self.impulse_running:
+            raise RuntimeError("Wait for the current scan or impulse test to finish")
+        if self.osa_button.instate(["disabled"]):
+            raise RuntimeError("Wait for the current OSA read to finish")
+        host, port, simulate = self.osa_connection()
+        if not self.controller.connected:
+            raise RuntimeError("Connect the voltage board first (Hardware & OSA)")
+        if self.controller.settings["dry_run"] != simulate:
+            raise RuntimeError("Use the physical voltage board with the real OSA, or a dry-run board with "
+                               "OSA Simulate for a rehearsal")
+        switch = self.osa_output_switch
+        if not switch.connected:
+            raise RuntimeError("Connect the OSA output switch first (dry run is available in Selector setup)")
+        for output in OUTPUTS:
+            switch.channel_for(output)
+        for name in self.network.switches:
+            if self.controller.settings["mapping"].get(name) is None:
+                raise ValueError(f"Assign a voltage-board pin to {name} first")
+        try:
+            self.save_wdm_plan(quiet=True)
+        except OSError as error:
+            raise ValueError(f"Could not save the wavelength plan: {error}") from error
+        wavelengths = wavelengths_from_assignment(self.wdm_plan.assignment)
+        if not wavelengths:
+            raise ValueError("Assign a comb wavelength to each laser input in the WDM comb tab")
+        half_window = self.wdm_plan.settings["half_window_nm"]
+        if simulate:
+            chip = SimulatedChip(self.network, lambda name: self.controller.applied_voltages.get(name, 0.0),
+                                 wavelengths)
+            return chip.spectrum, wavelengths, half_window, True
+        return (lambda output: osa.get_spectrum(host, port, fresh_sweeps=POST_SWITCH_SWEEPS),
+                wavelengths, half_window, False)
+
+    def start_alignment_check(self):
+        try:
+            read, wavelengths, half_window, simulate = self.calibration_hardware()
+            _, settle_s, pass_db = self.calibration_settings()
+        except (OSError, RuntimeError, ValueError) as error:
+            messagebox.showerror("Alignment check unavailable", str(error), parent=self)
+            return
+
+        def job(hooks):
+            check = check_alignment(self.controller, self.osa_output_switch, read, self.network, wavelengths,
+                                    half_window, settle_s, hooks["on_output"], hooks["stop_event"])
+            hooks["on_check"](check)
+            hooks["checks"].append(check)
+
+        self.run_mzi_job("alignment", "Alignment check: reading all outputs with every MZI at 0 V...", job,
+                         wavelengths, half_window, simulate, pass_db, [], settle_s)
+
+    def start_routed_check(self):
+        states = dict(self.network.states)
+        try:
+            read, wavelengths, half_window, simulate = self.calibration_hardware()
+            _, settle_s, pass_db = self.calibration_settings()
+            calibration = self.controller.settings["calibration"]
+            missing = [name for name in self.network.switches
+                       if calibration[name]["cross" if states[name] else "straight"] is None]
+            if missing:
+                raise ValueError(f"Calibrate {', '.join(missing)} first; their routed state has no saved voltage")
+        except (OSError, RuntimeError, ValueError) as error:
+            messagebox.showerror("State check unavailable", str(error), parent=self)
+            return
+
+        def job(hooks):
+            check = check_calibrated_states(self.controller, self.osa_output_switch, read, self.network, states,
+                                            wavelengths, half_window, "Routed states", settle_s,
+                                            hooks["on_output"], hooks["stop_event"])
+            hooks["on_check"](check)
+            hooks["checks"].append(check)
+
+        self.cal_view["states"] = states
+        self.run_mzi_job("routed_check", "Checking the routed states on every output...", job,
+                         wavelengths, half_window, simulate, pass_db, [], settle_s, leaves_zero=False)
+
+    def start_single_calibration(self):
+        name = self.cal_switch_var.get()
+        probe = self.selected_watch_probe()
+        save = self.cal_save_var.get()
+        try:
+            read, wavelengths, half_window, simulate = self.calibration_hardware()
+            voltages, settle_s, pass_db = self.calibration_settings()
+            self.confirm_voltage_sweep(voltages, names=[name])
+            self.calibration_plot_support()
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            messagebox.showerror("MZI sweep unavailable", str(error), parent=self)
+            return
+
+        def job(hooks):
+            result = calibrate_switch(self.controller, self.osa_output_switch, read, self.network, name, voltages,
+                                      settle_s, wavelengths, half_window, None if probe is None else probe.output,
+                                      save, hooks["on_probe"], hooks["on_point"], hooks["stop_event"])
+            hooks["calibrations"][name] = result
+            hooks["on_switch"](result, save)
+
+        self.run_mzi_job(f"single_{name.replace('.', '_')}", f"Sweeping {name} with every other MZI at 0 V...",
+                         job, wavelengths, half_window, simulate, pass_db, voltages, settle_s)
+
+    def start_complete_calibration(self):
+        verify = self.cal_verify_var.get()
+        try:
+            read, wavelengths, half_window, simulate = self.calibration_hardware()
+            voltages, settle_s, pass_db = self.calibration_settings()
+            self.confirm_voltage_sweep(voltages, names=list(self.network.switches))
+            self.calibration_plot_support()
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            messagebox.showerror("Calibration unavailable", str(error), parent=self)
+            return
+
+        def confirm_alignment(check):
+            errors = check.routing_errors()
+            if not errors:
+                return True
+            lines = "\n".join(f"In {source + 1}: expected at Out {expected + 1}, strongest at "
+                              f"{'—' if measured is None else f'Out {measured + 1}'}"
+                              for source, expected, measured in errors)
+            return self._ask_on_main_thread(
+                "Alignment errors",
+                f"With every MZI at 0 V, some lines do not leave at their all-cross output:\n\n{lines}\n\n"
+                "Check the input fibers, lasers and JDSU mapping. Continue the calibration anyway?",
+                icon=messagebox.WARNING)
+
+        def job(hooks):
+            result = CompleteCalibration()
+            try:
+                calibrate_all(self.controller, self.osa_output_switch, read, self.network, voltages, settle_s,
+                              wavelengths, half_window, verify, confirm_alignment, hooks["on_check"],
+                              hooks["on_output"], hooks["on_probe"], hooks["on_point"],
+                              lambda calibration: hooks["on_switch"](calibration, True),
+                              hooks["stop_event"], result)
+            finally:
+                hooks["calibrations"].update(result.switches)
+                hooks["checks"].extend(check for check in (result.alignment, *result.checks) if check is not None)
+
+        self.run_mzi_job("complete", "Complete calibration: alignment check at 0 V...", job,
+                         wavelengths, half_window, simulate, pass_db, voltages, settle_s)
+
+    def calibration_plot_support(self):
+        """Raise ImportError early when matplotlib is missing, like the other scans."""
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg  # noqa: F401
+        from matplotlib.figure import Figure  # noqa: F401
+
+    def stop_mzi_calibration(self):
+        if self.calibration_stop_event is not None:
+            self.calibration_stop_event.set()
+            self.cal_status_var.set("Stopping after the current measurement; every MZI will return to 0 V...")
+
+    def set_calibration_controls(self, running):
+        state = "disabled" if running else "normal"
+        for button in (self.cal_single_button, self.cal_all_button, self.cal_alignment_button,
+                       self.cal_routed_button):
+            button.configure(state=state)
+        self.cal_stop_button.configure(state="normal" if running else "disabled")
+        for tab in (self.route_tab, self.hardware_tab, self.crosstalk_tab, self.wdm_tab, self.impulse_tab):
+            self.set_tab_state(tab, state)
+        self.set_osa_reading(running)
+
+    def run_mzi_job(self, kind, message, job, wavelengths, half_window, simulate, pass_db, voltages, settle_s,
+                    leaves_zero=True):
+        """Run a calibration job on a worker thread, then save its results.
+
+        ``job(hooks)`` fills ``hooks["calibrations"]`` and ``hooks["checks"]``
+        and reports progress through the hook callbacks.
+        """
+        context = {
+            "kind": kind,
+            "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "comment": self.cal_comment_var.get().strip(),
+            "laser_wavelengths_nm": {str(row + 1): wavelength for row, wavelength in wavelengths.items()},
+            "line_half_window_nm": half_window,
+            "voltages_v": list(voltages),
+            "settle_s": settle_s,
+            "reference": "every MZI not being swept at 0 V (cross)",
+            "simulated": simulate,
+            "switch_pins": dict(self.controller.settings["mapping"]),
+            "calibration_before": {name: dict(value) for name, value in self.controller.settings["calibration"].items()},
+            "jdsu_channel_map": dict(self.osa_output_switch.settings["channel_map"]),
+        }
+        self.mzi_calibration_running = True
+        self.calibration_stop_event = stop_event = threading.Event()
+        self.cal_pass_db = pass_db
+        self.cal_job_verdicts = {}
+        self.set_calibration_controls(True)
+        self.cal_status_var.set(message)
+        if kind == "complete":
+            for row in self.cal_rows.values():
+                row["checks"] = []
+        hooks = {
+            "stop_event": stop_event, "calibrations": {}, "checks": [],
+            "on_output": lambda readout, index, total: self.after(
+                0, lambda: self.calibration_output_read(readout, index, total)),
+            "on_check": lambda check: self.after(0, lambda: self.calibration_check_done(check)),
+            "on_probe": lambda probe: self.after(0, lambda: self.calibration_probe_started(probe)),
+            "on_point": lambda probe, index, total, point: self.after(
+                0, lambda: self.calibration_point(probe, index, total, point)),
+            "on_switch": lambda calibration, saved: self.after(
+                0, lambda: self.calibration_switch_done(calibration, saved)),
+        }
+
+        def worker():
+            error, stopped, folder, save_error = None, False, None, None
+            try:
+                job(hooks)
+            except CalibrationStopped:
+                stopped = True
+            except Exception as error_value:
+                error = str(error_value)
+            if hooks["calibrations"] or hooks["checks"]:
+                status = "stopped" if stopped else "failed" if error else "complete"
+                try:
+                    folder = create_calibration_folder(app_dir(), kind)
+                    save_calibration_results(folder, {**context, "status": status, "error": error},
+                                             hooks["calibrations"], hooks["checks"], pass_db)
+                except Exception as error_value:
+                    save_error = str(error_value)
+            self.after(0, lambda: self.finish_mzi_job(error, stopped, folder, save_error, leaves_zero))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_mzi_job(self, error, stopped, folder, save_error, leaves_zero):
+        self.mzi_calibration_running = False
+        self.calibration_stop_event = None
+        self.set_calibration_controls(False)
+        probe = self.cal_view["probe"]
+        if probe is not None and self.cal_rows[probe.name]["status"] == "active":
+            row = self.cal_rows[probe.name]
+            row["status"] = "failed" if error else "saved" if None not in (row["cross"], row["bar"]) else "pending"
+            self.show_calibration_row(probe.name)
+        self.cal_view.update(probe=None, reading=None)
+        if leaves_zero:
+            # The routine has sent 0 V to every MZI, which is cross.
+            self.network.states = reference_states(self.network)
+            self.zero_volt_switches = set(self.network.switches)
+            for name in self.network.switches:
+                self.voltage_vars[name].set("0.00")
+            self.cal_view["states"] = reference_states(self.network)
+        else:
+            self.zero_volt_switches.clear()
+            self.show_calibrated_voltages()
+        routed = self.osa_output_switch.routed_output
+        if routed is not None:
+            self.osa_output_var.set(str(routed))
+        self.refresh(keep_selection=True)
+        self.draw_calibration_diagram()
+        saved = "" if folder is None else f" Results: {folder}"
+        if save_error:
+            saved = f" Saving the results failed: {save_error}"
+        if error:
+            self.cal_status_var.set(f"Calibration failed: {error}.{saved}")
+            messagebox.showerror("Calibration failed", error, parent=self)
+        elif stopped:
+            self.cal_status_var.set(f"Calibration stopped; every MZI is back at 0 V.{saved}")
+        else:
+            self.cal_status_var.set(f"{self.cal_view['note'].rstrip('.')}.{saved}")
+        if save_error:
+            messagebox.showerror("Calibration results not saved", save_error, parent=self)
+
+    def calibration_output_read(self, readout, index, total):
+        self.cal_view["reading"] = readout.output
+        self.cal_view["dominant"][readout.output] = strongest_input(readout.lines)
+        self.cal_status_var.set(f"Read output {readout.output + 1} ({index}/{total}).")
+        self.draw_calibration_diagram()
+
+    def calibration_check_done(self, check):
+        pass_db = self.cal_pass_db
+        short = CHECK_SHORT.get(check.label, check.label)
+        for name, item in check.switches.items():
+            verdict = item.verdict(pass_db)
+            row = self.cal_rows[name]
+            row["checks"] = [entry for entry in row["checks"] if entry[0] != short] + [(short, verdict, item.margin_db)]
+            # Several checks in one run combine to their worst verdict.
+            verdicts = self.cal_job_verdicts.setdefault(name, [])
+            verdicts.append(verdict)
+            row["status"] = min(verdicts, key=VERDICT_ORDER.index)
+            self.show_calibration_row(name)
+        self.cal_view.update(states=dict(check.states), probe=None, reading=None,
+                             dominant={output: strongest_input(lines) for output, lines in check.matrix.items()})
+        passed = sum(item.verdict(pass_db) == "ok" for item in check.switches.values())
+        errors = check.routing_errors()
+        note = f"{check.label}: {passed}/{len(check.switches)} MZIs pass the {pass_db:g} dB margin"
+        note += (". Misrouted lines: " + ", ".join(
+            f"In {source + 1}→{'—' if measured is None else f'Out {measured + 1}'} (expected Out {expected + 1})"
+            for source, expected, measured in errors) if errors else "; every line leaves where expected.")
+        self.cal_view["note"] = note
+        self.cal_status_var.set(note)
+        self.show_calibration_matrix(check)
+        self.draw_calibration_diagram()
+
+    def show_calibration_matrix(self, check):
+        self.cal_matrix.delete(*self.cal_matrix.get_children())
+        self.cal_matrix_title.set(check.label)
+        for output, lines in sorted(check.matrix.items()):
+            expected = check.expected.index(output)
+            strongest = strongest_input(lines)
+            cells = []
+            for source in range(self.network.size):
+                power = lines.get(source)
+                cell = "—" if power is None else f"{power:.1f}"
+                cells.append(f"● {cell}" if source == expected else cell)
+            self.cal_matrix.insert("", "end", values=[f"Out {output + 1}", *cells,
+                                                      "—" if strongest is None else f"In {strongest + 1}"],
+                                   tags=() if strongest is None else (f"input{strongest + 1}",))
+
+    def calibration_probe_started(self, probe):
+        row = self.cal_rows[probe.name]
+        row["status"] = "active"
+        row["watch"] = f"Out {probe.output + 1} (In {probe.cross_input + 1} X / In {probe.straight_input + 1} =)"
+        self.cal_job_verdicts.pop(probe.name, None)
+        self.show_calibration_row(probe.name)
+        self.cal_view.update(probe=probe, reading=probe.output, states=reference_states(self.network))
+        self.cal_view["note"] = (f"{probe.name}: watching Out {probe.output + 1}; In {probe.cross_input + 1} "
+                                 f"arrives there when cross, In {probe.straight_input + 1} when bar.")
+        self.cal_status_var.set(self.cal_view["note"])
+        self.add_calibration_plot(probe)
+        self.draw_calibration_diagram()
+
+    def calibration_point(self, probe, index, total, point):
+        if point.contrast_db is not None:
+            # Draw the light where the measurement says it currently goes.
+            self.cal_view["states"][probe.name] = point.contrast_db >= 0
+        number = lambda value: "—" if value is None else f"{value:.1f}"
+        self.cal_status_var.set(
+            f"{probe.name}: {index}/{total} at {point.voltage:.2f} V · In {probe.cross_input + 1} "
+            f"{number(point.cross_dbm)} dBm, In {probe.straight_input + 1} {number(point.straight_dbm)} dBm")
+        plot = self.cal_plot_items.get(probe.name)
+        if plot is not None:
+            plot["points"].append(point)
+            voltages = [item.voltage for item in plot["points"]]
+            for key, attribute in (("cross_line", "cross_dbm"), ("straight_line", "straight_dbm"),
+                                   ("contrast_line", "contrast_db")):
+                values = [getattr(item, attribute) for item in plot["points"]]
+                plot[key].set_data(voltages, [float("nan") if value is None else value for value in values])
+            for axis in plot["axes"]:
+                axis.relim()
+                axis.autoscale_view()
+            plot["canvas"].draw_idle()
+        self.draw_calibration_diagram()
+
+    def calibration_switch_done(self, calibration, saved):
+        name = calibration.name
+        row = self.cal_rows[name]
+        row.update(status="calibrated" if saved else "saved" if row["cross"] is not None else "pending",
+                   cross_margin=calibration.cross_margin_db, bar_margin=calibration.straight_margin_db)
+        if saved:
+            row.update(cross=calibration.cross.voltage, bar=calibration.straight.voltage)
+        self.show_calibration_row(name)
+        self.cal_view["states"][name] = True
+        self.cal_view["note"] = (f"{name}: cross {calibration.cross.voltage:.2f} V, bar "
+                                 f"{calibration.straight.voltage:.2f} V" + ("" if saved else " (not saved)"))
+        plot = self.cal_plot_items.get(name)
+        if plot is not None:
+            for axis in plot["axes"]:
+                axis.axvline(calibration.cross.voltage, color=ACCENT, linestyle="--", linewidth=1.2,
+                             label=f"Cross {calibration.cross.voltage:.2f} V")
+                axis.axvline(calibration.straight.voltage, color="#e0a100", linestyle="--", linewidth=1.2,
+                             label=f"Bar {calibration.straight.voltage:.2f} V")
+            plot["axes"][1].legend(loc="best", fontsize=8)
+            plot["canvas"].draw_idle()
+        self.draw_calibration_diagram()
+
+    def add_calibration_plot(self, probe):
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+        from matplotlib.figure import Figure
+
+        self.cal_plot_hint.place_forget()
+        old = self.cal_plot_items.pop(probe.name, None)
+        if old is not None:
+            old["tab"].destroy()
+        tab = ttk.Frame(self.cal_plots)
+        self.cal_plots.add(tab, text=probe.name)
+        self.cal_plots.select(tab)
+        figure = Figure(figsize=(7, 4.6))
+        lines_axis = figure.add_subplot(211)
+        contrast_axis = figure.add_subplot(212, sharex=lines_axis)
+        cross_line, = lines_axis.plot([], [], marker=".", linewidth=1.4, color=WDM_COLORS[probe.cross_input],
+                                      label=f"In {probe.cross_input + 1} (arrives if cross)")
+        straight_line, = lines_axis.plot([], [], marker=".", linewidth=1.4, color=WDM_COLORS[probe.straight_input],
+                                         label=f"In {probe.straight_input + 1} (arrives if bar)")
+        lines_axis.set(ylabel="Peak [dBm]", title=f"{probe.name}: lines at output {probe.output + 1} "
+                                                    f"(fiber {fiber_number(probe.output + 1)})")
+        lines_axis.legend(loc="best", fontsize=8)
+        lines_axis.grid(True)
+        contrast_line, = contrast_axis.plot([], [], marker=".", linewidth=1.4, color="#315b78")
+        contrast_axis.axhline(0, color="#9baec6", linewidth=0.8)
+        contrast_axis.set(xlabel="Voltage [V]", ylabel="Cross − bar line [dB]")
+        contrast_axis.grid(True)
+        figure.tight_layout()
+        canvas = FigureCanvasTkAgg(figure, master=tab)
+        toolbar = NavigationToolbar2Tk(canvas, tab)
+        toolbar.update()
+        canvas.get_tk_widget().configure(**PLOT_MIN_SIZE)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.cal_plot_items[probe.name] = {"tab": tab, "canvas": canvas, "axes": (lines_axis, contrast_axis),
+                                           "cross_line": cross_line, "straight_line": straight_line,
+                                           "contrast_line": contrast_line, "points": []}
+
+    def draw_calibration_diagram(self):
+        """Draw the network with each laser's expected path in its input colour and each MZI's status."""
+        c = getattr(self, "cal_canvas", None)
+        if c is None or not hasattr(self, "cal_rows"):
+            return
+        c.delete("all")
+        width, height = c.winfo_width(), c.winfo_height()
+        if width < 420 or height < 220:
+            return
+        view = self.cal_view
+        states = view["states"]
+        probe = view["probe"]
+        if probe is None and not self.mzi_calibration_running:
+            # Preview the selected MZI and the output it would be watched on.
+            probe = self.selected_watch_probe() if hasattr(self, "cal_watch_probes") else None
+        font = ("Segoe UI", 8)
+        left_x, right_x = 96, width - 104
+        first_stage, last_stage = left_x + 60, right_x - 70
+        xs = [first_stage + i * (last_stage - first_stage) / 4 for i in range(5)]
+        ys = [42 + i * (height - 84) / 5 for i in range(6)]
+        half = 16
+        for stage, pairs in enumerate(self.network.pairs):
+            x = xs[stage]
+            c.create_text(x, 12, text=f"STAGE {stage + 1}", fill="#9baec6", font=("Segoe UI", 8, "bold"))
+            for row, y in enumerate(ys):
+                if stage == 0:
+                    c.create_line(left_x + 14, y, x - half, y, fill=WIRE, width=2)
+                next_x = xs[stage + 1] - half if stage < 4 else right_x - 14
+                c.create_line(x + half, y, next_x, ys[self.network.links[stage][row]], fill=WIRE, width=2)
+                if (stage, row) not in self.network.at:
+                    c.create_line(x - half, y, x + half, y, fill=WIRE, width=2)
+
+        wavelengths = self.calibration_wavelengths()
+        routes = {row: self.network.trace(row, states) for row in wavelengths}
+        if probe is not None:
+            # Where the probed MZI's two lines would go in its other state.
+            other = {**states, probe.name: not states[probe.name]}
+            for row, route in routes.items():
+                if any(name == probe.name for name, _ in route.states):
+                    c.create_line(*self.route_points(self.network.trace(row, other), left_x + 14, right_x - 14,
+                                                     xs, ys, half),
+                                  fill=WDM_COLORS[row], width=2, dash=(6, 4), joinstyle="round", capstyle="round")
+        for row, route in routes.items():
+            c.create_line(*self.route_points(route, left_x + 14, right_x - 14, xs, ys, half),
+                          fill=WDM_COLORS[row], width=3, joinstyle="round", capstyle="round")
+
+        for stage, pairs in enumerate(self.network.pairs):
+            x = xs[stage]
+            for index, (a, b) in enumerate(pairs):
+                name = f"S{stage + 1}.{index + 1}"
+                status = self.cal_rows[name]["status"]
+                color = CAL_STATUS[status][0]
+                active = probe is not None and probe.name == name
+                c.create_rectangle(x - half, ys[a] - 7, x + half, ys[b] + 7,
+                                   fill="#2b2a1c" if active else PANEL,
+                                   outline=ZERO_VOLT_COLOR if active else color,
+                                   width=3 if active or status not in ("pending", "saved") else 2)
+                for start, end in ((a, b), (b, a)) if states[name] else ((a, a), (b, b)):
+                    c.create_line(x - half, ys[start], x + half, ys[end], fill="#a4bad4", width=1.5)
+                c.create_text(x, ys[a] - 16, text=name, fill=ZERO_VOLT_COLOR if active else color,
+                              font=("Segoe UI", 8, "bold"))
+                margins = [margin for _, _, margin in self.cal_rows[name]["checks"] if margin is not None]
+                if margins:
+                    c.create_text(x, ys[b] + 16, text=f"{min(margins):.0f} dB", fill=color, font=font)
+
+        watched = None if probe is None else probe.output
+        for row, y in enumerate(ys):
+            wavelength = wavelengths.get(row)
+            color = WDM_COLORS[row] if wavelength is not None else WIRE
+            c.create_oval(left_x - 13, y - 13, left_x + 13, y + 13, fill=PANEL, outline=color,
+                          width=3 if wavelength is not None else 1.5)
+            c.create_text(left_x, y, text=str(row + 1), fill=TEXT, font=("Segoe UI", 9, "bold"))
+            c.create_text(left_x - 20, y, anchor="e", font=font, fill=color if wavelength is not None else "#71829a",
+                          text=f"In {row + 1}\n" + ("no laser" if wavelength is None else f"{wavelength:g} nm"))
+            dominant = view["dominant"].get(row)
+            c.create_oval(right_x - 13, y - 13, right_x + 13, y + 13, outline=WIRE, width=1.5,
+                          fill=PANEL if dominant is None else WDM_COLORS[dominant])
+            c.create_text(right_x, y, text=str(row + 1), fill=TEXT if dominant is None else BG,
+                          font=("Segoe UI", 9, "bold"))
+            label = f"Out {row + 1}" + ("" if dominant is None else f"\nmeas. In {dominant + 1}")
+            c.create_text(right_x + 20, y, anchor="w", text=label, fill="#9baec6", font=font)
+            for radius, ring, color in ((18, view["reading"], OSA_COLOR), (23, watched, ZERO_VOLT_COLOR)):
+                if ring == row:
+                    c.create_oval(right_x - radius, y - radius, right_x + radius, y + radius, outline=color, width=2.5)
+        c.create_text(width / 2, height - 10, text=view["note"], fill="#9baec6", font=font)
+
     def build_wdm_tab(self):
         """Wavelength plan for the WDM comb at the inputs and the per-output OSA scan."""
         controls_column = ttk.Frame(self.wdm_tab, padding=(18, 18, 8, 18), width=390)
@@ -2168,6 +2775,8 @@ class BenesApp(tk.Tk):
                 lines.append(f"{wavelength} nm: In {port} → Out {output}")
         self.wdm_route_label.configure(text="WDM COMB    " + "     ".join(lines) if lines else "")
         self.draw_wdm_diagram()
+        if hasattr(self, "cal_canvas"):
+            self.update_calibration_lasers()
 
     def wdm_routes(self):
         """(input row, wavelength nm, colour) for every input with an assigned comb line."""
@@ -2294,6 +2903,8 @@ class BenesApp(tk.Tk):
             return
         switch = self.osa_output_switch
         try:
+            if self.mzi_calibration_running:
+                raise RuntimeError("Wait for the MZI calibration to finish")
             try:
                 self.save_wdm_plan(quiet=True)
             except OSError as error:
@@ -2667,6 +3278,10 @@ class BenesApp(tk.Tk):
         if self.wdm_running:
             messagebox.showinfo("WDM scan in progress", "Stop the WDM scan and wait for it to finish first.", parent=self)
             return
+        if self.mzi_calibration_running:
+            messagebox.showinfo("Calibration in progress",
+                                "Stop the MZI calibration and wait for every MZI to return to 0 V first.", parent=self)
+            return
         self.controller.disconnect()
         self.power_meter.disconnect()
         self.osa_output_switch.disconnect()
@@ -2751,7 +3366,7 @@ class BenesApp(tk.Tk):
         if self.impulse_running:
             return
         try:
-            if self.crosstalk_running:
+            if self.crosstalk_running or self.mzi_calibration_running:
                 raise RuntimeError("Wait for the current calibration or scan to finish")
             if self.read_power_button.instate(["disabled"]):
                 raise RuntimeError("Wait for the current Arduino reading to finish")
@@ -2845,8 +3460,8 @@ class BenesApp(tk.Tk):
         self.impulse_export_button.configure(state="disabled")
         self.impulse_average_entry.configure(state="disabled")
         self.read_power_button.configure(state="disabled")
-        for tab in (self.route_tab, self.hardware_tab, self.crosstalk_tab):
-            self.notebook.tab(tab, state="disabled")
+        for tab in (self.route_tab, self.hardware_tab, self.calibration_tab, self.crosstalk_tab):
+            self.set_tab_state(tab, "disabled")
         self.impulse_status.set(f"Recording {mode} pulse on {switch} and board pin 8...")
 
         def progress(trace):
@@ -2917,8 +3532,8 @@ class BenesApp(tk.Tk):
         self.impulse_stop_button.configure(state="disabled")
         self.impulse_average_entry.configure(state="normal")
         self.read_power_button.configure(state="normal")
-        for tab in (self.route_tab, self.hardware_tab, self.crosstalk_tab):
-            self.notebook.tab(tab, state="normal")
+        for tab in (self.route_tab, self.hardware_tab, self.calibration_tab, self.crosstalk_tab):
+            self.set_tab_state(tab, "normal")
         self.voltage_vars[switch].set(f"{low:.2f}")
         if trace is not None:
             self.impulse_trace = trace
@@ -2960,7 +3575,7 @@ class BenesApp(tk.Tk):
     def refresh(self, keep_selection=False):
         if not keep_selection:
             self.selected_route = 0
-        self.routes = [] if self.destination is None else self.network.routes(self.source, self.destination)
+        self.routes = self.network.routes(self.source, self.destination)
         self.route_list.delete(0, "end")
         for index, route in enumerate(self.routes):
             states = "  ".join(f"{name}={'X' if crossed else '='}" for name, crossed in route.states)
@@ -2968,12 +3583,12 @@ class BenesApp(tk.Tk):
         if self.routes:
             self.route_list.selection_set(self.selected_route)
             self.route_list.see(self.selected_route)
-        self.route_label.configure(text=f"{len(self.routes)} possible paths · = straight, X cross, 0V unbiased (routes as cross; click a switch to cycle) · switches omitted from a path are unconstrained" if self.routes else "Current route · select a destination to list every possible path and its required switch states")
+        self.route_label.configure(text=f"{len(self.routes)} possible paths · = straight, X cross, 0V unbiased (routes as cross; click a switch to cycle) · switches omitted from a path are unconstrained")
         mapping = self.network.mapping()
         self.mapping_label.configure(text="CURRENT CONNECTIONS    " + "     ".join(f"{i + 1} → {out + 1}" for i, out in enumerate(mapping)))
         self.update_wdm_routing()
         current = mapping[self.source] + 1
-        self.status.configure(text=f"Input {self.source + 1} currently reaches output {current}" + (f"   •   Exploring output {self.destination + 1}" if self.destination is not None else ""))
+        self.status.configure(text=f"Input {self.source + 1} currently reaches output {current}   •   Exploring output {self.destination + 1}")
         self.update_hardware_status()
         self.draw()
 
@@ -2987,6 +3602,8 @@ class BenesApp(tk.Tk):
         # Tk initially reports a 1x1 canvas before its first layout pass.
         if width < 420 or height < 220:
             return
+        display_states = self.permutation_preview_states or self.network.states
+        previewing_permutation = self.permutation_preview_states is not None
         scale = min(1.0, width / 1180, height / 355)
         font_small = ("Segoe UI", max(7, round(8 * scale)))
         font_normal = ("Segoe UI", max(8, round(9 * scale)))
@@ -3024,8 +3641,8 @@ class BenesApp(tk.Tk):
                     c.create_text(x, y + round(13 * scale), text="bypass", fill="#8393a9", font=font_small)
             for index, (a, b) in enumerate(pairs):
                 name = f"S{stage + 1}.{index + 1}"
-                crossed = self.network.states[name]
-                zero = name in self.zero_volt_switches
+                crossed = display_states[name]
+                zero = name in self.zero_volt_switches and not previewing_permutation
                 calibration = self.controller.settings["calibration"][name]
                 calibrated = calibration["straight"] is not None and calibration["cross"] is not None
                 tag = f"switch:{name}"
@@ -3042,6 +3659,23 @@ class BenesApp(tk.Tk):
                               text=f"{name}   PIN {pin if pin is not None else '-'}",
                               fill=ZERO_VOLT_COLOR if zero else ACCENT if calibrated else TEXT,
                               font=font_normal, tags=tag)
+                button_size = max(10, round(11 * scale))
+                button_gap = max(2, round(3 * scale))
+                button_x = x + half + max(4, round(5 * scale))
+                button_y = (self.ys[a] + self.ys[b]) / 2
+                for button_index, (label, state, color) in enumerate(
+                        (("X", "cross", ACCENT), ("=", "bar", "#ffbe69"), ("0", "zero", ZERO_VOLT_COLOR))):
+                    left = button_x + button_index * (button_size + button_gap)
+                    button_tag = f"set:{name}:{state}"
+                    c.create_rectangle(left, button_y - button_size / 2,
+                                       left + button_size, button_y + button_size / 2,
+                                       fill="#263650", outline=color, width=1.25, tags=button_tag)
+                    c.create_text(left + button_size / 2, button_y, text=label, fill=color,
+                                  font=("Segoe UI", max(7, round(8 * scale)), "bold"), tags=button_tag)
+                    c.tag_bind(button_tag, "<Button-1>",
+                               lambda event, n=name, s=state: self.set_switch_state(n, s))
+                    c.tag_bind(button_tag, "<Enter>", lambda event: c.configure(cursor="hand2"))
+                    c.tag_bind(button_tag, "<Leave>", lambda event: c.configure(cursor=""))
                 if show_voltage_entry:
                     entry = ttk.Entry(c, textvariable=self.voltage_vars[name], width=4, justify="center")
                     entry.bind("<Return>", lambda event, n=name: self.apply_voltage(n))
@@ -3051,22 +3685,30 @@ class BenesApp(tk.Tk):
                 c.tag_bind(tag, "<Enter>", lambda event: c.configure(cursor="hand2"))
                 c.tag_bind(tag, "<Leave>", lambda event: c.configure(cursor=""))
 
-        current = self.network.trace(self.source)
+        current = self.network.trace(self.source, display_states)
         wdm = self.wdm_routes()
         wdm_ends = {}
         for row, wavelength, color in wdm:
-            wdm_ends[row, "in"] = wdm_ends[self.network.trace(row).rows[-1], "out"] = (wavelength, color)
-        for row, _, color in wdm:
-            for points in self.crosstalk_points(self.network.trace(row), self.right_x - 18,
-                                                self.xs, self.ys, self.switch_half):
-                c.create_line(*points, fill=color, width=1.5, dash=(3, 4),
-                              joinstyle="round", capstyle="round", state="disabled")
-        if not self.routes and (self.source, "in") not in wdm_ends:
+            wdm_ends[row, "in"] = wdm_ends[self.network.trace(row, display_states).rows[-1], "out"] = (wavelength, color)
+        if not previewing_permutation:
+            for row, _, color in wdm:
+                for points in self.crosstalk_points(self.network.trace(row), self.right_x - 18,
+                                                    self.xs, self.ys, self.switch_half):
+                    c.create_line(*points, fill=color, width=1.5, dash=(3, 4),
+                                  joinstyle="round", capstyle="round", state="disabled")
+        if previewing_permutation:
+            for row in range(self.network.size):
+                self.draw_route(self.network.trace(row, display_states), WDM_COLORS[row], 3)
+            c.create_text(width / 2, height - 12,
+                          text=(f"Equivalent permutation routing {self.selected_permutation_route + 1} / "
+                                f"{len(self.permutation_route_states)} · preview only"),
+                          fill=ACCENT, font=font_normal)
+        elif not self.routes and (self.source, "in") not in wdm_ends:
             for points in self.crosstalk_points(current, self.right_x - 18,
                                                 self.xs, self.ys, self.switch_half):
                 c.create_line(*points, fill=ACCENT, width=1.5, dash=(3, 4),
                               joinstyle="round", capstyle="round", state="disabled")
-        if self.routes:
+        if self.routes and not previewing_permutation:
             for row, _, color in wdm:
                 self.draw_route(self.network.trace(row), color, 3)
             if self.all_paths.get():
@@ -3074,7 +3716,7 @@ class BenesApp(tk.Tk):
                     self.draw_route(route, COLORS[index % len(COLORS)], 2, dashed=True)
             self.draw_route(self.routes[self.selected_route], ACCENT, 4)
             c.create_text(width / 2, height - 12, text=f"Preview: path {self.selected_route + 1} in green · broad dashes show alternatives · thin dashes show crosstalk", fill=ACCENT, font=("Segoe UI", 10))
-        else:
+        elif not previewing_permutation:
             # A wide green halo keeps the selected input visible beneath its comb-line colour.
             self.draw_route(current, ACCENT, 9 if (self.source, "in") in wdm_ends else 4)
             for row, _, color in wdm:
@@ -3084,7 +3726,7 @@ class BenesApp(tk.Tk):
         for row, y in enumerate(self.ys):
             for side, x, selected, callback in (
                 ("in", self.left_x, row == self.source, self.click_input),
-                ("out", self.right_x, row == (self.destination if self.destination is not None else current.rows[-1]), self.click_output),
+                ("out", self.right_x, row == self.destination, self.click_output),
             ):
                 tag = f"{side}:{row}"
                 wavelength, wdm_color = wdm_ends.get((row, side), (None, None))
