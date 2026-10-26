@@ -10,6 +10,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from network import BenesNetwork
+from newport_laser import NewportLaserController, NewportPanel
 from calibration_scan import (ScanPoint, scan_switch, scan_switches, scan_switches_with_reader,
                               scan_voltages, spectrum_scan_point)
 from crosstalk_results import (PLOT_X_POWER, PLOT_X_VOLTAGE, RESCAN_STYLES, create_result_folder,
@@ -117,6 +118,8 @@ class BenesApp(tk.Tk):
         self.controller.current_density_authorizer = self.confirm_over_safe_current
         self.power_meter = ArduinoPowerMeter()
         self.osa_output_switch = OSAOutputSwitch()
+        self.newport_controller = NewportLaserController()
+        self.newport_window = None
         # The lab always drives the real JDSU; Dry run stays available in Selector setup.
         self.osa_output_switch.settings["dry_run"] = False
         self.wdm_plan = WDMPlan()
@@ -224,12 +227,15 @@ class BenesApp(tk.Tk):
         # Each tab fills the window when it fits and scrolls when the window is smaller.
         tabs = []
         for text in ("Routing", "Hardware & OSA", "MZI calibration", "Crosstalk scans", "WDM comb",
-                     "Dataset coverage", "Impulse test"):
+                     "Dataset coverage", "Impulse test", "Newport lasers"):
             scroller = ScrollableFrame(self.notebook, background=BG)
             self.notebook.add(scroller, text=text)
             tabs.append(scroller.inner)
         (self.route_tab, self.hardware_tab, self.calibration_tab, self.crosstalk_tab, self.wdm_tab,
-         self.dataset_tab, self.impulse_tab) = tabs
+         self.dataset_tab, self.impulse_tab, self.newport_tab) = tabs
+        self.newport_panel = NewportPanel(self.newport_tab, self.newport_controller,
+                                          detach=self.detach_newport)
+        self.newport_panel.pack(fill="both", expand=True)
 
         controls = ttk.Frame(self.route_tab, padding=(24, 8))
         controls.pack(fill="x")
@@ -3269,6 +3275,9 @@ class BenesApp(tk.Tk):
         self.dataset_report.configure(state="disabled")
 
     def close(self):
+        if self.newport_panel.busy:
+            messagebox.showinfo("Newport operation", "Wait for the Newport command to finish.", parent=self)
+            return
         if self.impulse_running:
             self.stop_impulse()
             return
@@ -3285,7 +3294,34 @@ class BenesApp(tk.Tk):
         self.controller.disconnect()
         self.power_meter.disconnect()
         self.osa_output_switch.disconnect()
+        self.newport_controller.disconnect()
         self.destroy()
+
+    def detach_newport(self):
+        if self.newport_panel.busy or self.newport_window is not None:
+            return
+        self.newport_panel.destroy()
+        window = tk.Toplevel(self)
+        window.title("Newport 9016 laser controller")
+        window.geometry("980x760")
+        window.minsize(620, 400)
+        scroller = ScrollableFrame(window, background=BG)
+        scroller.pack(fill="both", expand=True)
+        self.newport_window = window
+        self.newport_panel = NewportPanel(scroller.inner, self.newport_controller,
+                                          attach=self.attach_newport)
+        self.newport_panel.pack(fill="both", expand=True)
+        window.protocol("WM_DELETE_WINDOW", self.attach_newport)
+
+    def attach_newport(self):
+        if self.newport_panel.busy or self.newport_window is None:
+            return
+        self.newport_panel.destroy()
+        self.newport_window.destroy()
+        self.newport_window = None
+        self.newport_panel = NewportPanel(self.newport_tab, self.newport_controller,
+                                          detach=self.detach_newport)
+        self.newport_panel.pack(fill="both", expand=True)
 
     def build_impulse_tab(self):
         # The settings scroll on their own so the plot stays in view.

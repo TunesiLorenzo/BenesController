@@ -46,6 +46,21 @@ capped to the screen. The mapping dialog keeps **Save**/**Cancel** visible
 below its scrolling table. Plots rescale with the window down to about
 480 × 320 px, then the tab scrolls instead.
 
+## Newport 9016 laser modules
+
+The **Newport lasers** tab connects to the 9016 at `GPIB0::19::INSTR` by
+default. It reads the installed modules and shows separate **Laser current**
+and **TEC temperature** output states for each of the 16 slots. **Turn ON** and
+**Turn OFF** act on one output at a time; they use the current and temperature
+setpoints already configured on the Newport controller. **Refresh** rereads
+the output states. **ALL OFF** turns off every laser output first, then every
+TEC output, and reports any channel that could not be confirmed off.
+
+**Detach** opens the controls in their own scrollable window; **Attach** or the
+window close button returns them to the main tab. The connection remains open
+while moving between windows. NI-VISA and `python -m pip install pyvisa` are
+needed for the physical controller.
+
 ## OSA traces
 
 The **OSA** row reads trace 1 from a VIAVI OSA 500RS. Choose **Overlay** or **New
