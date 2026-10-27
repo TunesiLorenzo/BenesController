@@ -3,8 +3,8 @@
 import csv
 from datetime import datetime
 
-from calibration_scan import SpectrumScanPoint
-from osa import SPURIOUS_TAIL_POINTS
+from benes.measurements.calibration_scan import SpectrumScanPoint
+from benes.hardware.osa import SPURIOUS_TAIL_POINTS
 
 
 def write_spectra(path, traces, description=""):

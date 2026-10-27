@@ -1,6 +1,7 @@
+import math
 import unittest
 
-from osa import wait_for_fresh_trace
+from benes.hardware.osa import distinct_laser_wavelengths, find_laser_wavelengths, wait_for_fresh_trace
 
 
 class FakeClock:
@@ -34,6 +35,25 @@ class FreshTraceTests(unittest.TestCase):
         clock = FakeClock()
         with self.assertRaisesRegex(TimeoutError, "did not refresh"):
             wait_for_fresh_trace(lambda: "same", 1, max_wait_s=2, clock=clock, sleep=clock.sleep)
+
+
+class LaserChannelTests(unittest.TestCase):
+    def test_finds_six_distinct_peaks_and_orders_them_high_to_low(self):
+        expected = [1548.1, 1549.0, 1550.2, 1551.4, 1552.7, 1553.8]
+        wave = [1547.0 + step * 0.01 for step in range(800)]
+        power = [-65 + sum(45 * math.exp(-((item - center) / 0.025) ** 2)
+                           for center in expected) for item in wave]
+        self.assertEqual(find_laser_wavelengths(wave, power), list(reversed(expected)))
+
+    def test_rejects_a_trace_without_six_prominent_channels(self):
+        wave = [1549 + step * 0.01 for step in range(200)]
+        power = [-60 + 40 * math.exp(-((item - 1550) / 0.03) ** 2) for item in wave]
+        with self.assertRaisesRegex(ValueError, "Found only 1 of 6"):
+            find_laser_wavelengths(wave, power)
+
+    def test_combines_one_peak_from_each_output_in_wavelength_order(self):
+        self.assertEqual(distinct_laser_wavelengths([1551.1, 1549.2, 1550.5, 1552.3, 1548.9, 1553.0]),
+                         [1553.0, 1552.3, 1551.1, 1550.5, 1549.2, 1548.9])
 
 
 if __name__ == "__main__":

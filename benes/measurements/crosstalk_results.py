@@ -7,8 +7,8 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from calibration_scan import ScanPoint, SpectrumScanPoint
-from spectrum_export import write_crosstalk_csv
+from benes.measurements.calibration_scan import ScanPoint, SpectrumScanPoint
+from benes.measurements.spectrum_export import write_crosstalk_csv
 
 
 POWER_COLOR = "#ffbe69"

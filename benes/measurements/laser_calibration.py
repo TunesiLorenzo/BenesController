@@ -27,10 +27,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from osa import trim_spurious_tail
-from osa_output_switch import fiber_number
-from spectrum_export import write_spectra
-from wdm_comb import input_fiber_number, line_power
+from benes.hardware.osa import trim_spurious_tail
+from benes.hardware.osa_output_switch import fiber_number
+from benes.measurements.spectrum_export import write_spectra
+from benes.measurements.wdm_comb import input_fiber_number, line_power
 
 CALIBRATION_SUBFOLDER = "MZI_calibration"
 # A state check passes when the commanded line beats the other by this margin.

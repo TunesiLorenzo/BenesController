@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from power_meter import ArduinoPowerMeter
+from benes.hardware.power_meter import ArduinoPowerMeter
 
 
 class ArduinoPowerMeterTests(unittest.TestCase):
@@ -100,7 +100,7 @@ class ArduinoPowerMeterTests(unittest.TestCase):
         serial = RawSerial()
         meter = ArduinoPowerMeter(self.path)
         meter.serial = serial
-        with patch("power_meter.time.perf_counter", side_effect=lambda: clock.now),                 patch("power_meter.time.sleep", side_effect=sleep):
+        with patch("benes.hardware.power_meter.time.perf_counter", side_effect=lambda: clock.now),                 patch("benes.hardware.power_meter.time.sleep", side_effect=sleep):
             meter.start_stream()
             serial.chunks = [bytes((0x81, 1)), bytes((0x82, 3))]
             first, timing1 = meter.read_timed_samples(0.001, reset_buffer=False)
@@ -144,8 +144,8 @@ class ArduinoPowerMeterTests(unittest.TestCase):
         def sleep(duration):
             clock.now += duration
 
-        with patch("power_meter.time.perf_counter", side_effect=lambda: clock.now), \
-                patch("power_meter.time.sleep", side_effect=sleep):
+        with patch("benes.hardware.power_meter.time.perf_counter", side_effect=lambda: clock.now), \
+                patch("benes.hardware.power_meter.time.sleep", side_effect=sleep):
             with self.assertRaisesRegex(RuntimeError, "stream stopped"):
                 meter.read_timed_samples(0.6, reset_buffer=False)
 

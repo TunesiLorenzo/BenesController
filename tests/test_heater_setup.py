@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from heater_setup import load_heater_csv, voltage_limit
+from benes.core.heater_setup import load_heater_csv, voltage_limit
 
 
 CSV = """﻿# file,chip.gds,cell,TOP

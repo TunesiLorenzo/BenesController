@@ -5,9 +5,9 @@ import threading
 import unittest
 from pathlib import Path
 
-from osa_output_switch import OSAOutputSwitch
-from wdm_comb import (WDMPlan, line_power, normalized_assignment, parse_comb_lines, routed_wavelengths,
-                      save_wdm_scan, scan_outputs, simulated_comb_spectrum)
+from benes.hardware.osa_output_switch import OSAOutputSwitch
+from benes.measurements.wdm_comb import (WDMPlan, evaluate_configuration, line_power, normalized_assignment, parse_comb_lines,
+                      routed_wavelengths, save_wdm_scan, scan_outputs, simulated_comb_spectrum)
 
 PLAN = {"1": 1550.12, "2": 1550.92, "3": 1551.72, "4": None, "5": 1552.52, "6": 1553.33}
 # Input 1 → output 3, input 2 → output 1, ... (0-based like BenesNetwork.mapping()).
@@ -107,6 +107,25 @@ class WDMScanTests(unittest.TestCase):
             results = scan_outputs(switch, lambda _: self.fail("read after stop"), [1, 2], MAPPING,
                                    normalized_assignment(PLAN), 0.1, 10, stop_event=stop)
             self.assertEqual(results, [])
+
+    def test_configuration_summary_has_transmission_total_and_per_port_crosstalk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            switch = OSAOutputSwitch(Path(directory) / "switch.json", sleep=lambda _: None)
+            switch.connect()
+            assignment = normalized_assignment(PLAN)
+            routed = routed_wavelengths(MAPPING, assignment)
+            results = scan_outputs(
+                switch, lambda output: simulated_comb_spectrum(assignment, routed[output][0]),
+                range(1, 7), MAPPING, assignment, 0.1, 0, sleep=lambda _: None)
+            summary = evaluate_configuration(results, MAPPING, assignment)
+            line = next(item for item in summary if item.input_port == 1)
+            self.assertEqual(line.expected_output, 3)
+            self.assertAlmostEqual(line.transmission_dbm, -10, delta=0.5)
+            self.assertAlmostEqual(line.total_power_dbm, -9.9, delta=0.5)
+            self.assertGreater(line.normalized_transmission, 0.99)
+            self.assertIsNone(line.crosstalk_dbc[3])
+            self.assertLess(line.crosstalk_dbc[1], -25)
+            self.assertLess(line.normalized_crosstalk[1], 0.01)
 
 
 if __name__ == "__main__":

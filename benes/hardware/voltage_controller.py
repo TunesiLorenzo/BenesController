@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from heater_setup import BREAK_CURRENT_DENSITY, SAFE_CURRENT_DENSITY, HeaterDevice, voltage_limit
+from benes.core.heater_setup import BREAK_CURRENT_DENSITY, SAFE_CURRENT_DENSITY, HeaterDevice, voltage_limit
 
 
 def app_dir() -> Path:

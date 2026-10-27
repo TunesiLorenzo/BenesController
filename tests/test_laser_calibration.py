@@ -5,11 +5,11 @@ import unittest
 from itertools import product
 from pathlib import Path
 
-from laser_calibration import (CalibrationStopped, CompleteCalibration, ProbePoint, SimulatedChip, SwitchProbe,
+from benes.measurements.laser_calibration import (CalibrationStopped, CompleteCalibration, ProbePoint, SimulatedChip, SwitchProbe,
                                calibrate_all, calibrate_switch, extract_calibration,
                                calibration_plan, check_alignment, check_calibrated_states, reference_states,
                                save_calibration_results, switch_probes, wavelengths_from_assignment)
-from network import BenesNetwork
+from benes.core.network import BenesNetwork
 
 WAVELENGTHS = {row: 1540.0 + 2 * row for row in range(6)}
 

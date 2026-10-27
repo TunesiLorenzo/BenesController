@@ -1,6 +1,6 @@
 import unittest
 
-from newport_laser import NewportLaserController
+from benes.hardware.newport_laser import NewportLaserController
 
 
 class Fake9016:

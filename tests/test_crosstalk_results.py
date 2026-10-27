@@ -4,9 +4,9 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from calibration_scan import ScanPoint, SpectrumScanPoint
-from crosstalk_results import create_result_folder, save_scan_artifacts, scan_context
-from network import BenesNetwork
+from benes.measurements.calibration_scan import ScanPoint, SpectrumScanPoint
+from benes.measurements.crosstalk_results import create_result_folder, save_scan_artifacts, scan_context
+from benes.core.network import BenesNetwork
 
 
 class CrosstalkResultsTests(unittest.TestCase):
@@ -61,7 +61,7 @@ class CrosstalkResultsTests(unittest.TestCase):
             self.assertEqual(calibration.parent.name, "Path_calibration")
 
     def test_saved_arduino_and_osa_folders_load_back_with_rescans(self):
-        from crosstalk_results import load_scan_folder
+        from benes.measurements.crosstalk_results import load_scan_folder
 
         network = BenesNetwork()
         controller = SimpleNamespace(settings={"mapping": {}}, applied_voltages={},
@@ -102,7 +102,7 @@ class CrosstalkResultsTests(unittest.TestCase):
             load_scan_folder(Path(directory))
 
     def test_power_axis_uses_v_squared_over_r_and_falls_back_to_volts(self):
-        from crosstalk_results import PLOT_X_POWER, PLOT_X_VOLTAGE, plot_x_values
+        from benes.measurements.crosstalk_results import PLOT_X_POWER, PLOT_X_VOLTAGE, plot_x_values
         xs, label = plot_x_values([0, 1, 2], 1000, PLOT_X_POWER)
         self.assertEqual(xs, [0, 1, 4])
         self.assertIn("Heater power [mW]", label)

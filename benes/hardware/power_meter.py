@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from voltage_controller import app_dir, sibling_module_path
+from benes.hardware.voltage_controller import app_dir, sibling_module_path
 
 
 # Raw stream: 7-bit A0 byte (bit 7 clear) followed by a 7-bit A1 byte (bit 7 set).

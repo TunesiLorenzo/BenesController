@@ -6,33 +6,34 @@ import random
 import threading
 import tkinter as tk
 from datetime import datetime
+from itertools import product
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from network import BenesNetwork
-from newport_laser import NewportLaserController, NewportPanel
-from calibration_scan import (ScanPoint, scan_switch, scan_switches, scan_switches_with_reader,
+from benes.core.network import BenesNetwork
+from benes.hardware.newport_laser import NewportLaserController, NewportPanel
+from benes.measurements.calibration_scan import (ScanPoint, scan_switch, scan_switches, scan_switches_with_reader,
                               scan_voltages, spectrum_scan_point)
-from crosstalk_results import (PLOT_X_POWER, PLOT_X_VOLTAGE, RESCAN_STYLES, create_result_folder,
+from benes.measurements.crosstalk_results import (PLOT_X_POWER, PLOT_X_VOLTAGE, RESCAN_STYLES, create_result_folder,
                                load_scan_folder, plot_x_values, save_scan_artifacts, scan_context)
-from dataset_registry import (analyze_dataset, create_dataset, save_measurement,
+from benes.measurements.dataset_registry import (analyze_dataset, create_dataset, save_measurement,
                               write_coverage_report)
-from laser_calibration import (DEFAULT_PASS_DB, CalibrationStopped, CompleteCalibration, SimulatedChip,
+from benes.measurements.laser_calibration import (DEFAULT_PASS_DB, CalibrationStopped, CompleteCalibration, SimulatedChip,
                                calibrate_all, calibrate_switch, check_alignment, check_calibrated_states,
                                create_calibration_folder, reference_states, save_calibration_results,
                                strongest_input, switch_probes, wavelengths_from_assignment)
-from impulse_test import (LIVE_PLOT_WINDOW_S, plot_trace_samples, received_pair_rate,
+from benes.measurements.impulse_test import (LIVE_PLOT_WINDOW_S, plot_trace_samples, received_pair_rate,
                           run_impulse_test,
                           validate_impulse_settings, write_impulse_csv)
-import osa
-from osa_output_switch import JDSU_CHANNELS, OUTPUTS, OSAOutputSwitch, fiber_number
-from power_meter import ArduinoPowerMeter
-from spectrum_export import write_crosstalk_csv, write_spectra
-from voltage_controller import BenesVoltageController, app_dir
-from wdm_comb import (INPUTS, WDMPlan, create_wdm_folder, input_fiber_number, routed_wavelengths,
-                      save_wdm_scan, scan_outputs, simulated_comb_spectrum)
-from heater_setup import BREAK_CURRENT_DENSITY, SAFE_CURRENT_DENSITY, load_heater_csv, voltage_limit
-from scrollable import ScrollableFrame, fit_to_screen
+from benes.hardware import osa
+from benes.hardware.osa_output_switch import JDSU_CHANNELS, OUTPUTS, OSAOutputSwitch, fiber_number
+from benes.hardware.power_meter import ArduinoPowerMeter
+from benes.measurements.spectrum_export import write_crosstalk_csv, write_spectra
+from benes.hardware.voltage_controller import BenesVoltageController, app_dir
+from benes.measurements.wdm_comb import (INPUTS, WDMPlan, create_wdm_folder, evaluate_configuration, input_fiber_number,
+                      routed_wavelengths, save_wdm_scan, scan_outputs, simulated_comb_spectrum)
+from benes.core.heater_setup import BREAK_CURRENT_DENSITY, SAFE_CURRENT_DENSITY, load_heater_csv, voltage_limit
+from benes.gui.widgets import ScrollableFrame, fit_to_screen
 
 # Completed OSA sweeps to wait for after moving the output switch: the first may
 # have begun before the move, the second lies wholly after it.
@@ -125,13 +126,15 @@ class BenesApp(tk.Tk):
         self.wdm_plan = WDMPlan()
         self.wdm_running = False
         self.wdm_stop_event = None
+        self.dataset_batch_running = False
+        self.dataset_batch_stop_event = None
         self.scan_settings = {}
         self.crosstalk_running = False
         self.crosstalk_data = {}
         self.crosstalk_data_source = None
         self.crosstalk_data_unit = None
         self.crosstalk_result_folder = None
-        self.active_scan_kind = "Crosstalk scan"
+        self.active_scan_kind = "Thermal crosstalk scan"
         # Switches clicked to 0 V; they route as cross, the chip's unbiased state.
         self.zero_volt_switches = set()
         self.mzi_calibration_running = False
@@ -139,8 +142,8 @@ class BenesApp(tk.Tk):
         self.impulse_running = False
         self.impulse_stop_event = None
         self.impulse_trace = None
-        self.source = 0
-        self.destination = 0
+        self.source = None
+        self.destination = None
         self.routes = []
         self.selected_route = 0
         self.permutation_route_states = ()
@@ -226,12 +229,12 @@ class BenesApp(tk.Tk):
         self.notebook.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         # Each tab fills the window when it fits and scrolls when the window is smaller.
         tabs = []
-        for text in ("Routing", "Hardware & OSA", "MZI calibration", "Crosstalk scans", "WDM comb",
+        for text in ("Routing", "Hardware & OSA", "MZI calibration", "Thermal crosstalk",
                      "Dataset coverage", "Impulse test", "Newport lasers"):
             scroller = ScrollableFrame(self.notebook, background=BG)
             self.notebook.add(scroller, text=text)
             tabs.append(scroller.inner)
-        (self.route_tab, self.hardware_tab, self.calibration_tab, self.crosstalk_tab, self.wdm_tab,
+        (self.route_tab, self.hardware_tab, self.calibration_tab, self.crosstalk_tab,
          self.dataset_tab, self.impulse_tab, self.newport_tab) = tabs
         self.newport_panel = NewportPanel(self.newport_tab, self.newport_controller,
                                           detach=self.detach_newport)
@@ -240,16 +243,23 @@ class BenesApp(tk.Tk):
         controls = ttk.Frame(self.route_tab, padding=(24, 8))
         controls.pack(fill="x")
         ttk.Label(controls, text="Input").pack(side="left")
-        self.input_box = ttk.Combobox(controls, values=list(range(1, 7)), width=5, state="readonly")
-        self.input_box.current(0)
+        self.input_var = tk.StringVar(value="None")
+        self.input_box = ttk.Combobox(controls, textvariable=self.input_var,
+                                      values=("None", "1", "2", "3", "4", "5", "6"), width=5,
+                                      state="readonly")
         self.input_box.pack(side="left", padx=(8, 20))
         self.input_box.bind("<<ComboboxSelected>>", self.choose_input)
         ttk.Label(controls, text="Output").pack(side="left")
-        self.output_box = ttk.Combobox(controls, values=list(range(1, 7)), width=5, state="readonly")
-        self.output_box.current(0)
+        self.output_var = tk.StringVar(value="None")
+        self.output_box = ttk.Combobox(controls, textvariable=self.output_var,
+                                       values=("None", "1", "2", "3", "4", "5", "6"), width=5,
+                                       state="readonly")
         self.output_box.pack(side="left", padx=8)
         self.output_box.bind("<<ComboboxSelected>>", self.choose_output)
         ttk.Checkbutton(controls, text="Overlay all possible paths", variable=self.all_paths, command=self.draw).pack(side="left", padx=15)
+        self.evaluate_button = ttk.Button(controls, text="Evaluate Configuration", style="Accent.TButton",
+                                          command=self.start_configuration_evaluation)
+        self.evaluate_button.pack(side="left", padx=(0, 12))
         ttk.Button(controls, text="Reset switches", command=self.reset).pack(side="right")
         ttk.Button(controls, text="Random switches", command=self.randomize).pack(side="right", padx=8)
 
@@ -458,7 +468,6 @@ class BenesApp(tk.Tk):
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda event: self.draw())
         ttk.Label(diagram, text="Green switches have saved bar and cross voltages. Use the X, =, and 0 controls beside each MZI to set cross, bar, or 0 V; clicking an MZI still cycles the states. Type a voltage and press Enter to send it.", padding=(4, 5), wraplength=680).pack(anchor="w", fill="x")
-        self.build_wdm_tab()
         self.build_calibration_tab()
         self.build_dataset_tab()
         self.build_impulse_tab()
@@ -476,13 +485,18 @@ class BenesApp(tk.Tk):
 
     def choose_input(self, event=None):
         self.clear_permutation_preview()
-        self.source = self.input_box.current()
+        self.source = self.route_port(self.input_var)
         self.refresh()
 
     def choose_output(self, event=None):
         self.clear_permutation_preview()
-        self.destination = self.output_box.current()
+        self.destination = self.route_port(self.output_var)
         self.refresh()
+
+    @staticmethod
+    def route_port(variable):
+        value = variable.get()
+        return None if value == "None" else int(value) - 1
 
     @staticmethod
     def detector_port(variable):
@@ -583,11 +597,11 @@ class BenesApp(tk.Tk):
         self._approved_unsafe_voltages.update(unsafe)
 
     def click_input(self, row):
-        self.input_box.current(row)
+        self.input_var.set("None" if self.source == row else str(row + 1))
         self.choose_input()
 
     def click_output(self, row):
-        self.output_box.current(row)
+        self.output_var.set("None" if self.destination == row else str(row + 1))
         self.choose_output()
 
     def toggle(self, name):
@@ -1079,10 +1093,12 @@ class BenesApp(tk.Tk):
         names = [self.crosstalk_switches.get(index) for index in self.crosstalk_switches.curselection()]
         source = self.crosstalk_source.get()
         try:
-            if self.mzi_calibration_running:
+            if self.mzi_calibration_running or self.dataset_batch_running:
                 raise RuntimeError("Wait for the MZI calibration to finish")
             if not names:
                 raise ValueError("Select at least one switch")
+            if self.source is None or self.destination is None:
+                raise ValueError("Select an input and output in Routing before starting a thermal crosstalk scan")
             fields = self.crosstalk_fields
             voltages = scan_voltages(*(float(fields[key].get()) for key in
                                        ("Lower limit [V]", "Upper limit [V]", "Step [V]")))
@@ -1131,7 +1147,7 @@ class BenesApp(tk.Tk):
             messagebox.showerror("Crosstalk results unavailable", str(error), parent=self)
             return
 
-        self.active_scan_kind = "Crosstalk scan"
+        self.active_scan_kind = "Thermal crosstalk scan"
         self.crosstalk_running = True
         self.crosstalk_data = {}
         self.crosstalk_data_source = None
@@ -1933,8 +1949,11 @@ class BenesApp(tk.Tk):
             label = ttk.Label(lasers)
             label.grid(row=(port - 1) % 3, column=(port - 1) // 3, sticky="w", padx=(0, 18), pady=1)
             self.cal_laser_labels.append(label)
+        self.cal_detect_lasers_button = ttk.Button(
+            lasers, text="Read OSA + detect six channels", command=self.start_laser_channel_detection)
+        self.cal_detect_lasers_button.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Button(lasers, text="Edit wavelengths…", command=lambda: self.notebook.select(
-            self.tab_page(self.wdm_tab))).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            self.tab_page(self.dataset_tab))).grid(row=4, column=0, columnspan=2, sticky="w", pady=(5, 0))
 
         sweep = ttk.LabelFrame(controls, text="Sweep", padding=10)
         sweep.pack(fill="x", pady=(12, 0))
@@ -2080,6 +2099,72 @@ class BenesApp(tk.Tk):
                             foreground="#71829a" if wavelength is None else WDM_COLORS[row])
         self.update_calibration_watch_choices()
 
+    def start_laser_channel_detection(self):
+        """Read the OSA comb and fill the six input wavelengths by wavelength order."""
+        try:
+            if self.mzi_calibration_running:
+                raise RuntimeError("Wait for the MZI calibration to finish")
+            if self.osa_button.instate(["disabled"]):
+                raise RuntimeError("Wait for the current OSA trace read to finish")
+            host, port, simulate = self.osa_connection()
+        except (RuntimeError, ValueError) as error:
+            messagebox.showerror("Laser-channel detection unavailable", str(error), parent=self)
+            return
+
+        self.set_osa_reading(True)
+        self.cal_detect_lasers_button.configure(state="disabled")
+        self.cal_status_var.set("Reading the OSA trace and locating six laser channels...")
+
+        def acquire():
+            try:
+                wave, power = osa.simulated_spectrum() if simulate else osa.get_spectrum(host, port)
+                wave, power = osa.trim_spurious_tail(wave, power)
+                try:
+                    wavelengths = osa.find_laser_wavelengths(wave, power, count=len(INPUTS))
+                except ValueError as direct_error:
+                    wavelengths = self.detect_laser_channels_from_outputs(host, port, simulate, direct_error)
+            except Exception as error:
+                self.after(0, lambda: self.finish_laser_channel_detection(error=str(error)))
+            else:
+                self.after(0, lambda: self.finish_laser_channel_detection(wavelengths=wavelengths))
+
+        threading.Thread(target=acquire, daemon=True).start()
+
+    def detect_laser_channels_from_outputs(self, host, port, simulate, direct_error):
+        """Fall back to one strongest line per output when one trace is attenuated."""
+        switch = self.osa_output_switch
+        if not switch.connected:
+            raise ValueError(f"{direct_error} Connect the OSA output switch to also search all outputs.")
+        outputs = switch.mapped_outputs()
+        if len(outputs) < len(INPUTS):
+            raise ValueError(f"{direct_error} Map all six OSA outputs to use the multi-output fallback.")
+        peaks = []
+        for index, output in enumerate(outputs, start=1):
+            self.after(0, lambda o=output, i=index: self.cal_status_var.set(
+                f"Direct trace was attenuated; reading output {o} ({i}/{len(outputs)})..."))
+            switch.select_output(output)
+            wave, power = (osa.simulated_spectrum() if simulate else
+                           osa.get_spectrum(host, port, fresh_sweeps=POST_SWITCH_SWEEPS))
+            wave, power = osa.trim_spurious_tail(wave, power)
+            peaks.extend(osa.find_laser_wavelengths(wave, power, count=1))
+        return osa.distinct_laser_wavelengths(peaks, count=len(INPUTS))
+
+    def finish_laser_channel_detection(self, wavelengths=None, error=None):
+        self.set_osa_reading(False)
+        self.cal_detect_lasers_button.configure(state="normal")
+        if error is not None:
+            self.cal_status_var.set("Could not detect six laser channels from the OSA trace.")
+            messagebox.showerror("Laser-channel detection failed", error, parent=self)
+            return
+        assignment = {str(port): wavelength for port, wavelength in zip(INPUTS, wavelengths)}
+        try:
+            self.set_wdm_assignment(assignment)
+            self.save_wdm_plan(quiet=True)
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Could not save wavelength plan", str(error), parent=self)
+            return
+        self.cal_status_var.set("Detected six OSA channels: Input 1 is the highest wavelength; Input 6 the lowest.")
+
     def update_calibration_watch_choices(self):
         """Offer the two outputs whose arriving line the selected MZI decides."""
         self.cal_watch_probes = switch_probes(self.network, reference_states(self.network), self.cal_switch_var.get())
@@ -2143,7 +2228,7 @@ class BenesApp(tk.Tk):
         """Validate the instruments and wavelength plan; return (read_spectrum, wavelengths, half window, simulated)."""
         if self.mzi_calibration_running:
             raise RuntimeError("A calibration is already running")
-        if self.crosstalk_running or self.wdm_running or self.impulse_running:
+        if self.crosstalk_running or self.wdm_running or self.dataset_batch_running or self.impulse_running:
             raise RuntimeError("Wait for the current scan or impulse test to finish")
         if self.osa_button.instate(["disabled"]):
             raise RuntimeError("Wait for the current OSA read to finish")
@@ -2296,7 +2381,7 @@ class BenesApp(tk.Tk):
                        self.cal_routed_button):
             button.configure(state=state)
         self.cal_stop_button.configure(state="normal" if running else "disabled")
-        for tab in (self.route_tab, self.hardware_tab, self.crosstalk_tab, self.wdm_tab, self.impulse_tab):
+        for tab in (self.route_tab, self.hardware_tab, self.crosstalk_tab, self.dataset_tab, self.impulse_tab):
             self.set_tab_state(tab, state)
         self.set_osa_reading(running)
 
@@ -2904,29 +2989,43 @@ class BenesApp(tk.Tk):
         self.wdm_preset_var.set("")
         self.update_wdm_presets()
 
-    def start_wdm_scan(self):
-        if self.wdm_running:
+    def start_configuration_evaluation(self):
+        """Evaluate the persisted six-laser plan at every chip output."""
+        self.start_wdm_scan(outputs=OUTPUTS, evaluation=True, record_dataset=False)
+
+    def start_wdm_scan(self, outputs=None, evaluation=False, record_dataset=None):
+        if self.wdm_running or self.dataset_batch_running:
             return
         switch = self.osa_output_switch
         try:
             if self.mzi_calibration_running:
                 raise RuntimeError("Wait for the MZI calibration to finish")
-            try:
-                self.save_wdm_plan(quiet=True)
-            except OSError as error:
-                raise ValueError(f"Could not save the wavelength plan: {error}") from error
+            if self.osa_button.instate(["disabled"]):
+                raise RuntimeError("Wait for the current OSA trace read to finish")
+            if not evaluation:
+                try:
+                    self.save_wdm_plan(quiet=True)
+                except OSError as error:
+                    raise ValueError(f"Could not save the wavelength plan: {error}") from error
             assignment = dict(self.wdm_plan.assignment)
+            missing = [str(port) for port in INPUTS if assignment[str(port)] is None]
+            if evaluation and missing:
+                raise ValueError("Save a wavelength for every input before evaluating the configuration")
             if not any(wavelength is not None for wavelength in assignment.values()):
                 raise ValueError("Assign a comb wavelength to at least one input")
             host, port, simulate = self.osa_connection()
             if not switch.connected:
                 raise RuntimeError("Connect the OSA output switch first (dry run is available)")
-            outputs = [output for output, variable in self.wdm_output_vars.items() if variable.get()]
+            if outputs is None:
+                outputs = [output for output, variable in self.wdm_output_vars.items() if variable.get()]
+            else:
+                outputs = list(outputs)
             if not outputs:
                 raise ValueError("Select at least one output to scan")
             for output in outputs:
                 switch.channel_for(output)
-            dataset_root = self.dataset_root() if self.wdm_dataset_var.get() else None
+            record_dataset = self.wdm_dataset_var.get() if record_dataset is None else record_dataset
+            dataset_root = self.dataset_root() if record_dataset else None
             if dataset_root is not None and not (dataset_root / "benes_dataset.json").exists():
                 raise ValueError("Initialize the linked dataset in Dataset coverage first")
         except (RuntimeError, ValueError) as error:
@@ -2937,7 +3036,7 @@ class BenesApp(tk.Tk):
         permutation = self.active_dataset_permutation()
         routed = routed_wavelengths(mapping, assignment)
         settings = self.wdm_plan.settings
-        comment = self.wdm_comment_var.get()
+        comment = self.dataset_comment_var.get()
         context = {
             "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "permutation": list(permutation),
@@ -2960,11 +3059,17 @@ class BenesApp(tk.Tk):
 
         self.wdm_running = True
         self.wdm_stop_event = threading.Event()
-        self.wdm_start_button.configure(state="disabled")
-        self.wdm_stop_button.configure(state="normal")
+        if hasattr(self, "wdm_start_button"):
+            self.wdm_start_button.configure(state="disabled")
+        if hasattr(self, "wdm_stop_button"):
+            self.wdm_stop_button.configure(state="normal")
+        if hasattr(self, "evaluate_button"):
+            self.evaluate_button.configure(state="disabled")
         self.set_osa_reading(True)
-        self.wdm_table.delete(*self.wdm_table.get_children())
-        self.wdm_status_var.set(f"Scanning outputs {', '.join(map(str, outputs))}...")
+        if hasattr(self, "wdm_table"):
+            self.wdm_table.delete(*self.wdm_table.get_children())
+        self.wdm_status_var.set(("Evaluating" if evaluation else "Scanning") +
+                                f" outputs {', '.join(map(str, outputs))}...")
         stop_event = self.wdm_stop_event
 
         markers = [(wavelength, WDM_COLORS[int(port) - 1], f"In {port} · {wavelength:g} nm")
@@ -2992,7 +3097,8 @@ class BenesApp(tk.Tk):
             except Exception as error_value:
                 error = str(error_value)
             self.after(0, lambda: self.finish_wdm_scan(results, folder, error, stop_event.is_set(),
-                                                       dataset_root is not None, markers))
+                                                       dataset_root is not None, markers, evaluation, mapping,
+                                                       assignment))
 
 
         threading.Thread(target=worker, daemon=True).start()
@@ -3000,10 +3106,11 @@ class BenesApp(tk.Tk):
     def add_wdm_result(self, result, index, total):
         signal = result.signal
         fmt = lambda value, digits=2: "—" if value is None else f"{value:.{digits}f}"
-        self.wdm_table.insert("", "end", values=(
-            result.output, result.fiber, result.jdsu_channel, result.routed_input,
-            fmt(result.wavelength_nm, 3), fmt(signal and signal.peak_dbm), fmt(signal and signal.peak_nm, 3),
-            fmt(signal and signal.mean_dbm), fmt(result.isolation_db)), tags=(f"input{result.routed_input}",))
+        if hasattr(self, "wdm_table"):
+            self.wdm_table.insert("", "end", values=(
+                result.output, result.fiber, result.jdsu_channel, result.routed_input,
+                fmt(result.wavelength_nm, 3), fmt(signal and signal.peak_dbm), fmt(signal and signal.peak_nm, 3),
+                fmt(signal and signal.mean_dbm), fmt(result.isolation_db)), tags=(f"input{result.routed_input}",))
         self.wdm_status_var.set(f"Measured output {result.output} ({index}/{total}).")
 
     def stop_wdm_scan(self):
@@ -3011,15 +3118,22 @@ class BenesApp(tk.Tk):
             self.wdm_stop_event.set()
             self.wdm_status_var.set("Stopping after the current output...")
 
-    def finish_wdm_scan(self, results, folder, error, stopped, recorded, markers=()):
+    def finish_wdm_scan(self, results, folder, error, stopped, recorded, markers=(), evaluation=False,
+                        mapping=(), assignment=None):
         self.wdm_running = False
-        self.wdm_start_button.configure(state="normal")
-        self.wdm_stop_button.configure(state="disabled")
+        if hasattr(self, "wdm_start_button"):
+            self.wdm_start_button.configure(state="normal")
+        if hasattr(self, "wdm_stop_button"):
+            self.wdm_stop_button.configure(state="disabled")
+        if hasattr(self, "evaluate_button"):
+            self.evaluate_button.configure(state="normal")
         self.set_osa_reading(False)
         if results:
             self.osa_switch_status_var.set(f"OSA sampling output {results[-1].output} after the WDM scan")
             self.osa_output_var.set(str(results[-1].output))
-        if self.wdm_plot_var.get():
+        if evaluation and results:
+            self.show_configuration_evaluation(results, mapping, assignment)
+        elif self.wdm_plot_var.get():
             for result in results:
                 self.show_spectrum(result.wave, result.power, name=f"WDM Out {result.output} (In {result.routed_input})",
                                    restore_buttons=False, output_port=result.output, trimmed=True, markers=markers)
@@ -3035,6 +3149,55 @@ class BenesApp(tk.Tk):
                                 + (" and recorded in the dataset." if recorded else "."))
         if recorded:
             self.analyze_linked_dataset()
+
+    def show_configuration_evaluation(self, results, mapping, assignment):
+        """Show the six output spectra next to the configuration power table."""
+        try:
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+            from matplotlib.figure import Figure
+        except ImportError:
+            messagebox.showerror("Evaluation plot unavailable",
+                                 "Install matplotlib to display the configuration evaluation.", parent=self)
+            return
+        summary = evaluate_configuration(results, mapping, assignment)
+        window = tk.Toplevel(self)
+        window.title("Evaluate Configuration")
+        self.fit_dialog_to_screen(window, preferred_width=1280, preferred_height=720)
+        figure = Figure(figsize=(12, 6), facecolor=BG)
+        spectra = figure.add_subplot(121, facecolor=PANEL)
+        table_axis = figure.add_subplot(122, facecolor=PANEL)
+        for result in results:
+            spectra.plot(result.wave, result.power, linewidth=1.0, label=f"Out {result.output}")
+        spectra.set(xlabel="Wavelength [nm]", ylabel="Power [dBm]", title="Six-output OSA scan")
+        spectra.grid(True, alpha=0.3)
+        spectra.legend(loc="best", fontsize=8)
+        table_axis.axis("off")
+        headers = ["Input", "λ [nm]", "Total\n[dBm]", "Expected", "Transmission\n[dBm]", "Tx / total\n[%]"] + \
+                  [f"Out {port}\nXT / total [%]" for port in OUTPUTS]
+        fmt = lambda value: "—" if value is None else f"{value:.2f}"
+        rows = [[f"In {item.input_port}", f"{item.wavelength_nm:.3f}", fmt(item.total_power_dbm),
+                 f"Out {item.expected_output}", fmt(item.transmission_dbm),
+                 fmt(None if item.normalized_transmission is None else item.normalized_transmission * 100)] +
+                ["—" if port == item.expected_output else
+                 fmt(None if item.normalized_crosstalk.get(port) is None else
+                     item.normalized_crosstalk[port] * 100)
+                for port in OUTPUTS]
+                for item in summary]
+        table_axis.set_title("Per-wavelength routing evaluation", color=TEXT, fontsize=11, pad=12)
+        table = table_axis.table(cellText=rows, colLabels=headers, cellLoc="center", loc="center")
+        table.auto_set_font_size(False)
+        table.set_fontsize(6.5)
+        table.scale(1.05, 1.75)
+        for (row, _column), cell in table.get_celld().items():
+            cell.set_edgecolor(WIRE)
+            cell.set_facecolor("#263650" if row == 0 else PANEL)
+            cell.get_text().set_color(TEXT)
+        figure.subplots_adjust(left=0.06, right=0.98, bottom=0.12, top=0.9, wspace=0.24)
+        canvas = FigureCanvasTkAgg(figure, master=window)
+        NavigationToolbar2Tk(canvas, window).update()
+        canvas.get_tk_widget().configure(**PLOT_MIN_SIZE)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        canvas.draw_idle()
 
     def build_dataset_tab(self):
         """Build the durable measurement index and coverage view.
@@ -3062,6 +3225,7 @@ class BenesApp(tk.Tk):
                   font=("Segoe UI", 10, "bold")).pack(anchor="w")
         ttk.Label(controls, text="Each saved record includes the active permutation and the input/output ports it represents.",
                   wraplength=285).pack(anchor="w", pady=(4, 12))
+        self.build_dataset_scan_configuration(controls)
 
         folder_box = ttk.LabelFrame(controls, text="Dataset folder", padding=10)
         folder_box.pack(fill="x")
@@ -3109,6 +3273,24 @@ class BenesApp(tk.Tk):
         ttk.Label(selection, text="Routed pairs records only active Benes routes. All selected pairs is for a future fan-in/fan-out fixture.",
                   wraplength=280).grid(row=5, column=0, columnspan=2, sticky="w", pady=(5, 0))
 
+        batch = ttk.LabelFrame(controls, text="Fill dataset from hardware", padding=10)
+        batch.pack(fill="x", pady=(12, 0))
+        ttk.Label(batch, text=("Uses the saved six-laser OSA configuration and records all six routed pairs at "
+                               "each control state."), wraplength=280).pack(anchor="w")
+        self.dataset_active_scan_button = ttk.Button(
+            batch, text="Scan active control state", style="Accent.TButton",
+            command=lambda: self.start_dataset_batch("active"))
+        self.dataset_active_scan_button.pack(fill="x", pady=(8, 0))
+        self.dataset_all_scan_button = ttk.Button(
+            batch, text="Run all 720 output permutations", command=lambda: self.start_dataset_batch("all"))
+        self.dataset_all_scan_button.pack(fill="x", pady=(5, 0))
+        self.dataset_states_scan_button = ttk.Button(
+            batch, text="Run all 4096 switch states", command=lambda: self.start_dataset_batch("states"))
+        self.dataset_states_scan_button.pack(fill="x", pady=(5, 0))
+        self.dataset_batch_stop_button = ttk.Button(batch, text="Stop after current output", command=self.stop_dataset_batch,
+                                                    state="disabled")
+        self.dataset_batch_stop_button.pack(fill="x", pady=(5, 0))
+
         save_box = ttk.LabelFrame(controls, text="Save latest acquisition", padding=10)
         save_box.pack(fill="x", pady=(12, 0))
         ttk.Label(save_box, text="Comment (saved inside the record and CSV)").pack(anchor="w")
@@ -3126,6 +3308,29 @@ class BenesApp(tk.Tk):
                   font=("Segoe UI", 14, "bold")).pack(anchor="w")
         ttk.Label(summary, text="The report counts the six routed input→output paths required for each expected permutation.",
                   wraplength=700).pack(anchor="w", pady=(2, 8))
+        ttk.Label(summary, text="Live normalized optical metrics", foreground=ACCENT,
+                  font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(4, 2))
+        ttk.Label(summary, text=("Each row is one input wavelength at one switch state. Transmission and crosstalk "
+                                 "are normalized by that wavelength's linear power summed across all six outputs."),
+                  foreground="#9baec6", wraplength=700).pack(anchor="w", pady=(0, 4))
+        metrics_frame = ttk.Frame(summary)
+        metrics_frame.pack(fill="x", pady=(0, 10))
+        metric_columns = ("state", "permutation", "input", "wavelength", "total", "expected", "transmission") + \
+                         tuple(f"out{port}" for port in OUTPUTS)
+        self.dataset_metrics_table = ttk.Treeview(metrics_frame, columns=metric_columns, show="headings", height=8)
+        headings = {"state": "Switch state", "permutation": "Outputs", "input": "Input", "wavelength": "λ [nm]",
+                    "total": "Total [dBm]", "expected": "Expected", "transmission": "Tx / total [%]"}
+        headings.update({f"out{port}": f"Out {port} XT [%]" for port in OUTPUTS})
+        widths = {"state": 125, "permutation": 110, "input": 60, "wavelength": 85, "total": 85,
+                  "expected": 75, "transmission": 95, **{f"out{port}": 80 for port in OUTPUTS}}
+        for column in metric_columns:
+            self.dataset_metrics_table.heading(column, text=headings[column])
+            self.dataset_metrics_table.column(column, width=widths[column], anchor="center")
+        metrics_scroll = ttk.Scrollbar(metrics_frame, orient="horizontal", command=self.dataset_metrics_table.xview,
+                                       style="Accent.Horizontal.TScrollbar")
+        self.dataset_metrics_table.configure(xscrollcommand=metrics_scroll.set)
+        self.dataset_metrics_table.pack(fill="x")
+        metrics_scroll.pack(fill="x")
         report_frame = ttk.Frame(summary)
         report_frame.pack(fill="both", expand=True)
         report_scroll = ttk.Scrollbar(report_frame, orient="vertical", style="Accent.Vertical.TScrollbar")
@@ -3137,6 +3342,53 @@ class BenesApp(tk.Tk):
         self.dataset_report.pack(side="left", fill="both", expand=True)
         report_scroll.pack(side="right", fill="y")
         self.set_dataset_report("No dataset linked. Choose a folder, initialize its expected permutation set, then save OSA or power-meter acquisitions.")
+
+    def build_dataset_scan_configuration(self, controls):
+        """Keep the six-laser scan settings with the dataset they describe."""
+        settings = self.wdm_plan.settings
+        self.wdm_wavelength_vars = {
+            port: tk.StringVar(value="" if settings["assignment"][str(port)] is None
+                               else f"{settings['assignment'][str(port)]:g}")
+            for port in INPUTS
+        }
+        self.wdm_destination_vars = {port: tk.StringVar() for port in INPUTS}
+        self.wdm_comb_var = tk.StringVar(value=" ".join(f"{line:g}" for line in settings["comb_lines"]))
+        self.wdm_window_var = tk.StringVar(value=f"{settings['half_window_nm']:g}")
+        self.wdm_settle_var = tk.StringVar(value=f"{settings['settle_s']:g}")
+        self.wdm_output_vars = {output: tk.BooleanVar(value=True) for output in OUTPUTS}
+        self.wdm_comment_var = self.dataset_comment_var
+        self.wdm_dataset_var = tk.BooleanVar(value=True)
+        self.wdm_plot_var = tk.BooleanVar(value=False)
+        self.wdm_status_var = tk.StringVar(value="Configure the six laser wavelengths, then evaluate from Routing.")
+        self.wdm_wavelength_boxes = []
+
+        scan = ttk.LabelFrame(controls, text="Six-laser OSA scan configuration", padding=10)
+        scan.pack(fill="x", pady=(12, 0))
+        ttk.Label(scan, text="Comb lines [nm]").grid(row=0, column=0, sticky="w")
+        comb = ttk.Entry(scan, textvariable=self.wdm_comb_var, width=20)
+        comb.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        for row, port in enumerate(INPUTS, start=1):
+            ttk.Label(scan, text=f"In {port}", foreground=WDM_COLORS[port - 1]).grid(
+                row=row, column=0, sticky="w", pady=2)
+            entry = ttk.Entry(scan, textvariable=self.wdm_wavelength_vars[port], width=12)
+            entry.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=2)
+            self.wdm_wavelength_vars[port].trace_add(
+                "write", lambda *_: (self.update_wdm_routing(), self.draw()))
+        ttk.Label(scan, text="Line window ± [nm]").grid(row=7, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(scan, textvariable=self.wdm_window_var, width=8).grid(
+            row=7, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        ttk.Label(scan, text="OSA/JDSU settling [s]").grid(row=8, column=0, sticky="w", pady=2)
+        ttk.Entry(scan, textvariable=self.wdm_settle_var, width=8).grid(
+            row=8, column=1, sticky="w", padx=(8, 0), pady=2)
+        ttk.Button(scan, text="Save six-laser configuration", command=self.save_wdm_plan).grid(
+            row=9, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(scan, text=("Evaluate Configuration always scans all six outputs using this saved plan. "
+                              "Dataset Coverage has separate batch acquisition actions."), foreground="#9baec6",
+                  wraplength=280).grid(row=10, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(scan, textvariable=self.wdm_status_var, foreground="#9baec6", wraplength=280).grid(
+            row=11, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        comb.bind("<FocusOut>", lambda _event: self.update_wdm_comb_choices())
+        self.update_wdm_routing()
 
     def choose_dataset_folder(self):
         folder = filedialog.askdirectory(parent=self, title="Choose Benes measurement dataset")
@@ -3165,6 +3417,178 @@ class BenesApp(tk.Tk):
         if not value:
             raise ValueError("Choose a dataset folder first")
         return Path(value)
+
+    def start_dataset_batch(self, scope):
+        """Scan and index either the present controls or every six-port permutation."""
+        if self.dataset_batch_running or self.wdm_running:
+            return
+        try:
+            root = self.dataset_root()
+            if not (root / "benes_dataset.json").exists():
+                raise ValueError("Initialize the dataset before filling it from hardware")
+            assignment = dict(self.wdm_plan.assignment)
+            missing_wavelengths = [str(port) for port in INPUTS if assignment[str(port)] is None]
+            if missing_wavelengths:
+                raise ValueError("Save a wavelength for every input before filling the dataset")
+            if self.osa_button.instate(["disabled"]):
+                raise RuntimeError("Wait for the current OSA trace read to finish")
+            host, port, simulate = self.osa_connection()
+            if not self.controller.connected:
+                raise RuntimeError("Connect the voltage board before filling the dataset")
+            if self.controller.settings["dry_run"] != simulate:
+                raise RuntimeError("Use the physical voltage board with the real OSA, or dry-run board with OSA Simulate")
+            switch = self.osa_output_switch
+            if not switch.connected:
+                raise RuntimeError("Connect the OSA output switch before filling the dataset")
+            for output in OUTPUTS:
+                switch.channel_for(output)
+            missing_calibration = [name for name in self.network.switches
+                                   if self.controller.settings["calibration"][name]["cross"] is None or
+                                   self.controller.settings["calibration"][name]["straight"] is None]
+            if missing_calibration:
+                raise ValueError("Calibrate every MZI before automatically applying control states")
+            batch_sizes = {"all": "720 output permutations", "states": "4096 switch states"}
+            if scope in batch_sizes and not messagebox.askyesno(
+                    f"Run all {batch_sizes[scope]}",
+                    f"This will drive and measure all {batch_sizes[scope]}, with six OSA output scans each. "
+                    "It can take a long time. Continue?", parent=self):
+                return
+        except (OSError, RuntimeError, ValueError) as error:
+            messagebox.showerror("Dataset batch unavailable", str(error), parent=self)
+            return
+
+        original_states = dict(self.network.states)
+        original_zero = set(self.zero_volt_switches)
+        if scope == "active":
+            configurations = [(self.active_dataset_permutation(), dict(self.network.states))]
+        elif scope == "all":
+            configurations = self.all_permutation_control_states()
+        else:
+            configurations = self.all_switch_control_states()
+        settings = self.wdm_plan.settings
+        comment = self.dataset_comment_var.get()
+        self.dataset_batch_running = True
+        self.dataset_batch_stop_event = threading.Event()
+        self.dataset_active_scan_button.configure(state="disabled")
+        self.dataset_all_scan_button.configure(state="disabled")
+        self.dataset_states_scan_button.configure(state="disabled")
+        self.dataset_batch_stop_button.configure(state="normal")
+        self.evaluate_button.configure(state="disabled")
+        self.set_osa_reading(True)
+        for tab in (self.route_tab, self.hardware_tab, self.calibration_tab, self.crosstalk_tab, self.impulse_tab):
+            self.set_tab_state(tab, "disabled")
+        self.dataset_metrics_table.delete(*self.dataset_metrics_table.get_children())
+        self.dataset_status_var.set(f"Preparing {len(configurations)} configuration(s) for acquisition...")
+        stop_event = self.dataset_batch_stop_event
+
+        def worker():
+            saved, error = 0, None
+            try:
+                for index, (permutation, states) in enumerate(configurations, start=1):
+                    if stop_event.is_set():
+                        break
+                    self.controller.apply_calibrated_states(states)
+                    self.network.states.update(states)
+                    self.zero_volt_switches.clear()
+                    mapping = self.network.mapping()
+                    routed = routed_wavelengths(mapping, assignment)
+                    self.after(0, lambda i=index, total=len(configurations): self.dataset_status_var.set(
+                        f"Configuration {i}/{total}: scanning six outputs..."))
+
+                    def read(output):
+                        if simulate:
+                            return simulated_comb_spectrum(assignment, routed[output][0])
+                        return osa.get_spectrum(host, port, fresh_sweeps=POST_SWITCH_SWEEPS)
+
+                    results = scan_outputs(switch, read, OUTPUTS, mapping, assignment, settings["half_window_nm"],
+                                           settings["settle_s"], stop_event=stop_event)
+                    if len(results) != len(OUTPUTS):
+                        break
+                    self.after(0, lambda p=permutation, s=dict(states), r=results:
+                               self.add_dataset_batch_metrics(p, s, r, assignment))
+                    context = {
+                        "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                        "permutation": list(permutation), "assignment": assignment,
+                        "half_window_nm": settings["half_window_nm"], "settle_s": settings["settle_s"],
+                        "switch_states": {name: "cross" if crossed else "bar" for name, crossed in states.items()},
+                        "simulated_osa": simulate, "batch_scope": scope,
+                    }
+                    folder = create_wdm_folder(app_dir())
+                    files = save_wdm_scan(folder, results, context, comment)
+                    record = save_measurement(
+                        root, source="OSA WDM", permutation=permutation, input_ports=list(INPUTS),
+                        output_ports=list(OUTPUTS), mode="routed_pairs", files=files, comment=comment,
+                        extra={"results_folder": str(folder), "batch_scope": scope})
+                    save_wdm_scan(record, results, context, comment)
+                    saved += 1
+            except Exception as error_value:
+                error = str(error_value)
+            finally:
+                try:
+                    self.controller.apply_calibrated_states(original_states)
+                except Exception as restore_error:
+                    error = error or f"Could not restore the original control state: {restore_error}"
+                self.network.states.update(original_states)
+                self.zero_volt_switches = original_zero
+            self.after(0, lambda: self.finish_dataset_batch(saved, len(configurations), error, stop_event.is_set()))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def all_permutation_control_states(self):
+        """One valid MZI state map for each of the 720 output permutations."""
+        configurations = {}
+        names = tuple(self.network.switches)
+        for bits in product((False, True), repeat=len(names)):
+            states = dict(zip(names, bits))
+            configurations.setdefault(tuple(output + 1 for output in self.network.mapping(states)), states)
+        return sorted(configurations.items())
+
+    def all_switch_control_states(self):
+        """Every one of the 2**12 physical MZI bar/cross configurations."""
+        names = tuple(self.network.switches)
+        return [(tuple(output + 1 for output in self.network.mapping(states)), states)
+                for bits in product((False, True), repeat=len(names))
+                for states in (dict(zip(names, bits)),)]
+
+    def add_dataset_batch_metrics(self, permutation, states, results, assignment):
+        """Append normalized per-wavelength metrics for one measured switch state."""
+        fmt = lambda value: "—" if value is None else f"{value:.2f}"
+        state = " ".join(f"{name}={'X' if states[name] else '='}" for name in self.network.switches)
+        mapping = tuple(output - 1 for output in permutation)
+        for item in evaluate_configuration(results, mapping, assignment):
+            crosstalk = ["—" if port == item.expected_output else fmt(
+                None if item.normalized_crosstalk.get(port) is None else item.normalized_crosstalk[port] * 100)
+                         for port in OUTPUTS]
+            self.dataset_metrics_table.insert("", "end", values=(
+                state, " ".join(map(str, permutation)), f"In {item.input_port}", f"{item.wavelength_nm:.3f}",
+                fmt(item.total_power_dbm), f"Out {item.expected_output}",
+                fmt(None if item.normalized_transmission is None else item.normalized_transmission * 100),
+                *crosstalk))
+
+    def stop_dataset_batch(self):
+        if self.dataset_batch_stop_event is not None:
+            self.dataset_batch_stop_event.set()
+            self.dataset_status_var.set("Stopping after the current OSA output...")
+
+    def finish_dataset_batch(self, saved, total, error, stopped):
+        self.dataset_batch_running = False
+        self.dataset_batch_stop_event = None
+        self.dataset_active_scan_button.configure(state="normal")
+        self.dataset_all_scan_button.configure(state="normal")
+        self.dataset_states_scan_button.configure(state="normal")
+        self.dataset_batch_stop_button.configure(state="disabled")
+        self.evaluate_button.configure(state="normal")
+        self.set_osa_reading(False)
+        for tab in (self.route_tab, self.hardware_tab, self.calibration_tab, self.crosstalk_tab, self.impulse_tab):
+            self.set_tab_state(tab, "normal")
+        self.refresh(keep_selection=True)
+        if error:
+            self.dataset_status_var.set(f"Dataset batch failed after {saved}/{total} configuration(s): {error}")
+            messagebox.showerror("Dataset batch failed", error, parent=self)
+        else:
+            state = "stopped" if stopped else "complete"
+            self.dataset_status_var.set(f"Dataset batch {state}: recorded {saved}/{total} configuration(s).")
+        self.analyze_linked_dataset()
 
     def initialize_dataset(self, scope):
         try:
@@ -3286,6 +3710,9 @@ class BenesApp(tk.Tk):
             return
         if self.wdm_running:
             messagebox.showinfo("WDM scan in progress", "Stop the WDM scan and wait for it to finish first.", parent=self)
+            return
+        if self.dataset_batch_running:
+            messagebox.showinfo("Dataset batch in progress", "Stop the dataset batch and wait for it to finish first.", parent=self)
             return
         if self.mzi_calibration_running:
             messagebox.showinfo("Calibration in progress",
@@ -3611,7 +4038,8 @@ class BenesApp(tk.Tk):
     def refresh(self, keep_selection=False):
         if not keep_selection:
             self.selected_route = 0
-        self.routes = self.network.routes(self.source, self.destination)
+        self.routes = ([] if self.source is None or self.destination is None
+                       else self.network.routes(self.source, self.destination))
         self.route_list.delete(0, "end")
         for index, route in enumerate(self.routes):
             states = "  ".join(f"{name}={'X' if crossed else '='}" for name, crossed in route.states)
@@ -3619,12 +4047,20 @@ class BenesApp(tk.Tk):
         if self.routes:
             self.route_list.selection_set(self.selected_route)
             self.route_list.see(self.selected_route)
-        self.route_label.configure(text=f"{len(self.routes)} possible paths · = straight, X cross, 0V unbiased (routes as cross; click a switch to cycle) · switches omitted from a path are unconstrained")
+        if self.source is None or self.destination is None:
+            route_text = "No path selected. Choose an input and an output to explore paths."
+        else:
+            route_text = (f"{len(self.routes)} possible paths · = straight, X cross, 0V unbiased "
+                          "(routes as cross; click a switch to cycle) · switches omitted from a path are unconstrained")
+        self.route_label.configure(text=route_text)
         mapping = self.network.mapping()
         self.mapping_label.configure(text="CURRENT CONNECTIONS    " + "     ".join(f"{i + 1} → {out + 1}" for i, out in enumerate(mapping)))
         self.update_wdm_routing()
-        current = mapping[self.source] + 1
-        self.status.configure(text=f"Input {self.source + 1} currently reaches output {current}   •   Exploring output {self.destination + 1}")
+        if self.source is None or self.destination is None:
+            self.status.configure(text="No path selected. Click an input and output, or choose None to clear either selection.")
+        else:
+            current = mapping[self.source] + 1
+            self.status.configure(text=f"Input {self.source + 1} currently reaches output {current}   •   Exploring output {self.destination + 1}")
         self.update_hardware_status()
         self.draw()
 
@@ -3721,7 +4157,7 @@ class BenesApp(tk.Tk):
                 c.tag_bind(tag, "<Enter>", lambda event: c.configure(cursor="hand2"))
                 c.tag_bind(tag, "<Leave>", lambda event: c.configure(cursor=""))
 
-        current = self.network.trace(self.source, display_states)
+        current = None if self.source is None else self.network.trace(self.source, display_states)
         wdm = self.wdm_routes()
         wdm_ends = {}
         for row, wavelength, color in wdm:
@@ -3739,7 +4175,7 @@ class BenesApp(tk.Tk):
                           text=(f"Equivalent permutation routing {self.selected_permutation_route + 1} / "
                                 f"{len(self.permutation_route_states)} · preview only"),
                           fill=ACCENT, font=font_normal)
-        elif not self.routes and (self.source, "in") not in wdm_ends:
+        elif current is not None and not self.routes and (self.source, "in") not in wdm_ends:
             for points in self.crosstalk_points(current, self.right_x - 18,
                                                 self.xs, self.ys, self.switch_half):
                 c.create_line(*points, fill=ACCENT, width=1.5, dash=(3, 4),
@@ -3752,7 +4188,7 @@ class BenesApp(tk.Tk):
                     self.draw_route(route, COLORS[index % len(COLORS)], 2, dashed=True)
             self.draw_route(self.routes[self.selected_route], ACCENT, 4)
             c.create_text(width / 2, height - 12, text=f"Preview: path {self.selected_route + 1} in green · broad dashes show alternatives · thin dashes show crosstalk", fill=ACCENT, font=("Segoe UI", 10))
-        elif not previewing_permutation:
+        elif not previewing_permutation and current is not None:
             # A wide green halo keeps the selected input visible beneath its comb-line colour.
             self.draw_route(current, ACCENT, 9 if (self.source, "in") in wdm_ends else 4)
             for row, _, color in wdm:

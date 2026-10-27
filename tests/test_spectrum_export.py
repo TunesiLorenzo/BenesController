@@ -2,8 +2,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from calibration_scan import ScanPoint, SpectrumScanPoint
-from spectrum_export import write_crosstalk_csv, write_spectra
+from benes.measurements.calibration_scan import ScanPoint, SpectrumScanPoint
+from benes.measurements.spectrum_export import write_crosstalk_csv, write_spectra
 
 
 class SpectrumExportTests(unittest.TestCase):

@@ -5,7 +5,7 @@ import time
 import unittest
 from pathlib import Path
 
-from impulse_test import (plot_trace_samples, received_pair_rate, run_impulse_test,
+from benes.measurements.impulse_test import (plot_trace_samples, received_pair_rate, run_impulse_test,
                           validate_impulse_settings, write_impulse_csv)
 
 

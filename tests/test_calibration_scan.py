@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from calibration_scan import (scan_switch, scan_switches, scan_switches_with_reader,
+from benes.measurements.calibration_scan import (scan_switch, scan_switches, scan_switches_with_reader,
                               scan_voltages, spectrum_scan_point)
 
 
@@ -46,7 +46,7 @@ class CalibrationScanTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "larger step"):
             scan_voltages(-10, 10, 0.01)
 
-    @patch("calibration_scan.time.sleep")
+    @patch("benes.measurements.calibration_scan.time.sleep")
     def test_scan_reads_each_point_and_restores_voltage(self, _sleep):
         controller = FakeController()
         points = scan_switch(controller, FakeMeter(), "S1.1", [0, 1, 2], 0.01)
@@ -54,14 +54,14 @@ class CalibrationScanTests(unittest.TestCase):
         self.assertEqual(controller.sent, [0, 1, 2, 2.75])
         self.assertEqual(controller.settings["voltage"]["S1.1"], 1.25)
 
-    @patch("calibration_scan.time.sleep")
+    @patch("benes.measurements.calibration_scan.time.sleep")
     def test_scan_restores_voltage_after_meter_failure(self, _sleep):
         controller = FakeController()
         with self.assertRaisesRegex(OSError, "meter disconnected"):
             scan_switch(controller, FakeMeter(fail=True), "S1.1", [0, 1], 0)
         self.assertEqual(controller.sent, [0, 1, 2.75])
 
-    @patch("calibration_scan.time.sleep")
+    @patch("benes.measurements.calibration_scan.time.sleep")
     def test_sequential_scans_reset_each_switch_to_zero(self, _sleep):
         controller = FakeController()
         controller.settings["mapping"]["S1.2"] = 4
@@ -69,7 +69,7 @@ class CalibrationScanTests(unittest.TestCase):
         self.assertEqual(controller.sent, [-1, 1, 0, -1, 1, 0])
         self.assertEqual([p.power for p in points["S1.2"]], [3, 4])
 
-    @patch("calibration_scan.time.sleep")
+    @patch("benes.measurements.calibration_scan.time.sleep")
     def test_sequential_scan_resets_active_switch_on_failure(self, _sleep):
         controller = FakeController()
         controller.settings["mapping"]["S1.2"] = 4
@@ -77,7 +77,7 @@ class CalibrationScanTests(unittest.TestCase):
             scan_switches(controller, FakeMeter(fail=True), ["S1.1", "S1.2"], [-1, 1], 0)
         self.assertEqual(controller.sent, [-1, 1, 0, 0])
 
-    @patch("calibration_scan.time.sleep")
+    @patch("benes.measurements.calibration_scan.time.sleep")
     def test_osa_reader_keeps_full_spectrum_and_resets_switch(self, _sleep):
         controller = FakeController()
         results = scan_switches_with_reader(

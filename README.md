@@ -34,7 +34,7 @@ the Arduino sampler from the voltage-board signal and check the heater current
 limit.
 
 The UI is organized by workflow: **Routing**, **Hardware & OSA**, **MZI
-calibration**, **Crosstalk scans**, and **Impulse test**. Hardware & OSA separates the voltage board, OSA
+calibration**, **Thermal crosstalk**, and **Impulse test**. Hardware & OSA separates the voltage board, OSA
 and its output selector, and Arduino meter into sub-tabs so every control remains
 visible on a laptop display.
 
@@ -91,24 +91,30 @@ and verifies the channel with `CLOSE?`, as in the sister `Jdsu_switch` project.
 After each switch move, reads wait for the OSA to finish two new sweeps (the first may have begun before the move); if the OSA was stopped, the read starts it and waits for that one sweep. A trace therefore never contains light from the previous output, whatever the sweep time. Settings and the mapping persist in `benes_osa_output_switch_config.json`.
 Physical mode needs NI-VISA and `python -m pip install pyvisa`.
 
-### WDM comb plan and output scan
+### Six-laser configuration evaluation
 
-The **WDM comb** tab records which comb wavelength enters each input. Type a
-wavelength per input, or list the comb grid under **Comb lines** and pick from
-each input's dropdown; an input left empty carries no line. Beside each input the
-tab shows the output and fiber it currently reaches, and the routing tab lists
+**Dataset coverage** holds the saved six-laser wavelengths, line window and
+OSA/JDSU settling delay. **Evaluate Configuration** on the **Routing** tab
+always scans all six output ports using that persisted configuration. Its result
+window overlays the six spectra and includes a table for every wavelength:
+linear-sum power across all outputs, expected routed output, transmission at
+that output, and crosstalk at each other output in dBc.
+
+The saved plan records which comb wavelength enters each input. Configure the
+wavelengths under **Dataset coverage**; an input left empty carries no line. The
+routing tab lists
 every `λ: In → Out` pair, both following the applied permutation. **Save plan**
 keeps the plan in `benes_wdm_plan_config.json`; **Saved wavelength plans** stores
 named plans to load later.
 
-**Start scan** routes the JDSU to each selected output, waits the **Settling
-delay**, reads the OSA (Hardware & OSA settings; **Simulate** gives a synthetic
+**Evaluate Configuration** routes the JDSU to all six outputs, waits the saved
+**Settling delay**, reads the OSA (Hardware & OSA settings; **Simulate** gives a synthetic
 comb) and measures every assigned comb line within **Line window ±** of its
 wavelength. The delay should cover the switch settling and at least one complete
 OSA sweep, so a trace holds no light from the previous output; the JDSU's own
 settle check and its extra delay from **Selector setup…** still run first.
-**Stop** ends the scan after the current wait or read and still saves the outputs
-measured so far.
+The separate Dataset Coverage batch controls can be stopped after the current
+output and still save completed configurations.
 
 The table lists, per output, the routed input and wavelength, the routed line's
 peak power and wavelength, the linear mean over the window, and the isolation:
@@ -120,8 +126,14 @@ saved in `Results/WDM_scan/<timestamp>/`:
 - `wdm_spectra.csv`: all spectra.
 - `wdm_scan.json`: permutation, wavelength plan, delays, JDSU map, switch states and voltages.
 
-With **Also record in the linked dataset**, the same files are also registered as
-an `OSA WDM` measurement in the dataset chosen in **Dataset coverage**.
+**Dataset Coverage** has separate actions to scan the active control state or
+to run all 720 output permutations. Each action records the six routed pairs in
+the linked dataset and restores the original control state when it finishes.
+**Run all 4096 switch states** additionally measures every one of the 12-MZI
+bar/cross configurations, including configurations that realize the same output
+permutation. The live metrics table has one row per state and input wavelength:
+total line power over the six outputs, normalized expected-port transmission,
+and normalized crosstalk at the other outputs.
 
 ## Permutation measurement datasets
 
@@ -259,7 +271,7 @@ used for each scanned switch. Runs saved before R total was recorded plot as
 V²/R. The voltage board has no readback, so power is computed from the
 commanded voltage, not measured.
 
-The **Crosstalk** tab can scan several switches in sequence. Select switches
+The **Thermal crosstalk** tab can scan several switches in sequence. Select switches
 with Ctrl or Shift, choose **Arduino** or **OSA**, enter the lower and upper
 voltage limits, step, and settling time, then start the scan. Arduino readings
 are burst averages. For OSA scans, each voltage produces a spectrum after the
@@ -278,7 +290,7 @@ Before starting a crosstalk scan, choose the input and destination in **Route
 explorer**. You can also mark the output ports connected to the **Power Meter**
 and **OSA** with separate colored rings. These port selections and the current
 switch states are saved with each scan. Enter an optional scan comment in the
-**Crosstalk** tab. The application automatically creates
+**Thermal crosstalk** tab. The application automatically creates
 `Results/Crosstalk_scan/Port{input}-Port{output}_{dateTime}/` and saves
 `base_setting.json`, a compact `base_path.png` diagram, one PNG plot per
 measured switch, and `crosstalk_dataset.csv` with the comment. The folder uses
@@ -297,11 +309,17 @@ predates them. **Export CSV with comment** re-exports the loaded dataset.
 ### Six-laser MZI calibration
 
 The **MZI calibration** tab assumes a laser on every input, each at its own
-wavelength from the **WDM comb** plan. Whatever the switch states, every MZI then
+wavelength from the saved six-laser plan. Whatever the switch states, every MZI then
 carries two distinguishable lines, so no fibers need moving between steps. The
 OSA reads one output at a time through the JDSU switch. For any MZI, two outputs
 receive a different input's line depending on its state, and the power of those
 two lines there gives the MZI's state. MZIs not being swept stay at 0 V (cross).
+
+Use **Read OSA + detect six channels** when all six laser lines are visible in
+the OSA trace. It finds the six strongest distinct peaks, saves them into the
+WDM comb plan, and assigns them by wavelength: highest wavelength to Input 1
+and lowest to Input 6. It reports an error instead of changing the plan unless
+all six peaks are distinct and prominent.
 
 - **Sweep selected MZI** (single MZI): sweeps one MZI while watching one of its two
   outputs (**Auto** picks one that sees both lines). Cross is the voltage where the

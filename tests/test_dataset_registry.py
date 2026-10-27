@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from dataset_registry import analyze_dataset, connection_pairs, create_dataset, save_measurement
+from benes.measurements.dataset_registry import analyze_dataset, connection_pairs, create_dataset, save_measurement
 
 
 class DatasetRegistryTests(unittest.TestCase):

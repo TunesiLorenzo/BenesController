@@ -1,7 +1,7 @@
 import unittest
 from itertools import product
 
-from network import BenesNetwork
+from benes.core.network import BenesNetwork
 
 
 class NetworkTests(unittest.TestCase):

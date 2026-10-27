@@ -22,3 +22,7 @@ Thumbs.db
 /benes_power_meter_config.json
 /benes_voltage_config.json
 *.log
+
+
+#folders
+Results/

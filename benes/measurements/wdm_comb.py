@@ -20,10 +20,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from osa import trim_spurious_tail
-from osa_output_switch import fiber_number
-from spectrum_export import write_spectra
-from voltage_controller import app_dir
+from benes.hardware.osa import trim_spurious_tail
+from benes.hardware.osa_output_switch import fiber_number
+from benes.measurements.spectrum_export import write_spectra
+from benes.hardware.voltage_controller import app_dir
 
 INPUTS = tuple(range(1, 7))
 WDM_SUBFOLDER = "WDM_scan"
@@ -208,6 +208,59 @@ class WDMOutputResult:
         if self.signal is None or not others:
             return None
         return self.signal.peak_dbm - max(others)
+
+
+@dataclass(frozen=True)
+class ConfigurationLineResult:
+    """Six-port result for one input laser wavelength."""
+
+    input_port: int
+    wavelength_nm: float
+    expected_output: int
+    total_power_dbm: float | None
+    transmission_dbm: float | None
+    # Expected-port power divided by total power of this wavelength over all outputs.
+    normalized_transmission: float | None
+    # Output -> power relative to the expected-port transmission, in dBc.
+    crosstalk_dbc: dict[int, float | None]
+    # Output -> power divided by total power of this wavelength over all outputs.
+    normalized_crosstalk: dict[int, float | None]
+
+
+def evaluate_configuration(results: list[WDMOutputResult], mapping, assignment: dict) -> list[ConfigurationLineResult]:
+    """Summarise a six-output WDM scan by wavelength/input.
+
+    Total power is the linear sum of the measured line peak at every output.
+    Crosstalk is reported relative to the line at its expected routed output.
+    """
+    by_output = {result.output: result for result in results}
+    summary = []
+    for input_port in INPUTS:
+        wavelength_nm = assignment.get(str(input_port))
+        if wavelength_nm is None:
+            continue
+        expected_output = int(mapping[input_port - 1]) + 1
+        signal = by_output.get(expected_output)
+        expected_line = None if signal is None else signal.lines.get(input_port)
+        transmission_dbm = None if expected_line is None else expected_line.peak_dbm
+        output_powers = {result.output: line.peak_dbm for result in results
+                         if (line := result.lines.get(input_port)) is not None}
+        total_mw = sum(10 ** (power / 10) for power in output_powers.values())
+        total_power_dbm = 10 * math.log10(total_mw) if total_mw else None
+        normalized_transmission = (10 ** (transmission_dbm / 10) / total_mw
+                                   if transmission_dbm is not None and total_mw else None)
+        crosstalk_dbc = {}
+        normalized_crosstalk = {}
+        for output, result in by_output.items():
+            line = result.lines.get(input_port)
+            crosstalk_dbc[output] = (None if output == expected_output or line is None or transmission_dbm is None
+                                     else line.peak_dbm - transmission_dbm)
+            normalized_crosstalk[output] = (None if output == expected_output or line is None or not total_mw
+                                            else 10 ** (line.peak_dbm / 10) / total_mw)
+        summary.append(ConfigurationLineResult(
+            input_port, float(wavelength_nm), expected_output, total_power_dbm, transmission_dbm,
+            normalized_transmission, crosstalk_dbc, normalized_crosstalk))
+    return summary
 
 
 def simulated_comb_spectrum(assignment: dict, routed_input: int, points: int = 4001) -> tuple[list, list]:

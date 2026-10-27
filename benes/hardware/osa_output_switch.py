@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from voltage_controller import app_dir
+from benes.hardware.voltage_controller import app_dir
 
 OUTPUTS = tuple(range(1, 7))
 JDSU_CHANNELS = tuple(range(1, 17))

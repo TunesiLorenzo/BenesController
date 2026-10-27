@@ -6,7 +6,7 @@ import math
 import time
 from dataclasses import dataclass, field
 
-import osa
+from benes.hardware import osa
 
 
 @dataclass(frozen=True)

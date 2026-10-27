@@ -2,12 +2,19 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from benes_gui import BenesApp
-from network import BenesNetwork
-from impulse_test import validate_impulse_settings
+from benes.gui.app import BenesApp
+from benes.core.network import BenesNetwork
+from benes.measurements.impulse_test import validate_impulse_settings
 
 
 class PathProgressTests(unittest.TestCase):
+    def test_all_switch_control_states_covers_every_12_bit_configuration(self):
+        app = SimpleNamespace(network=BenesNetwork())
+        configurations = BenesApp.all_switch_control_states(app)
+        self.assertEqual(len(configurations), 2 ** 12)
+        self.assertEqual(len({tuple(states.values()) for _, states in configurations}), 2 ** 12)
+        self.assertEqual(len({permutation for permutation, _ in configurations}), 720)
+
     def test_crosstalk_branches_use_other_port_and_follow_downstream_switches(self):
         network = BenesNetwork()
         app = SimpleNamespace(network=network)
@@ -40,8 +47,8 @@ class PathProgressTests(unittest.TestCase):
             impulse_switch_var=SimpleNamespace(get=lambda: "S1.1"),
             controller=SimpleNamespace(connected=False),
         )
-        with patch("benes_gui.validate_impulse_settings", wraps=validate_impulse_settings) as validate, \
-                patch("benes_gui.messagebox.showerror") as error:
+        with patch("benes.gui.app.validate_impulse_settings", wraps=validate_impulse_settings) as validate, \
+                patch("benes.gui.app.messagebox.showerror") as error:
             BenesApp.start_impulse(app, "single")
         validate.assert_called_once_with("single", 0, 2, lead_in_s=0.001,
                                          pulse_s=0.05, measure_s=0.2)
@@ -50,7 +57,7 @@ class PathProgressTests(unittest.TestCase):
     def test_unsafe_voltage_prompt_names_arduino_and_heater_limit(self):
         app = SimpleNamespace(_approved_unsafe_voltages=set())
         app._ask_on_main_thread = lambda *args, **kwargs: BenesApp._ask_on_main_thread(app, *args, **kwargs)
-        with patch("benes_gui.messagebox.askyesno", return_value=True) as ask:
+        with patch("benes.gui.app.messagebox.askyesno", return_value=True) as ask:
             self.assertTrue(BenesApp.confirm_unsafe_voltage(app, "S1.1", 6.0))
         self.assertIn("Arduino sampler", ask.call_args.args[1])
         self.assertIn("heater overcurrent limit", ask.call_args.args[1])
@@ -59,7 +66,7 @@ class PathProgressTests(unittest.TestCase):
     def test_sweep_refuses_break_density_and_warns_once_above_safe(self):
         import tempfile
         from pathlib import Path
-        from voltage_controller import BenesVoltageController
+        from benes.hardware.voltage_controller import BenesVoltageController
 
         with tempfile.TemporaryDirectory() as directory:
             controller = BenesVoltageController(("S1.1",), Path(directory) / "config.json")
@@ -67,7 +74,7 @@ class PathProgressTests(unittest.TestCase):
             app = SimpleNamespace(controller=controller, _approved_over_safe=set(),
                                   _approved_unsafe_voltages=set())
             # Safe 5 V, break 7 V.
-            with patch("benes_gui.messagebox.askyesno", return_value=True) as ask:
+            with patch("benes.gui.app.messagebox.askyesno", return_value=True) as ask:
                 with self.assertRaisesRegex(ValueError, "break current"):
                     BenesApp.confirm_voltage_sweep(app, [0, 7.0], names=["S1.1"])
                 ask.assert_not_called()

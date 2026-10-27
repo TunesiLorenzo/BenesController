@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from osa_output_switch import OSAOutputSwitch
+from benes.hardware.osa_output_switch import OSAOutputSwitch
 
 
 class FakeJDSU:

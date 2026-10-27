@@ -2,8 +2,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from voltage_controller import BenesVoltageController
-from network import BenesNetwork
+from benes.hardware.voltage_controller import BenesVoltageController
+from benes.core.network import BenesNetwork
 
 
 class FakeBoard:
@@ -84,7 +84,7 @@ class VoltageControllerTests(unittest.TestCase):
             restored.set_heater_resistances({3: "-5"}, "")
 
     def test_total_resistance_sets_current_and_heater_power_and_limits(self):
-        from heater_setup import HeaterDevice
+        from benes.core.heater_setup import HeaterDevice
 
         controller = self.controller()
         controller.set_mapping({"S1.1": 3, "S1.2": 5})
