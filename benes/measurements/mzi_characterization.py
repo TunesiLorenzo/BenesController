@@ -254,17 +254,38 @@ def _extreme(points, value, highest, tie):
     return min(close, key=lambda point: (abs(point.voltage), -value(point) if highest else value(point)))
 
 
+def fitted_extremes(fit, xs, points):
+    """The measured points nearest the fit's first maximum and first null.
+
+    Counting from the sweep start, an extreme already passed by less than
+    π/2 is still the first one; the start point is then the best reachable.
+    """
+    measured = [(x, point) for x, point in zip(xs, points) if point.power is not None]
+    start, stop = min(x for x, _ in measured), max(x for x, _ in measured)
+    start_phase = fit.phase(start)
+    chosen = []
+    for offset in (0.0, math.pi):
+        turns = math.ceil((start_phase - math.pi / 2 - offset) / (2 * math.pi))
+        target = (offset + 2 * math.pi * turns - fit.phase0) / fit.phase_per_x
+        target = min(max(target, start), stop)
+        chosen.append(min(measured, key=lambda item: (abs(item[0] - target), item[0]))[1])
+    return tuple(chosen)
+
+
 def extract_calibration(probe, points, xs, unit="mW", x_unit="mW",
                         min_extinction_db=DEFAULT_MIN_EXTINCTION_DB) -> MZISweep:
     """Bright and dark extremes become cross/bar by the probe's bright state.
 
-    With a reference line (OSA) the contrast between the two lines decides;
-    otherwise the probed power alone. Near-equal extremes resolve to the
-    lowest voltage, so a sweep past 2π keeps the first maximum or null.
+    Power is flat around its extremes, so a good cos² fit of the probed power
+    places the first maximum and null. Otherwise the data decide: with a
+    reference line (OSA) the contrast between the two lines, else the power,
+    with near-equal points resolved to the lowest voltage.
     """
     points = tuple(points)
+    fit = fit_mzi_response(xs, [point.power for point in points], x_unit)
     with_contrast = [point for point in points if point.contrast_db is not None]
-    if len(with_contrast) >= 2 and len(with_contrast) == len([p for p in points if p.power is not None]):
+    contrast = len(with_contrast) >= 2 and len(with_contrast) == len([p for p in points if p.power is not None])
+    if contrast:
         measured, value, tie = with_contrast, (lambda point: point.contrast_db), 0.5
         extinction = max(map(value, measured)) - min(map(value, measured))
     else:
@@ -278,10 +299,12 @@ def extract_calibration(probe, points, xs, unit="mW", x_unit="mW",
     if extinction < min_extinction_db:
         raise ValueError(f"{probe.name}: only {extinction:.1f} dB change at output {probe.output + 1}; "
                          f"check that input {probe.input + 1} is lit and the detector is on that output")
-    bright = _extreme(measured, value, True, tie)
-    dark = _extreme(measured, value, False, tie)
+    if fit is not None and fit.rms < 0.05 * fit.amplitude:
+        bright, dark = fitted_extremes(fit, xs, points)
+    else:
+        bright = _extreme(measured, value, True, tie)
+        dark = _extreme(measured, value, False, tie)
     cross, bar = (bright, dark) if probe.bright_crossed else (dark, bright)
-    fit = fit_mzi_response(xs, [point.power for point in points], x_unit)
     return MZISweep(probe, points, cross, bar, extinction, fit, unit)
 
 

@@ -373,66 +373,110 @@ range-change rescans. The **X axis** toggle works on loaded results. It uses
 the heater resistances stored with the run, or the current ones when the run
 predates them. **Export CSV with comment** re-exports the loaded dataset.
 
-### One-source Arduino MZI calibration
+### MZI calibration
 
-For a single connected laser, use **Arduino · one connected source** in the
-MZI calibration tab. Select the actual input and the output physically patched
-to the Arduino optical detector. Connect the physical voltage board and Arduino
-meter in **Hardware & OSA**. The MZI picker lists only switches whose cross/bar
-states change the measured power at that output while every other MZI is held
-at 0 V. **Sweep selected MZI with Arduino** measures one; **Calibrate reachable
-MZIs** measures all listed switches. A single input and fixed detector output
-cannot illuminate and observe every MZI, so change the input or detector output
-and repeat for the others.
+Every MZI is calibrated with a *probe*: one lit input, one read output, and
+fixed states for the other MZIs, chosen so that the probed input's light
+reaches that output in only one of the MZI's states (bright) and leaves
+elsewhere in the other (dark). The other MZIs are cross at 0 V while
+uncalibrated. Once an MZI is calibrated, the plan may hold it at its bar
+voltage so that the detector can see more MZIs.
 
-Each point uses the Arduino's configured burst-average reading. The calibration
-rejects saturated readings and optical swings below 2 ADC counts. It saves the
-bright and dark extrema as cross and bar according to the selected input/output
-path, then resets all MZIs to 0 V even on Stop or an error. Results are saved
-under `Results/MZI_calibration/` as JSON, CSV, and a power plot; the JSON records
-the selected ports, detector settings, and whether voltages were saved.
+Choose the detection method under **Detection** in the MZI calibration tab:
 
-### Six-laser MZI calibration
+- **OSA · all lasers on**: every input carries its own line from the saved
+  six-laser plan. The JDSU selects the output and the OSA measures the probed
+  input's line there, with the line that arrives in the other state as a
+  reference. Every output is reachable through the JDSU.
+- **Power meter · one laser at a time**: the Newport 9016 lights one input at a
+  time, so the meter reading comes only from the probed input. This is much
+  faster than the OSA. Choose **HP 8152A** (settings in Thermal crosstalk) or
+  **Arduino** (settings in Hardware & OSA). Choose where the meter is connected:
+  **JDSU common (any output)**, or a fixed **Output n**. Each input has its own
+  Newport slot. The bays are reversed by default (slot 1 feeds input 6, slot 6
+  feeds input 1). **Laser settle** is the wait after a laser turns on. The
+  previous laser is always switched off before the next one turns on. All
+  mapped TECs must be on. When the run ends, the lasers return to the on/off
+  states they had before it started. The slot map and the settle time are
+  stored in `benes_laser_bank_config.json`.
 
-The **MZI calibration** tab assumes a laser on every input, each at its own
-wavelength from the saved six-laser plan. Whatever the switch states, every MZI then
-carries two distinguishable lines, so no fibers need moving between steps. The
-OSA reads one output at a time through the JDSU switch. For any MZI, two outputs
-receive a different input's line depending on its state, and the power of those
-two lines there gives the MZI's state. MZIs not being swept stay at 0 V (cross).
+The **Calibrate** box and the **Probe** column of the MZIs table update whenever
+these settings change. They show which MZIs are visible and how each one is
+probed, for example `In 1 → Out 5, bright when cross; S2.1 at bar`. For an MZI
+that cannot be seen, they show where to move the detector. A fixed output sees
+8–10 MZIs: a last-stage MZI only reaches its own two outputs. Through the JDSU,
+all 12 MZIs are visible at 0 V. The diagram previews the selected probe: the lit
+path, dashes for the other state, `=` on MZIs held at bar, and a yellow ring on
+the read output.
 
-Use **Detect six lasers (1550–1560 nm)** when all six laser lines are visible.
-It scans the mapped OSA outputs, finds prominent peaks within 1550–1560 nm,
-saves them into the WDM comb plan, and assigns them by wavelength: highest to
-Input 1 and lowest to Input 6. It reports an error instead of changing the plan
-unless all six peaks are distinct and prominent.
+**Sweep selected MZI** sweeps one MZI; **Save the voltages found** stores the
+result. **Calibrate all visible MZIs** works in rounds. Each round sweeps every
+MZI that is visible with the MZIs calibrated so far. Probes are grouped by
+input and output, so lasers and the JDSU change as little as possible.
+With the OSA method, **Then check all-cross and all-bar** finishes with both
+calibrated state checks.
 
-- **Sweep selected MZI** (single MZI): sweeps one MZI while watching one of its two
-  outputs (**Auto** picks one that sees both lines). Cross is the voltage where the
-  cross-state line most exceeds the other line, and bar the opposite. Points
-  within 0.5 dB of an extreme count as equal, and the lowest voltage wins.
-  **Save the voltages found** stores them.
-- **Calibrate all MZIs**: checks alignment (reads all six outputs at 0 V and asks
-  before continuing if a line leaves at an unexpected output), then sweeps every
-  MZI, grouped by watched output so the JDSU moves as little as possible. It then
-  optionally checks the calibrated all-cross and all-bar states.
-- **Alignment check (all 0 V)** and **Check routed states** read all outputs and
-  grade every MZI: its margin is the expected line minus the other line at its
-  outputs. *State OK* means at least the **Pass margin**; *wrong state* means the
-  lines are swapped by at least that margin. Routed states applies the Routing
-  tab's states with their saved voltages and leaves them applied. Every other
-  action returns all MZIs to 0 V, also after **Stop** or an error.
+Each sweep is fitted with T = offset + A·(1 + cos(π·x/x_π + φ₀))/2. Here x is
+the heater power (V² when the heater resistance is unknown). Power changes
+little near a maximum or a null, so a good fit sets cross and bar: the measured
+points nearest the first maximum and the first null. A sweep that runs past 2π
+therefore never picks the second extreme. When the fit is poor, the extremes
+come from the data: the two-line contrast for the OSA, or the power for a
+meter. Near-equal points then resolve to the lowest voltage. An MZI whose
+reading changes by less than 3 dB is rejected. This usually means the wrong
+input is lit or the detector is on the wrong output. Every MZI returns to 0 V at
+the end, also after **Stop** or an error. Runs are saved in the dataset's
+`calibration/` folder (an initialized dataset is required) as
+`mzi_calibration.json` (probe, voltages, extinction and fit per MZI),
+`mzi_sweeps.csv` and one plot per MZI.
 
-The diagram shows each laser's expected path in its input colour, with dashes
-where the swept MZI would send its lines in the other state. It also shows each
-MZI's status colour and margin, a blue ring on the output being read, a yellow
-ring on the watched output, and each output's strongest measured line. Tables
-list per-MZI voltages and margins and the latest output × input line matrix.
-Sweeps are plotted per MZI. Each run is saved in `Results/MZI_calibration/<time>_<kind>/`
-(`mzi_calibration.json`, `mzi_sweeps.csv`, `output_readouts.csv`,
-`readout_spectra.csv`). For a rehearsal without hardware, use a dry-run voltage
-board, a dry-run JDSU and OSA **Simulate**: a simulated chip with cos² MZIs
-answers.
+**Detect six lasers (1550–1560 nm)** scans the mapped OSA outputs, finds six
+distinct prominent peaks and saves them into the WDM plan by wavelength: the
+highest goes to Input 1 and the lowest to Input 6.
+
+**Alignment check (all 0 V)** and **Check routed states** use the OSA method
+with all lasers on. They read all outputs and grade every MZI: its margin is
+the expected line minus the other line at its outputs. *State OK* means at
+least the **Pass margin**; *wrong state* means the lines are swapped by at
+least that margin. Routed states leaves the Routing tab's states applied.
+These checks save `state_checks.json`, `output_readouts.csv` and
+`readout_spectra.csv`.
+
+For a rehearsal without hardware, use a dry-run voltage board. The OSA method
+also needs OSA **Simulate** and a dry-run JDSU. A simulated chip answers. It
+has cos² MZIs, a laser per input that can be switched on and off, and thermal
+crosstalk between neighbouring heaters.
+
+### Thermal crosstalk matrix
+
+**Crosstalk matrix (automatic)** in the Thermal crosstalk tab uses the detection
+method chosen in the MZI calibration tab. It also uses the voltage limits, step
+and settle time of the manual scan above it. Select aggressors and victims, then
+press **Plan** to see which pairs can be measured. A pair cannot be measured when
+every probe of the victim passes through the aggressor, because the aggressor
+would then switch the light itself. For each victim the app:
+
+1. applies a probe whose lit path avoids the aggressors, holding at most two
+   calibrated MZIs at bar;
+2. sweeps the victim, fits its cos² response, and biases it at the swept point
+   nearest quadrature;
+3. sweeps each aggressor. **Path reference sweep** (on by default) first repeats
+   that aggressor sweep with the victim at its bright extreme, where the victim
+   is insensitive to phase. Dividing by this reference removes the aggressor's
+   heating of the other MZIs on the path, and doubles the aggressor sweeps.
+
+The fit turns the victim's power into a phase shift. κ is the slope of that
+phase shift against aggressor heater power, divided by the victim's own phase
+per heater power. It is the share of the aggressor's heater power that the
+victim effectively feels. The tab shows a live κ heatmap and one tab per victim
+with its fit, bias and phase-shift curves. Results go to
+`Results/Crosstalk_matrix/<time>_matrix/`: `crosstalk_matrix.json`,
+`crosstalk_matrix.csv` (κ, aggressor rows × victim columns),
+`crosstalk_sweeps.csv`, the heatmap, and one plot per victim. κ is reported
+only when both heaters have resistances, or both have none, so that the two
+drives are in the same unit.
+
+### Route explorer
 
 - Click an **input** to highlight its actual path and current output.
 - Thin dashed lines in the input's colour show where possible crosstalk leaves the unused port of each switch and travels through downstream switches. These paths are illustrative; their optical power is not measured by the diagram.
