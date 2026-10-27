@@ -13,11 +13,13 @@ from typing import Callable
 from benes.paths import app_dir, sibling_module_path
 
 
-# Raw optical stream: 7-bit A0 value followed by 0xC0 or 0xC1 jump status.
+# Raw optical stream: top 7 A0 bits followed by a 110bbb0J status byte carrying
+# the low 3 ADC bits and the jump flag. Older sketches always send bbb = 000.
 # The Uno's 16 MHz clock divides exactly to both rates; match the sketch's Serial.begin.
 RAW_BAUDS = (1_000_000, 2_000_000)
 RAW_FULL_SCALE = 127
 RAW_STATUS_BASE = 0xC0
+RAW_STATUS_MASK = 0xE2
 DEFAULT_JUMP_GUARD_MS = 5.0
 # The detector flattens out near 80 counts, well below the 7-bit full scale.
 DEFAULT_CEILING = 80.0
@@ -218,8 +220,10 @@ class ArduinoPowerMeter:
     def _decode_optical_frames(data: bytes) -> tuple[list[tuple[int, bool]], bytes, int]:
         """Decode optical/status frames, preserving an unfinished A0 across reads.
 
-        Returns the frames, an unfinished trailing A0 byte, and how many bytes
-        were skipped to resynchronize.
+        Optical values are 7-bit counts with the low 3 ADC bits as eighths, so
+        ceilings and scale factors keep their meaning. Returns the frames, an
+        unfinished trailing A0 byte, and how many bytes were skipped to
+        resynchronize.
         """
         frames = []
         index = 0
@@ -227,8 +231,8 @@ class ArduinoPowerMeter:
         end = len(data) - 1
         while index < end:
             optical, status = data[index], data[index + 1]
-            if optical < 0x80 and status in (RAW_STATUS_BASE, RAW_STATUS_BASE | 1):
-                frames.append((optical, bool(status & 1)))
+            if optical < 0x80 and status & RAW_STATUS_MASK == RAW_STATUS_BASE:
+                frames.append((optical + ((status >> 2) & 0b111) / 8, bool(status & 1)))
                 index += 2
             else:
                 skipped += 1

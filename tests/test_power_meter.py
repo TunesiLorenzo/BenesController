@@ -69,6 +69,14 @@ class ArduinoPowerMeterTests(unittest.TestCase):
         self.assertEqual(ArduinoPowerMeter._decode_optical_frames(bytes((5, 0xC0, 0xC1))),
                          ([(5, False)], b"", 1))
 
+    def test_optical_frames_add_the_low_adc_bits_as_eighths(self):
+        # 110bbb0J: bbb = 0b101 with and without the jump flag; 0xC2 is not a status byte.
+        pairs, tail, skipped = ArduinoPowerMeter._decode_optical_frames(
+            bytes((80, 0xD4, 80, 0xD5, 127, 0xDC, 9, 0xC2)))
+        self.assertEqual(pairs, [(80.625, False), (80.625, True), (127.875, False)])
+        self.assertEqual(tail, b"")
+        self.assertEqual(skipped, 2)
+
     def test_raw_stream_sends_no_commands_and_measures_the_pair_period(self):
         clock = SimpleNamespace(now=10.0)
 
