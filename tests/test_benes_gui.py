@@ -47,8 +47,8 @@ class PathProgressTests(unittest.TestCase):
             impulse_switch_var=SimpleNamespace(get=lambda: "S1.1"),
             controller=SimpleNamespace(connected=False),
         )
-        with patch("benes.gui.app.validate_impulse_settings", wraps=validate_impulse_settings) as validate, \
-                patch("benes.gui.app.messagebox.showerror") as error:
+        with patch("benes.gui.impulse.validate_impulse_settings", wraps=validate_impulse_settings) as validate, \
+                patch("tkinter.messagebox.showerror") as error:
             BenesApp.start_impulse(app, "single")
         validate.assert_called_once_with("single", 0, 2, lead_in_s=0.001,
                                          pulse_s=0.05, measure_s=0.2)
@@ -57,7 +57,7 @@ class PathProgressTests(unittest.TestCase):
     def test_unsafe_voltage_prompt_names_arduino_and_heater_limit(self):
         app = SimpleNamespace(_approved_unsafe_voltages=set())
         app._ask_on_main_thread = lambda *args, **kwargs: BenesApp._ask_on_main_thread(app, *args, **kwargs)
-        with patch("benes.gui.app.messagebox.askyesno", return_value=True) as ask:
+        with patch("tkinter.messagebox.askyesno", return_value=True) as ask:
             self.assertTrue(BenesApp.confirm_unsafe_voltage(app, "S1.1", 6.0))
         self.assertIn("Arduino sampler", ask.call_args.args[1])
         self.assertIn("heater overcurrent limit", ask.call_args.args[1])
@@ -74,7 +74,7 @@ class PathProgressTests(unittest.TestCase):
             app = SimpleNamespace(controller=controller, _approved_over_safe=set(),
                                   _approved_unsafe_voltages=set())
             # Safe 5 V, break 7 V.
-            with patch("benes.gui.app.messagebox.askyesno", return_value=True) as ask:
+            with patch("tkinter.messagebox.askyesno", return_value=True) as ask:
                 with self.assertRaisesRegex(ValueError, "break current"):
                     BenesApp.confirm_voltage_sweep(app, [0, 7.0], names=["S1.1"])
                 ask.assert_not_called()

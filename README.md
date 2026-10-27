@@ -10,6 +10,28 @@ No pip packages are required. Tkinter is included in the standard Windows Python
 Physical board control additionally needs the `pyserial` dependency used by the
 sibling VoltageTuner project.
 
+## Project layout
+
+```text
+benes_gui.py          launcher (also: python -m benes); the PyInstaller entry point
+benes/
+  paths.py            app_dir() for configs and Results/, sibling-project lookup
+  core/               network topology/solver, heater current limits
+  hardware/           voltage board, Arduino meter, OSA, JDSU output switch, Newport lasers
+  measurements/       scans, calibration, WDM comb, impulse test, datasets, CSV export
+  gui/
+    app.py            main window: shared state, notebook, lifecycle
+    theme.py          colours and ttk style
+    widgets.py        scrollable containers
+    routing.py, hardware.py, spectra.py, mapping.py, crosstalk.py,
+    calibration.py, wdm.py, dataset.py, impulse.py
+                      one mixin per tab or dialog, combined into BenesApp
+tests/                unittest suite
+```
+
+Settings (`benes_*_config.json`) and `Results/` stay in the project folder, or beside
+the exe when frozen.
+
 ## Board control and calibration
 
 The GUI uses the existing sibling `../VoltageTuner/board.py` implementation, so

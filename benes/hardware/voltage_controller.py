@@ -5,26 +5,12 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
-import sys
 import time
 from pathlib import Path
 from typing import Callable
 
 from benes.core.heater_setup import BREAK_CURRENT_DENSITY, SAFE_CURRENT_DENSITY, HeaterDevice, voltage_limit
-
-
-def app_dir() -> Path:
-    """Folder for settings and results: beside the exe when frozen, else beside the sources."""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-
-def sibling_module_path(project: str, filename: str) -> Path:
-    """Locate a helper from a sibling project, or the copy bundled into the exe."""
-    if getattr(sys, "frozen", False):
-        return Path(sys._MEIPASS) / project / filename
-    return Path(__file__).resolve().parent.parent / project / filename
+from benes.paths import app_dir, sibling_module_path
 
 
 DEFAULT_PORT = "COM4"

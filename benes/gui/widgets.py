@@ -5,6 +5,8 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 
+from benes.gui.theme import BG
+
 # Widgets that scroll themselves under the mouse wheel.
 _NATIVE_SCROLLERS = ("Listbox", "Text", "Treeview")
 
@@ -133,3 +135,29 @@ def fit_to_screen(window, margin_x: int = 80, margin_y: int = 120):
     if width > max_width:
         height += bar
     window.geometry(f"{min(width, max_width)}x{min(height, max_height)}")
+
+
+class VerticalScrolledFrame(ttk.Frame):
+    """A compact scroll container for dialogs whose content exceeds the display."""
+
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.canvas = tk.Canvas(self, bg=BG, highlightthickness=0, borderwidth=0)
+        vertical = ttk.Scrollbar(self, orient="vertical", style="Accent.Vertical.TScrollbar",
+                                 command=self.canvas.yview)
+        horizontal = ttk.Scrollbar(self, orient="horizontal", style="Accent.Horizontal.TScrollbar",
+                                   command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        horizontal.pack(side="bottom", fill="x")
+        vertical.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.content = ttk.Frame(self.canvas)
+        self.content_id = self.canvas.create_window((0, 0), window=self.content, anchor="nw")
+        self.content.bind("<Configure>", self._update_region)
+        self.canvas.bind("<MouseWheel>", self._scroll)
+
+    def _update_region(self, _event=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _scroll(self, event):
+        self.canvas.yview_scroll(-1 * (event.delta // 120), "units")

@@ -23,7 +23,7 @@ from typing import Callable
 from benes.hardware.osa import trim_spurious_tail
 from benes.hardware.osa_output_switch import fiber_number
 from benes.measurements.spectrum_export import write_spectra
-from benes.hardware.voltage_controller import app_dir
+from benes.paths import app_dir
 
 INPUTS = tuple(range(1, 7))
 WDM_SUBFOLDER = "WDM_scan"
