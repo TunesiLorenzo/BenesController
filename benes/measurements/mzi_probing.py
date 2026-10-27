@@ -75,10 +75,17 @@ class CrosstalkPlan:
     groups: tuple[CrosstalkProbe, ...]
     # (aggressor, victim) -> why it cannot be measured.
     uncovered: dict[tuple[str, str], str]
+    # (aggressor, victim) pairs left out as too many stages apart to couple.
+    distant: tuple[tuple[str, str], ...] = ()
 
     @property
     def pair_count(self) -> int:
         return sum(len(group.aggressors) for group in self.groups)
+
+
+def stage_distance(network, first, second) -> int:
+    """Stages between two MZIs; 0 in the same stage, 1 for neighbouring stages."""
+    return abs(network.switches[first][0] - network.switches[second][0])
 
 
 def _probes_with(network, name, background, inputs, outputs) -> list[Probe]:
@@ -170,19 +177,25 @@ def plan_calibration(network, names=None, inputs=None, outputs=None, known=()) -
 
 
 def plan_crosstalk(network, victims, aggressors=None, inputs=None, outputs=None, known=(),
-                   max_biased=2) -> CrosstalkPlan:
+                   max_biased=2, max_stage_distance=None) -> CrosstalkPlan:
     """Choose victim probes whose lit path avoids each aggressor.
 
     An aggressor on the lit path would switch the light itself, so it must be
     measured with another probe. Each victim takes the probe that leaves the
     most aggressors measurable, then more probes for the rest. At most
     ``max_biased`` background MZIs are heated to bar: more seldom helps and
-    adds background heat.
+    adds background heat. With ``max_stage_distance`` only aggressors that
+    many stages or fewer from the victim are measured; heat from further
+    away is taken as negligible.
     """
     aggressors = list(network.switches if aggressors is None else aggressors)
-    groups, uncovered = [], {}
+    groups, uncovered, distant = [], {}, []
     for victim in victims:
         wanted = [name for name in aggressors if name != victim]
+        if max_stage_distance is not None:
+            distant.extend((name, victim) for name in wanted
+                           if stage_distance(network, name, victim) > max_stage_distance)
+            wanted = [name for name in wanted if stage_distance(network, name, victim) <= max_stage_distance]
         if not wanted:
             continue
         candidates = probe_candidates(network, victim, inputs, outputs, known, max_biased)
@@ -201,4 +214,4 @@ def plan_crosstalk(network, victims, aggressors=None, inputs=None, outputs=None,
                 break
             groups.append(CrosstalkProbe(probe, covered))
             wanted = [name for name in wanted if name not in covered]
-    return CrosstalkPlan(tuple(groups), uncovered)
+    return CrosstalkPlan(tuple(groups), uncovered, tuple(distant))

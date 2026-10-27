@@ -1,7 +1,7 @@
 import unittest
 
 from benes.core.network import BenesNetwork
-from benes.measurements.mzi_probing import plan_calibration, plan_crosstalk, probe_candidates
+from benes.measurements.mzi_probing import plan_calibration, plan_crosstalk, probe_candidates, stage_distance
 
 
 class ProbeTests(unittest.TestCase):
@@ -74,6 +74,18 @@ class CrosstalkPlanTests(unittest.TestCase):
             self.assertFalse(path & set(group.aggressors))
             measured |= {(aggressor, group.probe.name) for aggressor in group.aggressors}
         self.assertEqual(len(measured), 12 * 11)
+
+    def test_adjacent_stages_only_leaves_distant_pairs_out(self):
+        names = list(self.network.switches)
+        plan = plan_crosstalk(self.network, names, known=names, max_stage_distance=1)
+        self.assertEqual(plan.uncovered, {})
+        # Same stage: 3·2 + 2·1 + 2·1 + 2·1 + 3·2; next stage: 2·(3·2 + 2·2 + 2·2 + 2·3).
+        self.assertEqual(plan.pair_count, 18 + 40)
+        self.assertEqual(len(plan.distant), 12 * 11 - 58)
+        self.assertIn(("S4.2", "S1.2"), plan.distant)
+        for group in plan.groups:
+            for aggressor in group.aggressors:
+                self.assertLessEqual(stage_distance(self.network, aggressor, group.probe.name), 1)
 
     def test_without_calibration_some_pairs_share_every_path(self):
         plan = plan_crosstalk(self.network, ["S1.1"], ["S5.3", "S2.1"])

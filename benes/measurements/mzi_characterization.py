@@ -45,6 +45,12 @@ CROSSTALK_SUBFOLDER = "Crosstalk_matrix"
 DEFAULT_MIN_EXTINCTION_DB = 3.0
 # Points within this share of the swing of an extreme count as that extreme.
 EXTREME_TIE_FRACTION = 0.02
+# Pretest: the aggressor alternates between its sweep limits in low-high-high-low
+# blocks, so a linear drift of the reading cancels from the high-low difference.
+SCREEN_PATTERN = (False, True, True, False) * 2
+# A pretest step must exceed this many standard errors of the readings to count.
+SCREEN_SIGMA = 4.0
+DEFAULT_SCREEN_MIN_PHASE_RAD = 0.02
 
 
 def dbm_to_mw(dbm):
@@ -328,6 +334,102 @@ class CrosstalkSweep:
     reference_points: tuple[SweepPoint, ...] = ()
 
 
+@dataclass(frozen=True)
+class ScreenResult:
+    """Pretest of one aggressor: does a full swing move the victim at all?"""
+
+    aggressor: str
+    victim: str
+    probe: object
+    low_voltage: float
+    high_voltage: float
+    low: tuple[float | None, ...]
+    high: tuple[float | None, ...]
+    # The same swing with the victim at its bright extreme; empty without a path reference.
+    reference_low: tuple[float | None, ...]
+    reference_high: tuple[float | None, ...]
+    # Victim phase change over the full aggressor swing, linearised at quadrature [rad].
+    phase_shift_rad: float | None
+    # Smallest phase change the readings could tell apart from noise [rad].
+    resolution_rad: float | None
+    min_phase_rad: float
+    moved: bool
+
+
+def _step(low, high):
+    """Mean low reading, high/low ratio and its relative standard error; None if unusable."""
+    lows = [power for power in low if power is not None and math.isfinite(power)]
+    highs = [power for power in high if power is not None and math.isfinite(power)]
+    if len(lows) < 2 or len(highs) < 2:
+        return None
+    mean_low, mean_high = sum(lows) / len(lows), sum(highs) / len(highs)
+    if mean_low <= 0:
+        return None
+
+    def variance(values, mean):
+        return sum((value - mean) ** 2 for value in values) / (len(values) - 1)
+
+    spread = math.sqrt((variance(lows, mean_low) + variance(highs, mean_high)) / 2)
+    return mean_low, mean_high / mean_low, spread * math.sqrt(1 / len(lows) + 1 / len(highs)) / mean_low
+
+
+def evaluate_screen(aggressor, probe, victim_fit, low_voltage, high_voltage, low, high,
+                    reference_low=(), reference_high=(),
+                    min_phase_rad=DEFAULT_SCREEN_MIN_PHASE_RAD) -> ScreenResult:
+    """The aggressor moved the victim if the step beats both the noise and ``min_phase_rad``.
+
+    The aggressor also warms the other MZIs on the lit path. With the
+    victim at its bright extreme only that path change shows, so the
+    quadrature step is divided by the reference step, as in the full sweep.
+    Too few readings to decide count as moved, so the pair is measured
+    rather than dropped.
+    """
+    quadrature = _step(low, high)
+    reference = _step(reference_low, reference_high) if reference_low or reference_high else (None, 1.0, 0.0)
+    shift = resolution = None
+    moved = True
+    if quadrature and reference and victim_fit is not None and victim_fit.amplitude > 0:
+        level, ratio, error = quadrature
+        _, path_ratio, path_error = reference
+        # At quadrature the response changes by amplitude/2 per radian.
+        slope = victim_fit.amplitude / 2
+        shift = level * (ratio / path_ratio - 1) / slope
+        resolution = SCREEN_SIGMA * level * math.hypot(error, path_error) / slope
+        moved = abs(shift) > max(min_phase_rad, resolution)
+    return ScreenResult(aggressor, probe.name, probe, low_voltage, high_voltage, tuple(low), tuple(high),
+                        tuple(reference_low), tuple(reference_high), shift, resolution, min_phase_rad, moved)
+
+
+def screen_aggressor(controller, detector, probe, victim_fit, aggressor, low_voltage, high_voltage,
+                     bias_voltage, settle_s, bright_voltage=None, min_phase_rad=DEFAULT_SCREEN_MIN_PHASE_RAD,
+                     on_point=None, stop_event=None, sleep=time.sleep) -> ScreenResult:
+    """Swing ``aggressor`` between its limits a few times with the victim at quadrature.
+
+    With ``bright_voltage`` the swing is first repeated with the victim at its
+    bright extreme, as a path reference.
+    """
+    biases = ((bright_voltage, True),) if bright_voltage is not None else ()
+    biases += ((bias_voltage, False),)
+    total = len(SCREEN_PATTERN) * len(biases)
+    readings = {True: ([], []), False: ([], [])}
+    count = 0
+    for victim_voltage, is_reference in biases:
+        controller.drive_voltage(probe.name, victim_voltage)
+        low, high = readings[is_reference]
+        for raised in SCREEN_PATTERN:
+            _check_stop(stop_event)
+            voltage = high_voltage if raised else low_voltage
+            controller.drive_voltage(aggressor, voltage)
+            _wait(settle_s, stop_event, sleep)
+            power = detector.read(probe).power
+            (high if raised else low).append(power)
+            count += 1
+            if on_point is not None:
+                on_point(aggressor, count, total, SweepPoint(voltage, power))
+    return evaluate_screen(aggressor, probe, victim_fit, low_voltage, high_voltage, *readings[False],
+                           *readings[True], min_phase_rad)
+
+
 def phase_shift_from_power(fit: MZIFit, bias_x, powers) -> list[float | None]:
     """Victim phase change from the first reading, inverting the fitted cos².
 
@@ -497,19 +599,30 @@ class CrosstalkRun:
 
     victims: dict = None
     pairs: dict = None
+    # (aggressor, victim) -> ScreenResult, when the pretest ran.
+    screens: dict = None
 
     def __post_init__(self):
         self.victims = {} if self.victims is None else self.victims
         self.pairs = {} if self.pairs is None else self.pairs
+        self.screens = {} if self.screens is None else self.screens
+
+    @property
+    def static_pairs(self) -> set[tuple[str, str]]:
+        """Pairs the pretest saw no movement for, so they were not swept."""
+        return {key for key, screen in self.screens.items() if not screen.moved}
 
 
 def run_crosstalk(controller, detector, network, groups, voltages, settle_s, path_reference=True, run=None,
                   on_step=None, on_point=None, on_victim=None, on_pair=None, stop_event=None,
-                  sleep=time.sleep) -> CrosstalkRun:
+                  sleep=time.sleep, screen_min_phase_rad=None, on_screen=None) -> CrosstalkRun:
     """For each victim probe: sweep the victim, bias it at quadrature, then sweep each aggressor.
 
     With ``path_reference`` each aggressor is swept twice, first with the
     victim at its bright extreme, to remove heating of the rest of the path.
+    With ``screen_min_phase_rad`` each aggressor is first swung between its
+    limits a few times; one that moves the victim by less is recorded in
+    ``run.screens`` and not swept.
     """
     require_ready(controller, network, voltages, settle_s)
     run = CrosstalkRun() if run is None else run
@@ -532,6 +645,17 @@ def run_crosstalk(controller, detector, network, groups, voltages, settle_s, pat
             bias_x = heater_drive(controller, probe.name, bias.voltage)[0]
             bright = victim.cross if probe.bright_crossed else victim.bar
             for aggressor in group.aggressors:
+                if screen_min_phase_rad is not None:
+                    screen = screen_aggressor(controller, detector, probe, victim.fit, aggressor, voltages[0],
+                                              voltages[-1], bias.voltage, settle_s,
+                                              bright.voltage if path_reference else None,
+                                              screen_min_phase_rad, on_point, stop_event, sleep)
+                    controller.drive_voltage(aggressor, background.get(aggressor, 0.0))
+                    run.screens[aggressor, probe.name] = screen
+                    if on_screen is not None:
+                        on_screen(screen)
+                    if not screen.moved:
+                        continue
                 reference = ()
                 if path_reference:
                     controller.drive_voltage(probe.name, bright.voltage)
@@ -644,6 +768,7 @@ def save_crosstalk(folder: Path, context: dict, run: CrosstalkRun, network) -> l
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     matrix = kappa_matrix(network, run.pairs)
+    static = run.static_pairs
     record = {**context,
               "kappa_definition": "victim-equivalent heater drive per aggressor heater drive (phase slope ratio)",
               "kappa": matrix,
@@ -653,17 +778,21 @@ def save_crosstalk(folder: Path, context: dict, run: CrosstalkRun, network) -> l
                          "max_phase_shift_rad": max((abs(value) for value in item.phase_shift if value is not None),
                                                     default=None)}
                         for item in run.pairs.values()],
+              "pretest": [_screen_record(item) for item in run.screens.values()],
+              "static_pairs": [{"aggressor": aggressor, "victim": victim} for aggressor, victim in sorted(static)],
               "victims": [{**_probe_record(item.probe), "fit": _fit_record(item.fit),
                            "extinction_db": None if math.isinf(item.extinction_db) else item.extinction_db}
                           for item in run.victims.values()]}
     (folder / "crosstalk_matrix.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     with (folder / "crosstalk_matrix.csv").open("w", encoding="utf-8", newline="") as file:
         file.writelines(_header(context, "Thermal crosstalk matrix"))
-        file.write("# kappa: rows are aggressors, columns victims; blank where not measured\n")
+        file.write("# kappa: rows are aggressors, columns victims; blank where not measured, "
+                   "n.s. where the pretest saw no movement\n")
         writer = csv.writer(file)
         writer.writerow(["aggressor"] + list(network.switches))
         for aggressor, row in matrix.items():
-            writer.writerow([aggressor] + ["" if value is None else f"{value:.6g}" for value in row.values()])
+            writer.writerow([aggressor] + ["n.s." if (aggressor, victim) in static else
+                                           "" if value is None else f"{value:.6g}" for victim, value in row.items()])
     unit = context.get("unit", "mW")
     with (folder / "crosstalk_sweeps.csv").open("w", encoding="utf-8", newline="") as file:
         file.writelines(_header(context, "Thermal crosstalk sweeps"))
@@ -686,10 +815,30 @@ def save_crosstalk(folder: Path, context: dict, run: CrosstalkRun, network) -> l
                                  mw_to_dbm(point.power) if unit == "mW" else "", "", drive, item.x_unit,
                                  "" if shift is None else shift])
     files = ["crosstalk_matrix.json", "crosstalk_matrix.csv", "crosstalk_sweeps.csv"]
+    if run.screens:
+        with (folder / "crosstalk_pretest.csv").open("w", encoding="utf-8", newline="") as file:
+            file.writelines(_header(context, "Thermal crosstalk pretest"))
+            file.write("# Victim at quadrature (reference: at its bright extreme); aggressor swung "
+                       "low-high-high-low twice. moved=0 pairs were not swept.\n")
+            writer = csv.writer(file)
+            writer.writerow(["aggressor", "victim", "input", "output", "low_v", "high_v",
+                             f"low_{unit}", f"high_{unit}", f"reference_low_{unit}", f"reference_high_{unit}",
+                             "phase_shift_rad", "resolution_rad", "min_phase_rad", "moved"])
+            for item in run.screens.values():
+                writer.writerow([item.aggressor, item.victim, item.probe.input + 1, item.probe.output + 1,
+                                 item.low_voltage, item.high_voltage,
+                                 " ".join("" if power is None else f"{power:.6g}" for power in item.low),
+                                 " ".join("" if power is None else f"{power:.6g}" for power in item.high),
+                                 " ".join("" if power is None else f"{power:.6g}" for power in item.reference_low),
+                                 " ".join("" if power is None else f"{power:.6g}" for power in item.reference_high),
+                                 "" if item.phase_shift_rad is None else f"{item.phase_shift_rad:.6g}",
+                                 "" if item.resolution_rad is None else f"{item.resolution_rad:.6g}",
+                                 item.min_phase_rad, int(item.moved)])
+        files.append("crosstalk_pretest.csv")
     from matplotlib.figure import Figure
 
     figure = Figure(figsize=(7, 6))
-    draw_kappa_heatmap(figure.add_subplot(111), network, matrix)
+    draw_kappa_heatmap(figure.add_subplot(111), network, matrix, static)
     figure.tight_layout()
     figure.savefig(folder / "crosstalk_matrix.png", dpi=150)
     files.append("crosstalk_matrix.png")
@@ -705,7 +854,18 @@ def save_crosstalk(folder: Path, context: dict, run: CrosstalkRun, network) -> l
     return files
 
 
-def draw_kappa_heatmap(axis, network, matrix):
+def _screen_record(item):
+    return {"aggressor": item.aggressor, **_probe_record(item.probe), "victim": item.victim,
+            "low_voltage_v": item.low_voltage, "high_voltage_v": item.high_voltage,
+            "low_readings": list(item.low), "high_readings": list(item.high),
+            "reference_low_readings": list(item.reference_low),
+            "reference_high_readings": list(item.reference_high),
+            "phase_shift_rad": item.phase_shift_rad, "resolution_rad": item.resolution_rad,
+            "min_phase_rad": item.min_phase_rad, "moved": item.moved}
+
+
+def draw_kappa_heatmap(axis, network, matrix, static=()):
+    """κ in percent; pairs the pretest found static are marked n.s."""
     names = list(network.switches)
     values = [[float("nan") if matrix[aggressor][victim] is None else matrix[aggressor][victim] * 100
                for victim in names] for aggressor in names]
@@ -719,6 +879,8 @@ def draw_kappa_heatmap(axis, network, matrix):
         for column, value in enumerate(line):
             if math.isfinite(value):
                 axis.text(column, row, f"{value:.1f}", ha="center", va="center", fontsize=6)
+            elif (names[row], names[column]) in static:
+                axis.text(column, row, "n.s.", ha="center", va="center", fontsize=5, color="gray")
     axis.figure.colorbar(image, ax=axis, label="κ [%]")
 
 

@@ -9,8 +9,9 @@ from benes.core.network import BenesNetwork
 from benes.hardware.laser_bank import LaserBank, SimulatedLaserController
 from benes.hardware.newport_laser import ModuleState
 from benes.measurements.laser_calibration import CalibrationStopped, SimulatedChip
-from benes.measurements.mzi_characterization import (OSALineDetector, PowerMeterDetector, SweepPoint, dbm_to_mw,
-                                                     extract_calibration, fit_mzi_response, phase_shift_from_power,
+from benes.measurements.mzi_characterization import (MZIFit, OSALineDetector, PowerMeterDetector, SweepPoint,
+                                                     dbm_to_mw, evaluate_screen, extract_calibration,
+                                                     fit_mzi_response, phase_shift_from_power,
                                                      run_calibration, run_crosstalk, save_calibration,
                                                      save_crosstalk)
 from benes.measurements.mzi_probing import Probe, plan_calibration, plan_crosstalk
@@ -175,6 +176,51 @@ class CrosstalkRunTests(unittest.TestCase):
         record = json.loads((folder / "crosstalk_matrix.json").read_text(encoding="utf-8"))
         self.assertIsNotNone(record["kappa"]["S1.1"]["S1.2"])
         self.assertIsNone(record["kappa"]["S1.2"]["S1.1"])
+
+    def test_pretest_skips_aggressors_that_do_not_move_the_victim(self):
+        network = BenesNetwork()
+        controller, selector, chip, detector, directory = bench(network)
+        self.addCleanup(directory.cleanup)
+        plan = plan_calibration(network, inputs=detector.inputs, outputs=detector.outputs)
+        run_calibration(controller, detector, network, plan.steps, VOLTAGES, 0, sleep=lambda _: None)
+        # S4.2 is three stages from S1.2 and does not heat it.
+        crosstalk = plan_crosstalk(network, ["S1.2"], ["S1.1", "S4.2"], detector.inputs, detector.outputs,
+                                   known=network.switches)
+        screened = []
+        run = run_crosstalk(controller, detector, network, crosstalk.groups, VOLTAGES, 0, sleep=lambda _: None,
+                            screen_min_phase_rad=0.02, on_screen=screened.append)
+        self.assertEqual(len(screened), 2)
+        self.assertTrue(run.screens["S1.1", "S1.2"].moved)
+        self.assertEqual(run.static_pairs, {("S4.2", "S1.2")})
+        self.assertEqual(set(run.pairs), {("S1.1", "S1.2")})
+        self.assertAlmostEqual(run.pairs["S1.1", "S1.2"].kappa, chip.coupling["S1.1", "S1.2"], delta=0.004)
+        # The path reference was taken with the victim at its bright extreme.
+        self.assertEqual(len(run.screens["S4.2", "S1.2"].reference_low), 4)
+        self.assertTrue(all(voltage == 0 for voltage in controller.applied_voltages.values()))
+        folder = Path(directory.name) / "screened"
+        files = save_crosstalk(folder, {"comment": "", "unit": "mW"}, run, network)
+        self.assertIn("crosstalk_pretest.csv", files)
+        record = json.loads((folder / "crosstalk_matrix.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["static_pairs"], [{"aggressor": "S4.2", "victim": "S1.2"}])
+        self.assertIn("n.s.", (folder / "crosstalk_matrix.csv").read_text(encoding="utf-8"))
+
+    def test_pretest_weighs_the_step_against_noise_and_the_phase_floor(self):
+        probe = Probe("S1.2", 0, 1, True, (), 2)
+        fit = MZIFit(0.0, 2.0, 5.0, 0.0, 0.0, "V²")
+        # Amplitude 2 gives 1 unit of power per radian at quadrature.
+        quiet = evaluate_screen("S1.1", probe, fit, 0, 5, [1.0, 1.0, 1.0, 1.0], [1.05, 1.05, 1.05, 1.05])
+        self.assertTrue(quiet.moved)
+        self.assertAlmostEqual(quiet.phase_shift_rad, 0.05)
+        tiny = evaluate_screen("S1.1", probe, fit, 0, 5, [1.0] * 4, [1.01] * 4)
+        self.assertFalse(tiny.moved)
+        noisy = evaluate_screen("S1.1", probe, fit, 0, 5, [0.9, 1.1, 0.9, 1.1], [0.95, 1.15, 0.95, 1.15])
+        self.assertFalse(noisy.moved)
+        self.assertGreater(noisy.resolution_rad, 0.05)
+        # The same step on the path alone is not the victim's.
+        path = evaluate_screen("S1.1", probe, fit, 0, 5, [1.0] * 4, [1.05] * 4, [2.0] * 4, [2.1] * 4)
+        self.assertAlmostEqual(path.phase_shift_rad, 0.0)
+        self.assertFalse(path.moved)
+        self.assertTrue(evaluate_screen("S1.1", probe, fit, 0, 5, [1.0], [None]).moved)
 
 
 class LaserBankTests(unittest.TestCase):

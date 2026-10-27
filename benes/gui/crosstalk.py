@@ -17,9 +17,10 @@ from benes.measurements.crosstalk_results import (PLOT_X_POWER, PLOT_X_VOLTAGE, 
                                                   create_result_folder, load_scan_folder, plot_x_values,
                                                   save_scan_artifacts, scan_context)
 from benes.measurements.laser_calibration import CalibrationStopped
-from benes.measurements.mzi_characterization import (CrosstalkRun, create_crosstalk_folder, draw_kappa_heatmap,
-                                                     draw_phase_shifts, heater_drive, kappa_matrix, mw_to_dbm,
-                                                     run_crosstalk, save_crosstalk)
+from benes.measurements.mzi_characterization import (DEFAULT_SCREEN_MIN_PHASE_RAD, SCREEN_PATTERN, CrosstalkRun,
+                                                     create_crosstalk_folder, draw_kappa_heatmap, draw_phase_shifts,
+                                                     heater_drive, kappa_matrix, mw_to_dbm, run_crosstalk,
+                                                     save_crosstalk)
 from benes.measurements.mzi_probing import plan_crosstalk
 from benes.measurements.spectrum_export import write_crosstalk_csv
 from benes.paths import app_dir
@@ -137,17 +138,34 @@ class CrosstalkMixin:
             "Sweeps each aggressor again with the victim at its bright extreme and divides it out, removing "
             "heating of the other MZIs on the path. Doubles the aggressor sweeps.")).grid(
             row=5, column=0, columnspan=2, sticky="w")
+        self.crosstalk_adjacent_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frame, text="Adjacent MZIs only (same or next stage)",
+                        variable=self.crosstalk_adjacent_var).grid(row=6, column=0, columnspan=2, sticky="w",
+                                                                   pady=(6, 0))
+        self.crosstalk_pretest_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frame, text="Pretest: skip aggressors that do not move the victim",
+                        variable=self.crosstalk_pretest_var).grid(row=7, column=0, columnspan=2, sticky="w",
+                                                                  pady=(6, 0))
+        ttk.Label(frame, text="Min. victim shift [mrad]").grid(row=8, column=0, sticky="w", pady=(2, 0))
+        self.crosstalk_pretest_mrad_var = tk.StringVar(value=f"{DEFAULT_SCREEN_MIN_PHASE_RAD * 1000:g}")
+        ttk.Entry(frame, textvariable=self.crosstalk_pretest_mrad_var, width=7).grid(
+            row=8, column=1, sticky="w", pady=(2, 0))
+        ttk.Label(frame, foreground="#9baec6", wraplength=240, text=(
+            f"With the victim at quadrature, each aggressor is swung between the limits above "
+            f"{len(SCREEN_PATTERN)} times (and again with the victim bright when the path reference is on). "
+            "Pairs whose step stays below the minimum or the noise are marked n.s. and not swept.")).grid(
+            row=9, column=0, columnspan=2, sticky="w")
         ttk.Button(frame, text="Plan", command=self.show_crosstalk_plan).grid(
-            row=6, column=0, sticky="ew", pady=(8, 0), padx=(0, 4))
+            row=10, column=0, sticky="ew", pady=(8, 0), padx=(0, 4))
         self.crosstalk_matrix_button = ttk.Button(frame, text="Run matrix", style="Accent.TButton",
                                                   command=self.start_crosstalk_matrix)
-        self.crosstalk_matrix_button.grid(row=6, column=1, sticky="ew", pady=(8, 0))
+        self.crosstalk_matrix_button.grid(row=10, column=1, sticky="ew", pady=(8, 0))
         self.crosstalk_stop_button = ttk.Button(frame, text="Stop", state="disabled",
                                                 command=self.stop_crosstalk_matrix)
-        self.crosstalk_stop_button.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.crosstalk_stop_button.grid(row=11, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.crosstalk_plan_var = tk.StringVar()
         ttk.Label(frame, textvariable=self.crosstalk_plan_var, wraplength=240).grid(
-            row=8, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            row=12, column=0, columnspan=2, sticky="w", pady=(6, 0))
         self.crosstalk_stop_event = None
         for variable in (self.detection_method_var, self.detection_meter_var, self.detection_position_var):
             variable.trace_add("write", lambda *_: self.update_crosstalk_detection())
@@ -167,11 +185,14 @@ class CrosstalkMixin:
             raise ValueError("Select at least one aggressor and one victim")
         if inputs is None:
             inputs, outputs = self.detection_ports()
-        return plan_crosstalk(self.network, victims, aggressors, inputs, outputs, known=self.calibrated_switches())
+        return plan_crosstalk(self.network, victims, aggressors, inputs, outputs, known=self.calibrated_switches(),
+                              max_stage_distance=1 if self.crosstalk_adjacent_var.get() else None)
 
     def describe_crosstalk_plan(self, plan):
         text = (f"{plan.pair_count} pair(s) in {len(plan.groups)} probe(s), "
                 f"{len({group.probe.name for group in plan.groups})} victim(s).")
+        if plan.distant:
+            text += f" {len(plan.distant)} pair(s) more than one stage apart left out."
         if plan.uncovered:
             reasons = sorted(set(plan.uncovered.values()))
             text += f" {len(plan.uncovered)} pair(s) not measurable: " + "; ".join(reasons[:4])
@@ -207,6 +228,11 @@ class CrosstalkMixin:
             settle_ms = float(fields["Settle [ms]"].get())
             if not 0 <= settle_ms <= 10000:
                 raise ValueError("Settling time must be between 0 and 10000 ms")
+            screen_min_phase = None
+            if self.crosstalk_pretest_var.get():
+                screen_min_phase = float(self.crosstalk_pretest_mrad_var.get()) / 1000
+                if not 0 <= screen_min_phase <= math.pi:
+                    raise ValueError("The pretest minimum shift must be between 0 and 3142 mrad")
             swept = sorted({group.probe.name for group in plan.groups} |
                            {name for group in plan.groups for name in group.aggressors})
             self.confirm_voltage_sweep(voltages, names=swept)
@@ -223,6 +249,9 @@ class CrosstalkMixin:
             "comment": self.crosstalk_comment_var.get().strip(), "unit": setup["unit"],
             "voltages_v": list(voltages), "settle_s": settle_s, "path_reference": reference,
             "victim_bias": "swept point nearest quadrature of the victim's fitted cos² response",
+            "max_stage_distance": 1 if self.crosstalk_adjacent_var.get() else None,
+            "distant_pairs_left_out": [f"{aggressor}->{victim}" for aggressor, victim in plan.distant],
+            "pretest_min_phase_rad": screen_min_phase,
             "background": "MZIs off the probe at their calibrated cross voltage (0 V if uncalibrated), "
                           "or calibrated bar where the probe needs it",
             "not_measurable": {f"{aggressor}->{victim}": reason
@@ -233,7 +262,8 @@ class CrosstalkMixin:
             "total_resistance_ohm": {name: self.controller.total_resistance(name) for name in self.network.switches},
         }
         per_aggressor = len(voltages) * (2 if reference else 1)
-        total = sum(len(voltages) + len(group.aggressors) * per_aggressor for group in plan.groups)
+        per_screen = 0 if screen_min_phase is None else len(SCREEN_PATTERN) * (2 if reference else 1)
+        total = sum(len(voltages) + len(group.aggressors) * (per_screen + per_aggressor) for group in plan.groups)
         self.crosstalk_running = True
         self.active_scan_kind = "Crosstalk matrix"
         self.crosstalk_stop_event = stop_event = threading.Event()
@@ -252,6 +282,12 @@ class CrosstalkMixin:
                 "crosstalk", value, detail=f"Crosstalk matrix: sweeping {name} {index}/{count} "
                                            f"({point.voltage:.2f} V)"))
 
+        def on_screen(screen):
+            if not screen.moved:
+                # The skipped sweeps count as done, so the bar keeps its pace.
+                done[0] += per_aggressor
+            self.after(0, lambda: self.crosstalk_screen_done(screen, run))
+
         def on_step(group, index, count):
             self.after(0, lambda: self.crosstalk_status.set(
                 f"Victim {group.probe.name} ({index}/{count}): {group.probe.describe()}; "
@@ -266,7 +302,7 @@ class CrosstalkMixin:
                                   reference, run, on_step, on_point,
                                   lambda victim: self.after(0, lambda: self.crosstalk_victim_done(victim)),
                                   lambda pair: self.after(0, lambda: self.crosstalk_pair_done(pair, run)),
-                                  stop_event)
+                                  stop_event, screen_min_phase_rad=screen_min_phase, on_screen=on_screen)
                 finally:
                     close()
             except CalibrationStopped:
@@ -308,7 +344,10 @@ class CrosstalkMixin:
         for name in self.network.switches:
             self.voltage_vars[name].set("0.00")
         self.refresh(keep_selection=True)
-        detail = f"{len(run.pairs)} pair(s) measured" + ("" if folder is None else f". Results: {folder}")
+        detail = f"{len(run.pairs)} pair(s) measured"
+        if run.screens:
+            detail += f", {len(run.static_pairs)} of {len(run.screens)} pretested pair(s) did not move"
+        detail += "" if folder is None else f". Results: {folder}"
         if error:
             self.crosstalk_status.set(f"Crosstalk matrix failed: {error}. {detail}")
             messagebox.showerror("Crosstalk matrix failed", error, parent=self)
@@ -342,10 +381,10 @@ class CrosstalkMixin:
         self.crosstalk_victim_plots = {}
         self.draw_crosstalk_matrix({})
 
-    def draw_crosstalk_matrix(self, pairs):
+    def draw_crosstalk_matrix(self, pairs, static=()):
         figure = self.crosstalk_matrix_canvas.figure
         figure.clear()
-        draw_kappa_heatmap(figure.add_subplot(111), self.network, kappa_matrix(self.network, pairs))
+        draw_kappa_heatmap(figure.add_subplot(111), self.network, kappa_matrix(self.network, pairs), static)
         figure.tight_layout()
         self.crosstalk_matrix_canvas.draw_idle()
 
@@ -388,8 +427,16 @@ class CrosstalkMixin:
         self.crosstalk_victim_plots[key] = {"tab": tab, "canvas": canvas, "response": response, "shifts": shifts,
                                             "pairs": []}
 
+    def crosstalk_screen_done(self, screen, run):
+        shift = "—" if screen.phase_shift_rad is None else f"{screen.phase_shift_rad * 1000:.1f} mrad"
+        noise = "" if screen.resolution_rad is None else f", noise limit {screen.resolution_rad * 1000:.1f} mrad"
+        verdict = "moves it; sweeping" if screen.moved else "no movement; not swept (n.s.)"
+        self.crosstalk_status.set(f"Pretest {screen.aggressor} → {screen.victim}: {shift}{noise}, {verdict}")
+        if not screen.moved:
+            self.draw_crosstalk_matrix(run.pairs, run.static_pairs)
+
     def crosstalk_pair_done(self, pair, run):
-        self.draw_crosstalk_matrix(run.pairs)
+        self.draw_crosstalk_matrix(run.pairs, run.static_pairs)
         plot = self.crosstalk_victim_plots.get(pair.victim)
         kappa = "—" if pair.kappa is None else f"{pair.kappa * 100:.2f} %"
         self.crosstalk_status.set(f"{pair.aggressor} → {pair.victim}: κ = {kappa} (bias {pair.bias_voltage:.2f} V)")
