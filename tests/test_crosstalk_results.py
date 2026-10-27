@@ -80,13 +80,21 @@ class CrosstalkResultsTests(unittest.TestCase):
             self.assertEqual(loaded["context"]["heater_resistance_ohm"]["S3.1"], 800.0)
 
             osa_context = scan_context(network, 0, 3, 1, 4, controller, ["S1.1"], [-1, 1], 50, "OSA", "")
+            osa_context.update(reference_input_port=1, reference_wavelength_nm=1550.0,
+                               reference_half_window_nm=0.2)
             osa_folder = create_result_folder(Path(directory), osa_context)
-            spectra = {"S1.1": [SpectrumScanPoint(-1, -20, (1550.0, 1551.0), (-30.0, -20.0)),
-                                SpectrumScanPoint(1, -18, (1550.0, 1551.0), (-25.0, -18.0))]}
+            spectra = {"S1.1": [SpectrumScanPoint(-1, -30, (1550.0, 1551.0), (-30.0, -20.0), 1550.0, 0.2),
+                                SpectrumScanPoint(1, -25, (1550.0, 1551.0), (-25.0, -18.0), 1550.0, 0.2)]}
             save_scan_artifacts(osa_folder, osa_context, spectra, "OSA", "dBm", network)
             self.assertEqual(load_scan_folder(osa_folder)["data"], spectra)
+            self.assertIn("Reference wavelength: 1550 nm",
+                          (osa_folder / "crosstalk_dataset.csv").read_text(encoding="utf-8"))
 
             # Older OSA datasets used a single response_power column.
+            legacy_context = json.loads((osa_folder / "base_setting.json").read_text(encoding="utf-8"))
+            for key in ("reference_input_port", "reference_wavelength_nm", "reference_half_window_nm"):
+                legacy_context.pop(key)
+            (osa_folder / "base_setting.json").write_text(json.dumps(legacy_context), encoding="utf-8")
             (osa_folder / "crosstalk_dataset.csv").write_text("\n".join((
                 "# Crosstalk OSA scan exported 2026-10-16",
                 "# Response unit: dBm",

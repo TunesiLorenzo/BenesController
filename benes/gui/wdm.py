@@ -11,8 +11,10 @@ from benes.gui.widgets import VerticalScrolledFrame
 from benes.hardware import osa
 from benes.hardware.osa_output_switch import OUTPUTS, fiber_number
 from benes.measurements.dataset_registry import save_measurement
-from benes.measurements.wdm_comb import (INPUTS, create_wdm_folder, evaluate_configuration,
-                                         input_fiber_number, routed_wavelengths, save_wdm_scan, scan_outputs,
+from benes.measurements.wdm_comb import (INPUTS, acquire_averaged_spectrum, create_wdm_folder,
+                                         evaluate_configuration,
+                                         input_fiber_number, power_ratio_db, routed_wavelengths,
+                                         save_configuration_evaluation, save_wdm_scan, scan_outputs,
                                          simulated_comb_spectrum)
 from benes.paths import app_dir
 
@@ -246,7 +248,7 @@ class WDMMixin:
     def save_wdm_plan(self, quiet=False):
         try:
             self.wdm_plan.configure(self.wdm_assignment(), self.wdm_window_var.get(), self.wdm_settle_var.get(),
-                                    self.wdm_comb_var.get())
+                                    self.wdm_comb_var.get(), self.wdm_evaluation_sweeps_var.get())
         except (OSError, ValueError) as error:
             if not quiet:
                 messagebox.showerror("WDM plan", str(error), parent=self)
@@ -346,6 +348,7 @@ class WDMMixin:
         permutation = self.active_dataset_permutation()
         routed = routed_wavelengths(mapping, assignment)
         settings = self.wdm_plan.settings
+        evaluation_sweeps = settings["evaluation_sweeps"] if evaluation else 1
         comment = self.dataset_comment_var.get()
         context = {
             "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -354,20 +357,36 @@ class WDMMixin:
             "wavelength_plan": settings["active_preset"],
             "half_window_nm": settings["half_window_nm"],
             "settle_s": settings["settle_s"],
+            "averaged_sweeps_per_output": evaluation_sweeps,
             "jdsu_switch_settle_s": switch.settings["settle_s"],
             "jdsu_channel_map": dict(switch.settings["channel_map"]),
             "switch_states": {name: "cross" if crossed else "bar" for name, crossed in self.network.states.items()},
-            "switch_voltages_v": dict(self.controller.settings["voltage"]),
+            "switch_voltages_v": {
+                name: self.controller.applied_voltages.get(name, self.controller.settings["voltage"].get(name))
+                for name in self.network.states
+            },
             "simulated_osa": simulate,
             "dry_run_switch": switch.settings["dry_run"],
         }
 
         def read(output):
+            output_index = outputs.index(output) + 1
+            def on_sweep(index, count):
+                self.after(0, lambda o=output, oi=output_index, i=index, c=count:
+                           self.update_activity("wdm", (oi - 1) * c + i,
+                                                detail=f"{'Evaluating' if evaluation else 'Scanning'} output "
+                                                       f"{o} ({oi}/{len(outputs)}), sweep {i}/{c}"))
             if simulate:
-                return simulated_comb_spectrum(assignment, routed[output][0])
-            return osa.get_spectrum(host, port, fresh_sweeps=POST_SWITCH_SWEEPS)
+                return acquire_averaged_spectrum(
+                    lambda _: simulated_comb_spectrum(assignment, routed[output][0]),
+                    evaluation_sweeps, POST_SWITCH_SWEEPS, on_sweep)
+            return acquire_averaged_spectrum(
+                lambda fresh: osa.get_spectrum(host, port, fresh_sweeps=fresh),
+                evaluation_sweeps, POST_SWITCH_SWEEPS, on_sweep)
 
         self.wdm_running = True
+        self.begin_activity("wdm", "Evaluating configuration" if evaluation else "WDM output scan",
+                            len(outputs) * evaluation_sweeps + 1)
         self.wdm_stop_event = threading.Event()
         if hasattr(self, "wdm_start_button"):
             self.wdm_start_button.configure(state="disabled")
@@ -379,7 +398,8 @@ class WDMMixin:
         if hasattr(self, "wdm_table"):
             self.wdm_table.delete(*self.wdm_table.get_children())
         self.wdm_status_var.set(("Evaluating" if evaluation else "Scanning") +
-                                f" outputs {', '.join(map(str, outputs))}...")
+                                f" outputs {', '.join(map(str, outputs))}"
+                                + (f" ({evaluation_sweeps} sweeps/output)" if evaluation else "") + "...")
         stop_event = self.wdm_stop_event
 
         markers = [(wavelength, WDM_COLORS[int(port) - 1], f"In {port} · {wavelength:g} nm")
@@ -394,6 +414,7 @@ class WDMMixin:
                 results = scan_outputs(switch, read, outputs, mapping, assignment, settings["half_window_nm"],
                                        settings["settle_s"], on_result=on_result, stop_event=stop_event)
                 if results:
+                    self.after(0, lambda: self.update_activity("wdm", detail="Saving WDM results..."))
                     complete = {**context, "complete": len(results) == len(outputs)}
                     folder = create_wdm_folder(app_dir())
                     files = save_wdm_scan(folder, results, complete, comment)
@@ -408,7 +429,7 @@ class WDMMixin:
                 error = str(error_value)
             self.after(0, lambda: self.finish_wdm_scan(results, folder, error, stop_event.is_set(),
                                                        dataset_root is not None, markers, evaluation, mapping,
-                                                       assignment))
+                                                       assignment, context))
 
 
         threading.Thread(target=worker, daemon=True).start()
@@ -429,8 +450,10 @@ class WDMMixin:
             self.wdm_status_var.set("Stopping after the current output...")
 
     def finish_wdm_scan(self, results, folder, error, stopped, recorded, markers=(), evaluation=False,
-                        mapping=(), assignment=None):
+                        mapping=(), assignment=None, context=None):
         self.wdm_running = False
+        job_name = "Evaluation" if evaluation else "WDM scan"
+        self.finish_activity("wdm", f"{job_name} {'failed' if error else 'stopped' if stopped else 'complete'}")
         if hasattr(self, "wdm_start_button"):
             self.wdm_start_button.configure(state="normal")
         if hasattr(self, "wdm_stop_button"):
@@ -442,7 +465,7 @@ class WDMMixin:
             self.osa_switch_status_var.set(f"OSA sampling output {results[-1].output} after the WDM scan")
             self.osa_output_var.set(str(results[-1].output))
         if evaluation and results:
-            self.show_configuration_evaluation(results, mapping, assignment)
+            self.show_configuration_evaluation(results, mapping, assignment, folder, context)
         elif self.wdm_plot_var.get():
             for result in results:
                 self.show_spectrum(result.wave, result.power, name=f"WDM Out {result.output} (In {result.routed_input})",
@@ -460,7 +483,7 @@ class WDMMixin:
         if recorded:
             self.analyze_linked_dataset()
 
-    def show_configuration_evaluation(self, results, mapping, assignment):
+    def show_configuration_evaluation(self, results, mapping, assignment, folder=None, context=None):
         """Show the six output spectra next to the configuration power table."""
         try:
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
@@ -479,18 +502,21 @@ class WDMMixin:
         for result in results:
             spectra.plot(result.wave, result.power, linewidth=1.0, label=f"Out {result.output}")
         spectra.set(xlabel="Wavelength [nm]", ylabel="Power [dBm]", title="Six-output OSA scan")
+        spectra.title.set_color("white")
+        spectra.xaxis.label.set_color("white")
+        spectra.yaxis.label.set_color("white")
+        spectra.tick_params(colors="white")
         spectra.grid(True, alpha=0.3)
         spectra.legend(loc="best", fontsize=8)
         table_axis.axis("off")
-        headers = ["Input", "λ [nm]", "Total\n[dBm]", "Expected", "Transmission\n[dBm]", "Tx / total\n[%]"] + \
-                  [f"Out {port}\nXT / total [%]" for port in OUTPUTS]
+        headers = ["Input", "λ [nm]", "Total\n[dBm]", "Expected", "Transmission\n[dBm]", "Tx / total\n[dB]"] + \
+                  [f"Out {port}\nXT / total [dB]" for port in OUTPUTS]
         fmt = lambda value: "—" if value is None else f"{value:.2f}"
         rows = [[f"In {item.input_port}", f"{item.wavelength_nm:.3f}", fmt(item.total_power_dbm),
                  f"Out {item.expected_output}", fmt(item.transmission_dbm),
-                 fmt(None if item.normalized_transmission is None else item.normalized_transmission * 100)] +
+                 fmt(power_ratio_db(item.normalized_transmission))] +
                 ["—" if port == item.expected_output else
-                 fmt(None if item.normalized_crosstalk.get(port) is None else
-                     item.normalized_crosstalk[port] * 100)
+                 fmt(power_ratio_db(item.normalized_crosstalk.get(port)))
                 for port in OUTPUTS]
                 for item in summary]
         table_axis.set_title("Per-wavelength routing evaluation", color=TEXT, fontsize=11, pad=12)
@@ -505,6 +531,21 @@ class WDMMixin:
         figure.subplots_adjust(left=0.06, right=0.98, bottom=0.12, top=0.9, wspace=0.24)
         canvas = FigureCanvasTkAgg(figure, master=window)
         NavigationToolbar2Tk(canvas, window).update()
+        ttk.Button(window, text="Export image, controls and data to results",
+                   command=lambda: self.export_configuration_evaluation(
+                       folder, figure, summary, context, window),
+                   state="normal" if folder is not None and context is not None else "disabled").pack(
+                       anchor="e", padx=8, pady=4)
         canvas.get_tk_widget().configure(**PLOT_MIN_SIZE)
         canvas.get_tk_widget().pack(fill="both", expand=True)
         canvas.draw_idle()
+
+    def export_configuration_evaluation(self, folder, figure, summary, context, parent):
+        try:
+            save_configuration_evaluation(folder, summary, context)
+            figure.savefig(folder / "configuration_evaluation.png", dpi=200, facecolor=figure.get_facecolor())
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Evaluation export failed", str(error), parent=parent)
+            return
+        messagebox.showinfo("Evaluation export complete",
+                            f"Saved the image, control values and evaluation data in:\n{folder}", parent=parent)

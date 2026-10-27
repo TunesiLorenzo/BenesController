@@ -33,6 +33,7 @@ CAL_STATUS = {
     "inverted": ("#ff6b6b", "wrong state"),
     "unknown": ("#9baec6", "no line"),
     "failed": ("#ff6b6b", "sweep failed"),
+    "hidden": ("#5d6b80", "not visible"),
 }
 # Worst first, to combine the verdicts of several state checks.
 VERDICT_ORDER = ("inverted", "partial", "unknown", "ok")
@@ -64,6 +65,8 @@ def apply_theme(root):
                     font=("Segoe UI", 10, "bold"))
     style.map("TNotebook.Tab", background=[("selected", PANEL), ("active", "#21324b")],
               foreground=[("selected", ACCENT), ("active", TEXT)])
+    style.configure("Activity.Horizontal.TProgressbar", background=ACCENT, troughcolor=PANEL,
+                    bordercolor=PANEL, lightcolor=ACCENT, darkcolor=ACCENT)
     # High-contrast scrollbars everywhere so it is obvious when a window has more content.
     for scrollbar_style in ("Accent.Vertical.TScrollbar", "Accent.Horizontal.TScrollbar",
                             "Vertical.TScrollbar", "Horizontal.TScrollbar"):

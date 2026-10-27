@@ -95,6 +95,15 @@ class CalibrationScanTests(unittest.TestCase):
         self.assertEqual(point.power, -20)
         self.assertAlmostEqual(point.mean_power_dbm, -22.596373, places=5)
 
+    def test_osa_reference_uses_selected_line_even_when_another_line_is_brighter(self):
+        point = spectrum_scan_point(0, ([1549.9, 1550.0, 1551.0, 1552.0, 1553.0],
+                                        [-30, -20, -5, 50, 60]), 1550.0, 0.15)
+        self.assertEqual(point.power, -20)
+        self.assertAlmostEqual(point.mean_power_dbm, -22.596373, places=5)
+        self.assertEqual(point.spectrum_dbm, (-30, -20, -5))
+        with self.assertRaisesRegex(ValueError, "No OSA bins near"):
+            spectrum_scan_point(0, ([1550.0, 1551.0, 1552.0], [-30, -20, 50]), 1540.0, 0.1)
+
     def test_osa_reader_rejects_bad_spectrum(self):
         with self.assertRaisesRegex(ValueError, "mismatched"):
             spectrum_scan_point(0, ([1550.0], []))

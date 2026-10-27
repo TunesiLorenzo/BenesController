@@ -1,13 +1,70 @@
 import unittest
+import math
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from benes.gui.app import BenesApp
+from benes.gui.calibration import CalibrationMixin
 from benes.core.network import BenesNetwork
 from benes.measurements.impulse_test import validate_impulse_settings
 
 
+class ActivityProgressTests(unittest.TestCase):
+    def test_shows_counted_work_and_restores_another_running_job(self):
+        class FakeBar:
+            def __init__(self):
+                self.options = {"mode": "determinate", "value": 0}
+
+            def configure(self, **options):
+                self.options.update(options)
+
+            def cget(self, key):
+                return self.options[key]
+
+            def start(self, _interval):
+                self.options["running"] = True
+
+            def stop(self):
+                self.options["running"] = False
+
+        text = SimpleNamespace(value="", set=lambda value: setattr(text, "value", value))
+        app = SimpleNamespace(activities={}, activity_text=text, activity_bar=FakeBar())
+        app._render_activity = lambda: BenesApp._render_activity(app)
+        BenesApp.begin_activity(app, "evaluation", "Evaluating", 61)
+        BenesApp.update_activity(app, "evaluation", 20, detail="Output 2, sweep 10/10")
+        self.assertEqual(app.activity_bar.options["value"], 20)
+        self.assertEqual(text.value, "Output 2, sweep 10/10")
+        BenesApp.begin_activity(app, "read", "Reading power")
+        self.assertEqual(app.activity_bar.options["mode"], "indeterminate")
+        BenesApp.finish_activity(app, "read", "Power read complete")
+        self.assertEqual(app.activity_bar.options["mode"], "determinate")
+        self.assertEqual(app.activity_bar.options["value"], 20)
+        BenesApp.finish_activity(app, "evaluation", "Evaluation complete")
+        self.assertEqual(text.value, "Evaluation complete")
+
+
 class PathProgressTests(unittest.TestCase):
+    def test_laser_detection_reads_and_retains_each_osa_output(self):
+        selected = []
+        selector = SimpleNamespace(select_output=selected.append, mapped_outputs=lambda: list(range(1, 7)))
+        app = SimpleNamespace(osa_output_switch=selector,
+                              cal_status_var=SimpleNamespace(set=lambda value: None),
+                              after=lambda delay, callback: callback())
+        wave = [1549 + index * 0.01 for index in range(1400)]
+
+        def spectrum(host, port, fresh_sweeps):
+            center = 1549 + selected[-1]
+            return wave, [-60 + 40 * math.exp(-((value - center) / 0.03) ** 2)
+                          + 50 * math.exp(-((value - 1561) / 0.03) ** 2) for value in wave]
+
+        traces = []
+        with patch("benes.gui.calibration.osa.get_spectrum", side_effect=spectrum):
+            wavelengths = CalibrationMixin.detect_laser_channels_from_outputs(app, "osa", 1, traces)
+        self.assertEqual(selected, list(range(1, 7)))
+        self.assertEqual(wavelengths, [1555, 1554, 1553, 1552, 1551, 1550])
+        self.assertEqual(len(traces), 6)
+        self.assertTrue(all(len(item[1]) == len(item[2]) == len(wave) - 2 for item in traces))
+
     def test_all_switch_control_states_covers_every_12_bit_configuration(self):
         app = SimpleNamespace(network=BenesNetwork())
         configurations = BenesApp.all_switch_control_states(app)

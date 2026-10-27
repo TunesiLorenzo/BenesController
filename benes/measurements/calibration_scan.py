@@ -19,23 +19,47 @@ class ScanPoint:
 class SpectrumScanPoint(ScanPoint):
     wavelength_nm: tuple[float, ...]
     spectrum_dbm: tuple[float, ...]
+    reference_wavelength_nm: float | None = None
+    half_window_nm: float | None = None
     mean_power_dbm: float = field(init=False)
 
     def __post_init__(self):
         if not self.spectrum_dbm:
             raise ValueError("The OSA returned an empty spectrum")
-        peak = max(self.spectrum_dbm)
-        relative_mean = sum(10 ** ((power - peak) / 10) for power in self.spectrum_dbm) / len(self.spectrum_dbm)
+        values = self.spectrum_dbm
+        if self.reference_wavelength_nm is not None:
+            if self.half_window_nm is None or not math.isfinite(self.half_window_nm) or self.half_window_nm <= 0:
+                raise ValueError("Enter a positive wavelength window for the OSA reference line")
+            values = tuple(power for wave, power in zip(self.wavelength_nm, self.spectrum_dbm)
+                           if abs(wave - self.reference_wavelength_nm) <= self.half_window_nm)
+            if not values:
+                raise ValueError(f"No OSA bins near {self.reference_wavelength_nm:g} nm")
+        peak = max(values)
+        relative_mean = sum(10 ** ((power - peak) / 10) for power in values) / len(values)
         object.__setattr__(self, "mean_power_dbm", peak + 10 * math.log10(relative_mean))
 
 
-def spectrum_scan_point(voltage: float, spectrum) -> SpectrumScanPoint:
+def spectrum_scan_point(voltage: float, spectrum, reference_wavelength_nm: float | None = None,
+                        half_window_nm: float | None = None) -> SpectrumScanPoint:
     wavelength, power = osa.trim_spurious_tail(*spectrum)
     if not wavelength or len(wavelength) != len(power):
         raise ValueError("The OSA returned an empty or mismatched spectrum")
     if not all(math.isfinite(value) for value in wavelength) or not all(math.isfinite(value) for value in power):
         raise ValueError("The OSA returned non-finite spectrum values")
-    return SpectrumScanPoint(voltage, max(power), tuple(wavelength), tuple(power))
+    if reference_wavelength_nm is not None:
+        if not math.isfinite(reference_wavelength_nm):
+            raise ValueError("The OSA reference wavelength must be finite")
+        if half_window_nm is None or not math.isfinite(half_window_nm) or half_window_nm <= 0:
+            raise ValueError("Enter a positive wavelength window for the OSA reference line")
+        selected = [value for wave, value in zip(wavelength, power)
+                    if abs(wave - reference_wavelength_nm) <= half_window_nm]
+        if not selected:
+            raise ValueError(f"No OSA bins near {reference_wavelength_nm:g} nm")
+        peak = max(selected)
+    else:
+        peak = max(power)
+    return SpectrumScanPoint(voltage, peak, tuple(wavelength), tuple(power),
+                             reference_wavelength_nm, half_window_nm)
 
 
 def scan_voltages(start: float, stop: float, step: float) -> list[float]:

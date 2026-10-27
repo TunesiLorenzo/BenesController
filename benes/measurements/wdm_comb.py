@@ -91,6 +91,7 @@ class WDMPlan:
             "comb_lines": [],
             "half_window_nm": 0.2,
             "settle_s": 2.0,
+            "evaluation_sweeps": 10,
         }
 
     def _load(self) -> dict:
@@ -105,6 +106,7 @@ class WDMPlan:
             candidate["presets"] = {str(name): normalized_assignment(value)
                                     for name, value in dict(candidate["presets"]).items()}
             self._validate_scan(candidate["half_window_nm"], candidate["settle_s"])
+            candidate["evaluation_sweeps"] = self._validate_evaluation_sweeps(candidate["evaluation_sweeps"])
             settings = candidate
         except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
             # A damaged plan must not prevent the controller from starting.
@@ -120,6 +122,16 @@ class WDMPlan:
             raise ValueError("Settling delay must be between 0 and 600 seconds")
         return half_window_nm, settle_s
 
+    @staticmethod
+    def _validate_evaluation_sweeps(value) -> int:
+        try:
+            count = int(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError("Evaluation sweeps must be a whole number from 1 to 16") from error
+        if str(value).strip() != str(count) or not 1 <= count <= 16:
+            raise ValueError("Evaluation sweeps must be a whole number from 1 to 16")
+        return count
+
     def save(self) -> None:
         temporary = self.config_path.with_suffix(self.config_path.suffix + ".tmp")
         temporary.write_text(json.dumps(self.settings, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -129,11 +141,14 @@ class WDMPlan:
     def assignment(self) -> dict:
         return self.settings["assignment"]
 
-    def configure(self, assignment: dict, half_window_nm, settle_s, comb_lines="") -> None:
+    def configure(self, assignment: dict, half_window_nm, settle_s, comb_lines="",
+                  evaluation_sweeps=None) -> None:
         assignment = normalized_assignment(assignment)
         half_window_nm, settle_s = self._validate_scan(half_window_nm, settle_s)
+        evaluation_sweeps = self._validate_evaluation_sweeps(
+            self.settings["evaluation_sweeps"] if evaluation_sweeps is None else evaluation_sweeps)
         self.settings.update(assignment=assignment, half_window_nm=half_window_nm, settle_s=settle_s,
-                             comb_lines=parse_comb_lines(comb_lines))
+                             comb_lines=parse_comb_lines(comb_lines), evaluation_sweeps=evaluation_sweeps)
         self.save()
 
     def save_preset(self, name: str) -> None:
@@ -263,6 +278,42 @@ def evaluate_configuration(results: list[WDMOutputResult], mapping, assignment: 
     return summary
 
 
+def power_ratio_db(fraction: float | None) -> float | None:
+    """Express a positive linear power fraction relative to its total in dB."""
+    return None if fraction is None or fraction <= 0 else 10 * math.log10(fraction)
+
+
+def average_spectra(spectra) -> tuple[list[float], list[float]]:
+    """Average matching OSA traces as linear power, then return dBm samples."""
+    traces = list(spectra)
+    if not traces:
+        raise ValueError("No OSA spectra were acquired for averaging")
+    wavelengths = list(traces[0][0])
+    if not wavelengths or any(len(wave) != len(wavelengths) or len(power) != len(wavelengths)
+                              for wave, power in traces):
+        raise ValueError("OSA sweeps have different trace lengths")
+    for wave, _ in traces[1:]:
+        if any(not math.isclose(first, later, rel_tol=0, abs_tol=1e-6)
+               for first, later in zip(wavelengths, wave)):
+            raise ValueError("OSA wavelength grid changed between sweeps")
+    averaged = [10 * math.log10(math.fsum(10 ** (power[index] / 10) for _, power in traces) / len(traces))
+                for index in range(len(wavelengths))]
+    return wavelengths, averaged
+
+
+def acquire_averaged_spectrum(fetch: Callable[[int], tuple], count: int,
+                              first_fresh_sweeps: int = 2,
+                              on_sweep: Callable[[int, int], None] | None = None) -> tuple[list[float], list[float]]:
+    """Acquire complete sweeps after an output change, then average their power."""
+    count = WDMPlan._validate_evaluation_sweeps(count)
+    spectra = []
+    for index in range(1, count + 1):
+        spectra.append(fetch(first_fresh_sweeps if index == 1 else 1))
+        if on_sweep is not None:
+            on_sweep(index, count)
+    return average_spectra(spectra) if count > 1 else spectra[0]
+
+
 def simulated_comb_spectrum(assignment: dict, routed_input: int, points: int = 4001) -> tuple[list, list]:
     """Dry-run trace: the routed line at -10 dBm, the other comb lines leaking at -45 dBm."""
     lines = [(wavelength, -10.0 if int(port) == routed_input else -45.0)
@@ -326,6 +377,8 @@ def save_wdm_scan(folder: Path, results: list[WDMOutputResult], context: dict, c
     header = [f"# WDM comb scan saved {datetime.now().isoformat(timespec='seconds')}\n",
               f"# Permutation (output per input 1-6): {' '.join(map(str, context['permutation']))}\n",
               f"# Line window: ±{context['half_window_nm']:g} nm; settling delay {context['settle_s']:g} s\n"]
+    if "averaged_sweeps_per_output" in context:
+        header.append(f"# OSA sweeps averaged per output: {context['averaged_sweeps_per_output']}\n")
     header += [f"# Comment: {line}\n" for line in comment.splitlines() or [""]]
 
     with (folder / "wdm_summary.csv").open("w", encoding="utf-8", newline="") as file:
@@ -363,6 +416,35 @@ def save_wdm_scan(folder: Path, results: list[WDMOutputResult], context: dict, c
         for result in results]}
     (folder / "wdm_scan.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     return files
+
+
+def save_configuration_evaluation(folder: Path, summary: list[ConfigurationLineResult],
+                                  context: dict) -> list[str]:
+    """Export the displayed evaluation data and the controls captured at scan start."""
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    evaluation_name = "configuration_evaluation.csv"
+    with (folder / evaluation_name).open("w", encoding="utf-8", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["input", "wavelength_nm", "expected_output", "total_power_dbm",
+                         "transmission_dbm", "transmission_to_total_db"] +
+                        [f"out{port}_crosstalk_to_total_db" for port in INPUTS])
+        for item in summary:
+            writer.writerow([item.input_port, _fmt(item.wavelength_nm, 4), item.expected_output,
+                             _fmt(item.total_power_dbm), _fmt(item.transmission_dbm),
+                             _fmt(power_ratio_db(item.normalized_transmission))] +
+                            [_fmt(power_ratio_db(item.normalized_crosstalk.get(port)))
+                             if port != item.expected_output else "" for port in INPUTS])
+
+    controls_name = "configuration_controls.csv"
+    states = context["switch_states"]
+    voltages = context["switch_voltages_v"]
+    with (folder / controls_name).open("w", encoding="utf-8", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["switch", "state", "voltage_v"])
+        for name, state in states.items():
+            writer.writerow([name, state, voltages.get(name, "")])
+    return [evaluation_name, controls_name]
 
 
 def create_wdm_folder(project_dir: Path) -> Path:

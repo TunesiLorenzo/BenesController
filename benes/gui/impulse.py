@@ -57,10 +57,11 @@ class ImpulseMixin:
         ttk.Label(controls, textvariable=self.impulse_frequency_var).grid(
             row=9, column=0, columnspan=2, sticky="w", pady=(2, 0))
         self.impulse_input_ready = tk.BooleanVar(value=False)
-        ttk.Checkbutton(controls, text="Pin 8 signal at A1 stays within 0–5 V",
+        ttk.Checkbutton(controls, text="Legacy dual only: pin 8 at A1 stays within 0–5 V",
                         variable=self.impulse_input_ready).grid(
             row=10, column=0, columnspan=2, sticky="w", pady=(12, 4))
-        ttk.Label(controls, text="Board pin 8 mirrors the selected MZI. Arduino A0 reads optical power; A1 reads pin 8.",
+        ttk.Label(controls, text="Raw optical sketch reads A0 only and plots commanded voltage. "
+                  "Legacy dual mode can also monitor board pin 8 on A1.",
                   wraplength=275).grid(row=11, column=0, columnspan=2, sticky="w", pady=(0, 12))
         self.impulse_play_button = ttk.Button(controls, text="Play square wave", style="Accent.TButton",
                                                command=lambda: self.start_impulse("square"))
@@ -72,7 +73,7 @@ class ImpulseMixin:
         self.impulse_export_button = ttk.Button(controls, text="Export trace CSV", style="Accent.TButton",
                                                  command=self.export_impulse, state="disabled")
         self.impulse_export_button.grid(row=16, column=0, columnspan=2, sticky="ew", pady=(12, 3))
-        self.impulse_status = tk.StringVar(value="Raw stream: tagged 7-bit A0/A1 pairs.")
+        self.impulse_status = tk.StringVar(value="Raw stream: optical A0 samples with jump flags.")
         ttk.Label(controls, textvariable=self.impulse_status, wraplength=275).grid(
             row=17, column=0, columnspan=2, sticky="w", pady=(10, 0))
         self.impulse_average_var = tk.StringVar()
@@ -81,7 +82,7 @@ class ImpulseMixin:
         self.impulse_average_entry = ttk.Entry(
             controls, textvariable=self.impulse_average_var, width=10)
         self.impulse_average_entry.grid(row=18, column=1, sticky="w", padx=(8, 0), pady=(12, 0))
-        ttk.Label(controls, text="Blank or 0 shows raw samples; CSV always exports raw A0/A1 data.",
+        ttk.Label(controls, text="Blank or 0 shows raw samples; CSV exports optical samples and jump flags.",
                   wraplength=275).grid(row=19, column=0, columnspan=2, sticky="w")
         ttk.Label(controls, text="Times are in seconds: 1e-3 = 1 ms, 5e-2 = 50 ms. "
                   "Each edge takes ~1.9 ms to send at 115200 baud, so shorter pulses stretch. "
@@ -97,8 +98,6 @@ class ImpulseMixin:
                 raise RuntimeError("Wait for the current calibration or scan to finish")
             if self.read_power_button.instate(["disabled"]):
                 raise RuntimeError("Wait for the current Arduino reading to finish")
-            if not self.impulse_input_ready.get():
-                raise ValueError("Confirm that the pin 8 signal at Arduino A1 stays within 0–5 V")
             fields = self.impulse_fields
             low = float(fields["Low voltage [V]"].get())
             high = float(fields["High voltage [V]"].get())
@@ -117,12 +116,15 @@ class ImpulseMixin:
             switch = self.impulse_switch_var.get()
             if not self.controller.connected or self.controller.settings["dry_run"]:
                 raise RuntimeError("Connect the physical voltage board first")
+            raw_optical_only = self.power_meter.settings["stream_format"] == "raw"
+            if not raw_optical_only and not self.impulse_input_ready.get():
+                raise ValueError("Confirm that the pin 8 signal at Arduino A1 stays within 0–5 V")
             if self.controller.settings["mapping"].get(switch) is None:
                 raise ValueError(f"Assign a board pin to {switch} first")
-            if 8 in self.controller.settings["mapping"].values():
+            if not raw_optical_only and 8 in self.controller.settings["mapping"].values():
                 raise ValueError("Board pin 8 must be unassigned to mirror the pulse")
             if not self.power_meter.connected or self.power_meter.settings["stream_format"] not in ("raw", "dual"):
-                raise RuntimeError("Connect the Arduino with the raw A0/A1 stream selected")
+                raise RuntimeError("Connect the Arduino with the raw optical or legacy dual stream selected")
             # Confirm here: a prompt during the run would stall the pulse timing.
             self.confirm_voltage_sweep([low, high], names=[switch])
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
@@ -135,6 +137,7 @@ class ImpulseMixin:
         for child in self.impulse_plot_area.winfo_children():
             child.destroy()
         figure = Figure(figsize=(7, 5), dpi=100, facecolor=BG)
+        self.impulse_raw_optical_only = raw_optical_only
         self.impulse_average_ms = average_ms
         self.impulse_optical_axis = figure.add_subplot(111, facecolor=PANEL)
         self.impulse_electrical_axis = self.impulse_optical_axis.twinx()
@@ -143,7 +146,9 @@ class ImpulseMixin:
         self.impulse_optical_line, = self.impulse_optical_axis.plot(
             [], [], color=POWER_METER_COLOR, linewidth=1.5, label=optical_label)
         self.impulse_electrical_line, = self.impulse_electrical_axis.plot(
-            [], [], color=OSA_COLOR, linewidth=1.5, label="Electrical monitor · A1")
+            [], [], color=OSA_COLOR, linewidth=1.5,
+            drawstyle="steps-post" if raw_optical_only else "default",
+            label="Commanded voltage" if raw_optical_only else "Electrical monitor · A1")
         self.impulse_optical_axis.set(xlabel="Time since first sample",
                                       ylabel=f"Optical power [{self.power_meter.settings['unit']}]")
         self.impulse_optical_axis.xaxis.set_major_locator(MaxNLocator(nbins=6, min_n_ticks=3))
@@ -154,6 +159,7 @@ class ImpulseMixin:
             for spine in axis.spines.values():
                 spine.set_color(WIRE)
         self.impulse_electrical_axis.set_ylabel(
+            "Commanded voltage [V]" if raw_optical_only else
             f"Electrical signal [ADC counts, 0–{self.power_meter.full_scale}]")
         self.impulse_optical_axis.tick_params(axis="y", colors=POWER_METER_COLOR)
         self.impulse_electrical_axis.tick_params(axis="y", colors=OSA_COLOR)
@@ -162,7 +168,7 @@ class ImpulseMixin:
         self.impulse_optical_axis.grid(True, color="#aab5c4", alpha=0.4)
         figure.suptitle(f"{switch} · {mode.capitalize()} pulse response", color=TEXT, y=0.99)
         figure.legend((self.impulse_optical_line, self.impulse_electrical_line),
-                      (optical_label, "Electrical monitor · A1"),
+                      (optical_label, "Commanded voltage" if raw_optical_only else "Electrical monitor · A1"),
                       loc="upper center", bbox_to_anchor=(0.5, 0.95), ncol=2,
                       facecolor=PANEL, edgecolor=WIRE, labelcolor=TEXT)
         figure.subplots_adjust(left=0.13, right=0.84, bottom=0.18, top=0.83)
@@ -181,6 +187,7 @@ class ImpulseMixin:
         self.impulse_stop_event = threading.Event()
         self.impulse_trace = None
         self.impulse_running = True
+        self.begin_activity("impulse", f"Recording {mode} pulse on {switch}...")
         self.impulse_play_button.configure(state="disabled")
         self.impulse_single_button.configure(state="disabled")
         self.impulse_stop_button.configure(state="normal")
@@ -189,7 +196,7 @@ class ImpulseMixin:
         self.read_power_button.configure(state="disabled")
         for tab in (self.route_tab, self.hardware_tab, self.calibration_tab, self.crosstalk_tab):
             self.set_tab_state(tab, "disabled")
-        self.impulse_status.set(f"Recording {mode} pulse on {switch} and board pin 8...")
+        self.impulse_status.set(f"Recording {mode} pulse on {switch} with optical A0...")
 
         def progress(trace):
             self.after(0, lambda: self.render_impulse_trace(trace))
@@ -209,7 +216,7 @@ class ImpulseMixin:
     def stop_impulse(self):
         if self.impulse_stop_event is not None:
             self.impulse_stop_event.set()
-            self.impulse_status.set("Stopping and returning both board pins to the low voltage...")
+            self.impulse_status.set("Stopping and returning the switch to the low voltage...")
 
     def render_impulse_trace(self, trace):
         if self.impulse_canvas is None:
@@ -226,11 +233,18 @@ class ImpulseMixin:
             return
         times = [sample[0] for sample in shown]
         optical = [sample[3] for sample in shown]
-        electrical = [sample[2] for sample in shown]
+        if self.impulse_raw_optical_only:
+            events = sorted(trace.voltage_events)
+            electrical_times = [times[0]] + [event[0] for event in events] + [times[-1]]
+            electrical = [trace.low_v] + [event[1] for event in events]
+            electrical.append(electrical[-1])
+        else:
+            electrical_times = times
+            electrical = [sample[2] for sample in shown]
         left = self.impulse_optical_axis
         right = self.impulse_electrical_axis
         self.impulse_optical_line.set_data(times, optical)
-        self.impulse_electrical_line.set_data(times, electrical)
+        self.impulse_electrical_line.set_data(electrical_times, electrical)
         if not navigating:
             left.set_xlim(min(0, times[0]) if not self.impulse_running else max(0, times[-1] - LIVE_PLOT_WINDOW_S),
                           max(0.0001, times[-1]))
@@ -244,15 +258,19 @@ class ImpulseMixin:
         rate = (len(trace.samples) / trace.capture_elapsed_s if trace.sample_period_s and trace.capture_elapsed_s
                 else received_pair_rate(trace.samples, window_s=1.0 if self.impulse_running else None))
         self.impulse_status.set(
-            f"{trace.mode.capitalize()} trace: {len(trace.samples)} paired samples, "
-            f"~{rate:,.0f} pairs/s · " +
-            (f"{trace.sample_period_s * 1e6:.1f} µs measured pairs · " if trace.sample_period_s else "") +
+            f"{trace.mode.capitalize()} trace: {len(trace.samples)} samples, "
+            f"~{rate:,.0f} samples/s · " +
+            (f"{trace.sample_period_s * 1e6:.1f} µs measured spacing · " if trace.sample_period_s else "") +
             (f"{trace.skipped_bytes} bytes resynced · " if trace.skipped_bytes else "") +
+            (f"{len(trace.jump_indices)} jumps marked · " if trace.jump_indices else "") +
             (f"showing latest {LIVE_PLOT_WINDOW_S:g} s" if self.impulse_running else "full recording; use zoom to inspect edges")
         )
+        if self.impulse_running:
+            self.update_activity("impulse", detail=f"Recording {trace.mode}: {len(trace.samples)} samples")
 
     def finish_impulse(self, switch, low, trace=None, error=None):
         self.impulse_running = False
+        self.finish_activity("impulse", "Impulse test failed" if error else "Impulse test complete")
         self.impulse_stop_event = None
         self.impulse_play_button.configure(state="normal")
         self.impulse_single_button.configure(state="normal")
@@ -274,8 +292,8 @@ class ImpulseMixin:
             rate = (len(trace.samples) / trace.capture_elapsed_s if trace.sample_period_s and trace.capture_elapsed_s
                     else received_pair_rate(trace.samples))
             self.impulse_status.set(
-                f"Trace ready: {len(trace.samples)} optical/electrical pairs "
-                f"(~{rate:,.0f} pairs/s"
+                f"Trace ready: {len(trace.samples)} optical samples "
+                f"(~{rate:,.0f} samples/s"
                 + (f", {trace.sample_period_s * 1e6:.1f} µs measured spacing" if trace.sample_period_s else "")
                 + (f", {trace.skipped_bytes} bytes resynced" if trace.skipped_bytes else "")
                 + "). Export CSV to save it."

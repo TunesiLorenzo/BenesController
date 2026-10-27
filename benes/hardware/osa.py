@@ -11,7 +11,7 @@ SPURIOUS_TAIL_POINTS = 2
 
 
 def find_laser_wavelengths(wavelength, power, count=6, min_separation_nm=0.1,
-                           min_prominence_db=3.0):
+                           min_prominence_db=3.0, wavelength_range_nm=None):
     """Return the ``count`` strongest distinct OSA peaks, high wavelength first.
 
     The six-laser calibration needs the physical wavelength ordering, rather
@@ -28,6 +28,10 @@ def find_laser_wavelengths(wavelength, power, count=6, min_separation_nm=0.1,
         raise ValueError("The minimum peak separation must be positive")
     if not math.isfinite(min_prominence_db) or min_prominence_db < 0:
         raise ValueError("The minimum peak prominence cannot be negative")
+    if wavelength_range_nm is not None:
+        lower_nm, upper_nm = wavelength_range_nm
+        if not (math.isfinite(lower_nm) and math.isfinite(upper_nm) and lower_nm < upper_nm):
+            raise ValueError("The laser wavelength range must have finite increasing limits")
 
     samples = []
     for item_wavelength, item_power in zip(wavelength, power):
@@ -50,6 +54,8 @@ def find_laser_wavelengths(wavelength, power, count=6, min_separation_nm=0.1,
     candidates = []
     for index in range(1, len(samples) - 1):
         wavelength_nm, power_dbm = samples[index]
+        if wavelength_range_nm is not None and not lower_nm <= wavelength_nm <= upper_nm:
+            continue
         if power_dbm < samples[index - 1][1] or power_dbm < samples[index + 1][1]:
             continue
         # At least one strict neighbour prevents a flat portion of the noise
@@ -71,21 +77,27 @@ def find_laser_wavelengths(wavelength, power, count=6, min_separation_nm=0.1,
         raise ValueError(
             f"Found only {len(selected)} of {count} distinct laser peaks. Ensure all six lasers are visible "
             "in the OSA trace and their peaks are at least 3 dB above the local baseline."
+            + ("" if wavelength_range_nm is None else f" Search range: {lower_nm:g}–{upper_nm:g} nm.")
         )
     return sorted(selected, reverse=True)
 
 
-def distinct_laser_wavelengths(wavelengths, count=6, min_separation_nm=0.1):
+def distinct_laser_wavelengths(wavelengths, count=6, min_separation_nm=0.1,
+                               wavelength_range_nm=None):
     """Validate and order peak positions collected from multiple OSA outputs."""
     if not math.isfinite(min_separation_nm) or min_separation_nm <= 0:
         raise ValueError("The minimum peak separation must be positive")
+    if wavelength_range_nm is not None:
+        lower_nm, upper_nm = wavelength_range_nm
+        if not (math.isfinite(lower_nm) and math.isfinite(upper_nm) and lower_nm < upper_nm):
+            raise ValueError("The laser wavelength range must have finite increasing limits")
     values = []
     for value in wavelengths:
         try:
             value = float(value)
         except (TypeError, ValueError) as error:
             raise ValueError("A detected laser wavelength is not numeric") from error
-        if math.isfinite(value):
+        if math.isfinite(value) and (wavelength_range_nm is None or lower_nm <= value <= upper_nm):
             values.append(value)
     selected = []
     for value in sorted(values, reverse=True):

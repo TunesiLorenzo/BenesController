@@ -16,7 +16,7 @@ from benes.measurements.dataset_registry import (analyze_dataset, create_dataset
                                                  write_coverage_report)
 from benes.measurements.spectrum_export import write_spectra
 from benes.measurements.wdm_comb import (INPUTS, create_wdm_folder, evaluate_configuration,
-                                         routed_wavelengths, save_wdm_scan, scan_outputs,
+                                         power_ratio_db, routed_wavelengths, save_wdm_scan, scan_outputs,
                                          simulated_comb_spectrum)
 from benes.paths import app_dir
 
@@ -133,10 +133,10 @@ class DatasetMixin:
                   font=("Segoe UI", 14, "bold")).pack(anchor="w")
         ttk.Label(summary, text="The report counts the six routed input→output paths required for each expected permutation.",
                   wraplength=700).pack(anchor="w", pady=(2, 8))
-        ttk.Label(summary, text="Live normalized optical metrics", foreground=ACCENT,
+        ttk.Label(summary, text="Live optical power ratios", foreground=ACCENT,
                   font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(4, 2))
         ttk.Label(summary, text=("Each row is one input wavelength at one switch state. Transmission and crosstalk "
-                                 "are normalized by that wavelength's linear power summed across all six outputs."),
+                                 "are in dB relative to that wavelength's linear power summed across measured outputs."),
                   foreground="#9baec6", wraplength=700).pack(anchor="w", pady=(0, 4))
         metrics_frame = ttk.Frame(summary)
         metrics_frame.pack(fill="x", pady=(0, 10))
@@ -144,10 +144,10 @@ class DatasetMixin:
                          tuple(f"out{port}" for port in OUTPUTS)
         self.dataset_metrics_table = ttk.Treeview(metrics_frame, columns=metric_columns, show="headings", height=8)
         headings = {"state": "Switch state", "permutation": "Outputs", "input": "Input", "wavelength": "λ [nm]",
-                    "total": "Total [dBm]", "expected": "Expected", "transmission": "Tx / total [%]"}
-        headings.update({f"out{port}": f"Out {port} XT [%]" for port in OUTPUTS})
+                    "total": "Total [dBm]", "expected": "Expected", "transmission": "Tx / total [dB]"}
+        headings.update({f"out{port}": f"Out {port} XT / total [dB]" for port in OUTPUTS})
         widths = {"state": 125, "permutation": 110, "input": 60, "wavelength": 85, "total": 85,
-                  "expected": 75, "transmission": 95, **{f"out{port}": 80 for port in OUTPUTS}}
+                  "expected": 75, "transmission": 115, **{f"out{port}": 125 for port in OUTPUTS}}
         for column in metric_columns:
             self.dataset_metrics_table.heading(column, text=headings[column])
             self.dataset_metrics_table.column(column, width=widths[column], anchor="center")
@@ -180,6 +180,7 @@ class DatasetMixin:
         self.wdm_comb_var = tk.StringVar(value=" ".join(f"{line:g}" for line in settings["comb_lines"]))
         self.wdm_window_var = tk.StringVar(value=f"{settings['half_window_nm']:g}")
         self.wdm_settle_var = tk.StringVar(value=f"{settings['settle_s']:g}")
+        self.wdm_evaluation_sweeps_var = tk.StringVar(value=str(settings["evaluation_sweeps"]))
         self.wdm_output_vars = {output: tk.BooleanVar(value=True) for output in OUTPUTS}
         self.wdm_comment_var = self.dataset_comment_var
         self.wdm_dataset_var = tk.BooleanVar(value=True)
@@ -205,13 +206,16 @@ class DatasetMixin:
         ttk.Label(scan, text="OSA/JDSU settling [s]").grid(row=8, column=0, sticky="w", pady=2)
         ttk.Entry(scan, textvariable=self.wdm_settle_var, width=8).grid(
             row=8, column=1, sticky="w", padx=(8, 0), pady=2)
+        ttk.Label(scan, text="Evaluate sweeps per output").grid(row=9, column=0, sticky="w", pady=2)
+        ttk.Entry(scan, textvariable=self.wdm_evaluation_sweeps_var, width=8).grid(
+            row=9, column=1, sticky="w", padx=(8, 0), pady=2)
         ttk.Button(scan, text="Save six-laser configuration", command=self.save_wdm_plan).grid(
-            row=9, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+            row=10, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         ttk.Label(scan, text=("Evaluate Configuration always scans all six outputs using this saved plan. "
                               "Dataset Coverage has separate batch acquisition actions."), foreground="#9baec6",
-                  wraplength=280).grid(row=10, column=0, columnspan=2, sticky="w", pady=(6, 0))
+                  wraplength=280).grid(row=11, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Label(scan, textvariable=self.wdm_status_var, foreground="#9baec6", wraplength=280).grid(
-            row=11, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            row=12, column=0, columnspan=2, sticky="w", pady=(6, 0))
         comb.bind("<FocusOut>", lambda _event: self.update_wdm_comb_choices())
         self.update_wdm_routing()
 
@@ -293,6 +297,7 @@ class DatasetMixin:
         settings = self.wdm_plan.settings
         comment = self.dataset_comment_var.get()
         self.dataset_batch_running = True
+        self.begin_activity("dataset", "Preparing dataset acquisition...", len(configurations) * len(OUTPUTS) + 1)
         self.dataset_batch_stop_event = threading.Event()
         self.dataset_active_scan_button.configure(state="disabled")
         self.dataset_all_scan_button.configure(state="disabled")
@@ -319,14 +324,23 @@ class DatasetMixin:
                     routed = routed_wavelengths(mapping, assignment)
                     self.after(0, lambda i=index, total=len(configurations): self.dataset_status_var.set(
                         f"Configuration {i}/{total}: scanning six outputs..."))
+                    self.after(0, lambda i=index, total=len(configurations): self.update_activity(
+                        "dataset", detail=f"Dataset configuration {i}/{total}: applying controls..."))
 
                     def read(output):
                         if simulate:
                             return simulated_comb_spectrum(assignment, routed[output][0])
                         return osa.get_spectrum(host, port, fresh_sweeps=POST_SWITCH_SWEEPS)
 
+                    def on_result(result, output_index, output_total):
+                        self.after(0, lambda i=index, o=result.output, oi=output_index, ot=output_total:
+                                   self.update_activity(
+                                       "dataset", (i - 1) * len(OUTPUTS) + oi,
+                                       detail=f"Dataset configuration {i}/{len(configurations)}: "
+                                              f"output {o} ({oi}/{ot})"))
+
                     results = scan_outputs(switch, read, OUTPUTS, mapping, assignment, settings["half_window_nm"],
-                                           settings["settle_s"], stop_event=stop_event)
+                                           settings["settle_s"], on_result=on_result, stop_event=stop_event)
                     if len(results) != len(OUTPUTS):
                         break
                     self.after(0, lambda p=permutation, s=dict(states), r=results:
@@ -346,6 +360,8 @@ class DatasetMixin:
                         extra={"results_folder": str(folder), "batch_scope": scope})
                     save_wdm_scan(record, results, context, comment)
                     saved += 1
+                    self.after(0, lambda i=index: self.update_activity(
+                        "dataset", detail=f"Saved dataset configuration {i}/{len(configurations)}"))
             except Exception as error_value:
                 error = str(error_value)
             finally:
@@ -376,18 +392,18 @@ class DatasetMixin:
                 for states in (dict(zip(names, bits)),)]
 
     def add_dataset_batch_metrics(self, permutation, states, results, assignment):
-        """Append normalized per-wavelength metrics for one measured switch state."""
+        """Append per-wavelength power ratios for one measured switch state."""
         fmt = lambda value: "—" if value is None else f"{value:.2f}"
         state = " ".join(f"{name}={'X' if states[name] else '='}" for name in self.network.switches)
         mapping = tuple(output - 1 for output in permutation)
         for item in evaluate_configuration(results, mapping, assignment):
             crosstalk = ["—" if port == item.expected_output else fmt(
-                None if item.normalized_crosstalk.get(port) is None else item.normalized_crosstalk[port] * 100)
+                power_ratio_db(item.normalized_crosstalk.get(port)))
                          for port in OUTPUTS]
             self.dataset_metrics_table.insert("", "end", values=(
                 state, " ".join(map(str, permutation)), f"In {item.input_port}", f"{item.wavelength_nm:.3f}",
                 fmt(item.total_power_dbm), f"Out {item.expected_output}",
-                fmt(None if item.normalized_transmission is None else item.normalized_transmission * 100),
+                fmt(power_ratio_db(item.normalized_transmission)),
                 *crosstalk))
 
     def stop_dataset_batch(self):
@@ -397,6 +413,8 @@ class DatasetMixin:
 
     def finish_dataset_batch(self, saved, total, error, stopped):
         self.dataset_batch_running = False
+        self.finish_activity("dataset", f"Dataset acquisition {'failed' if error else 'stopped' if stopped else 'complete'}: "
+                             f"{saved}/{total} configurations saved")
         self.dataset_batch_stop_event = None
         self.dataset_active_scan_button.configure(state="normal")
         self.dataset_all_scan_button.configure(state="normal")
@@ -481,10 +499,34 @@ class DatasetMixin:
     def analyze_linked_dataset(self):
         try:
             root = self.dataset_root()
-            report = analyze_dataset(root)
-            csv_path = write_coverage_report(root, report)
         except (OSError, ValueError) as error:
             messagebox.showerror("Dataset analysis failed", str(error), parent=self)
+            return
+        self.dataset_analysis_request += 1
+        request = self.dataset_analysis_request
+        self.begin_activity("dataset_analysis", "Evaluating dataset coverage...")
+
+        def worker():
+            try:
+                with self.dataset_analysis_lock:
+                    report = analyze_dataset(root)
+                    csv_path = write_coverage_report(root, report)
+            except Exception as error:
+                self.after(0, lambda message=str(error): self.finish_dataset_analysis(request, root=root, error=message))
+            else:
+                self.after(0, lambda: self.finish_dataset_analysis(request, root, report, csv_path))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_dataset_analysis(self, request, root=None, report=None, csv_path=None, error=None):
+        if request != self.dataset_analysis_request:
+            return
+        if root is not None and root != Path(self.dataset_folder_var.get().strip()):
+            self.finish_activity("dataset_analysis", "Dataset selection changed")
+            return
+        if error:
+            self.finish_activity("dataset_analysis", "Dataset analysis failed")
+            messagebox.showerror("Dataset analysis failed", error, parent=self)
             return
         active = self.active_dataset_permutation()
         active_item = next((item for item in report["configurations"] if item["permutation"] == active), None)
@@ -516,6 +558,7 @@ class DatasetMixin:
                 lines.append(f"  … plus {len(incomplete) - 30} more in {csv_path.name}")
         self.set_dataset_report("\n".join(lines))
         self.dataset_status_var.set(f"Coverage analysed: {report['missing_paths']} routed path(s) still missing.")
+        self.finish_activity("dataset_analysis", "Dataset coverage updated")
 
     def set_dataset_report(self, text):
         self.dataset_report.configure(state="normal")

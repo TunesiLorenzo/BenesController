@@ -1,5 +1,6 @@
 """Main window: shared state, notebook and lifecycle. Each tab lives in its own mixin module."""
 
+import json
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -7,12 +8,14 @@ from tkinter import messagebox, ttk
 from benes.core.network import BenesNetwork
 from benes.gui.theme import ACCENT, BG, apply_theme
 from benes.gui.widgets import ScrollableFrame
+from benes.hardware.laser_bank import LaserBank
 from benes.hardware.newport_laser import NewportLaserController, NewportPanel
+from benes.hardware.hp8152a import DEFAULT_RESOURCE
 from benes.hardware.osa_output_switch import OUTPUTS, OSAOutputSwitch
 from benes.hardware.power_meter import ArduinoPowerMeter
 from benes.hardware.voltage_controller import BenesVoltageController
 from benes.measurements.wdm_comb import WDMPlan
-from benes.gui.calibration import CalibrationMixin
+from benes.gui.calibration import DETECT_OSA, METER_HP, METER_VIA_JDSU, CalibrationMixin
 from benes.gui.crosstalk import CrosstalkMixin
 from benes.gui.dataset import DatasetMixin
 from benes.gui.hardware import HardwareMixin
@@ -21,6 +24,7 @@ from benes.gui.mapping import MappingMixin
 from benes.gui.routing import RoutingMixin
 from benes.gui.spectra import SpectraMixin
 from benes.gui.wdm import WDMMixin
+from benes.paths import app_dir
 
 
 class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, CrosstalkMixin,
@@ -46,6 +50,7 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
         self.osa_output_switch = OSAOutputSwitch()
         self.newport_controller = NewportLaserController()
         self.newport_window = None
+        self.laser_bank = LaserBank(self.newport_controller)
         # The lab always drives the real JDSU; Dry run stays available in Selector setup.
         self.osa_output_switch.settings["dry_run"] = False
         self.wdm_plan = WDMPlan()
@@ -53,8 +58,12 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
         self.wdm_stop_event = None
         self.dataset_batch_running = False
         self.dataset_batch_stop_event = None
+        self.dataset_analysis_lock = threading.Lock()
+        self.dataset_analysis_request = 0
         self.scan_settings = {}
         self.crosstalk_running = False
+        self.hp_meter_busy = None
+        self.hp_stream_stop = None
         self.crosstalk_data = {}
         self.crosstalk_data_source = None
         self.crosstalk_data_unit = None
@@ -114,7 +123,24 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
         self.arduino_unit_var = tk.StringVar(value=self.power_meter.settings["unit"])
         self.arduino_stream_var = tk.StringVar(value=self.power_meter.settings["stream_format"])
         self.arduino_ceiling_var = tk.StringVar(value=f"{self.power_meter.settings['ceiling']:g}")
+        self.arduino_jump_guard_var = tk.StringVar(value=f"{self.power_meter.settings['jump_guard_ms']:g}")
         self.power_reading_var = tk.StringVar(value="No Arduino reading yet")
+        try:
+            hp_settings = json.loads((app_dir() / "benes_hp8152a_config.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            hp_settings = {}
+        self.hp_meter_resource_var = tk.StringVar(value=hp_settings.get("resource", DEFAULT_RESOURCE))
+        self.hp_meter_channel_var = tk.StringVar(value=hp_settings.get("channel", "A"))
+        self.hp_meter_wavelength_var = tk.StringVar(value=str(hp_settings.get("wavelength_nm", 1550)))
+        self.hp_meter_range_var = tk.StringVar(value=hp_settings.get("range", "Auto"))
+        self.hp_stream_hz_var = tk.StringVar(value="5")
+        # How MZI calibration and the crosstalk matrix read a probe (set in the MZI calibration tab).
+        self.detection_method_var = tk.StringVar(value=DETECT_OSA)
+        self.detection_meter_var = tk.StringVar(value=METER_HP)
+        self.detection_position_var = tk.StringVar(value=METER_VIA_JDSU)
+        self.laser_slot_vars = {port: tk.StringVar(value=str(slot))
+                                for port, slot in self.laser_bank.settings["slots"].items()}
+        self.laser_settle_var = tk.StringVar(value=f"{self.laser_bank.settings['settle_s']:g}")
         apply_theme(self)
 
         header = ttk.Frame(self, padding=(24, 14, 24, 6))
@@ -122,6 +148,15 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
         ttk.Label(header, text="BENES LAB", foreground=ACCENT, font=("Segoe UI", 10, "bold")).pack(anchor="w")
         ttk.Label(header, text="6 × 6 photonic routing", font=("Segoe UI", 22, "bold")).pack(anchor="w")
         ttk.Label(header, text="Route · calibrate · measure", foreground="#9baec6").pack(anchor="w", pady=(2, 0))
+
+        self.activities = {}
+        self.activity_text = tk.StringVar(value="Ready")
+        activity_strip = ttk.Frame(self, padding=(24, 4, 24, 10))
+        activity_strip.pack(fill="x")
+        ttk.Label(activity_strip, textvariable=self.activity_text).pack(anchor="w")
+        self.activity_bar = ttk.Progressbar(activity_strip, mode="determinate", maximum=1,
+                                            style="Activity.Horizontal.TProgressbar")
+        self.activity_bar.pack(fill="x", pady=(4, 0))
 
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=12, pady=(0, 12))
@@ -156,6 +191,47 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
     def set_tab_state(self, tab, state):
         self.notebook.tab(self.tab_page(tab), state=state)
 
+    def begin_activity(self, key, label, total=None):
+        """Show a running job in the fixed status strip; call from the Tk thread."""
+        self.activities[key] = {"label": label, "detail": label, "done": 0, "total": total}
+        self._render_activity()
+
+    def update_activity(self, key, done=None, total=None, detail=None):
+        if key not in self.activities:
+            return
+        activity = self.activities[key]
+        if done is not None:
+            activity["done"] = done
+        if total is not None:
+            activity["total"] = total
+        if detail is not None:
+            activity["detail"] = detail
+        self._render_activity()
+
+    def finish_activity(self, key, detail):
+        self.activities.pop(key, None)
+        if self.activities:
+            self._render_activity()
+        else:
+            self.activity_bar.stop()
+            self.activity_bar.configure(mode="determinate", maximum=1, value=1)
+            self.activity_text.set(detail)
+
+    def _render_activity(self):
+        if not self.activities:
+            return
+        activity = next(reversed(self.activities.values()))
+        total = activity["total"]
+        if total is None:
+            if str(self.activity_bar.cget("mode")) != "indeterminate":
+                self.activity_bar.configure(mode="indeterminate")
+                self.activity_bar.start(12)
+        else:
+            self.activity_bar.stop()
+            self.activity_bar.configure(mode="determinate", maximum=max(1, total),
+                                        value=min(activity["done"], total))
+        self.activity_text.set(activity["detail"])
+
     def fit_dialog_to_screen(self, dialog, preferred_width=900, preferred_height=650):
         """Size a dialog within the current display, leaving OS chrome visible."""
         width = min(preferred_width, max(480, self.winfo_screenwidth() - 100))
@@ -182,6 +258,13 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
         return accepted[0]
 
     def close(self):
+        if self.hp_meter_busy == "stream":
+            self.stop_hp_stream()
+            messagebox.showinfo("HP meter stream", "Stopping the HP meter stream. Close again when it has stopped.", parent=self)
+            return
+        if self.hp_meter_busy == "test":
+            messagebox.showinfo("HP meter test", "Wait for the HP meter test to finish.", parent=self)
+            return
         if self.newport_panel.busy:
             messagebox.showinfo("Newport operation", "Wait for the Newport command to finish.", parent=self)
             return

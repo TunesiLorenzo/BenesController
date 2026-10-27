@@ -1,3 +1,7 @@
+// Archived tagged A0/A1 sketch. The current "raw" mode uses
+// ArduinoOptical/ArduinoOptical.ino instead; this two-byte A0/A1 format is
+// not accepted by the optical-only decoder. The "dual" mode expects an older
+// six-byte framed sketch, not this archived tagged sketch.
 // Uno R3 tagged A0/A1 stream for BenesController, at 2,000,000 baud
 // (1,000,000 also works; set the same baud in the GUI).
 // Streams continuously from power-up as fast as the loop runs; no commands.

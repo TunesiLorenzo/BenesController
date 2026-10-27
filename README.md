@@ -32,6 +32,12 @@ tests/                unittest suite
 Settings (`benes_*_config.json`) and `Results/` stay in the project folder, or beside
 the exe when frozen.
 
+The status strip below the window title stays visible across tabs during OSA
+reads, configuration evaluation, calibration, dataset acquisition, crosstalk
+and voltage scans, and impulse capture. It names the current step and shows a
+counted progress bar when the work has a known number of measurements; other
+operations show an animated bar.
+
 ## Board control and calibration
 
 The GUI uses the existing sibling `../VoltageTuner/board.py` implementation, so
@@ -48,8 +54,8 @@ recorded, toggling a switch or applying a route sends the voltage for its logica
 state. Mapping, connection settings, voltages, and calibration points are kept in
 `benes_voltage_config.json` beside the application. It is created on first change.
 The route diagram starts with every MZI crossed, matching the 0 V physical state.
-New configurations leave board pin 8 free for the impulse monitor. Existing pin
-mappings are preserved; unassign pin 8 from any MZI before an impulse test.
+New configurations leave board pin 8 free for the optional legacy dual-channel
+impulse monitor. Existing pin mappings are preserved.
 The default scan limits are 0–5 V. A voltage outside this range requires a
 confirmation before the board sends it; the prompt reminds you to disconnect
 the Arduino sampler from the voltage-board signal and check the heater current
@@ -57,8 +63,19 @@ limit.
 
 The UI is organized by workflow: **Routing**, **Hardware & OSA**, **MZI
 calibration**, **Thermal crosstalk**, and **Impulse test**. Hardware & OSA separates the voltage board, OSA
-and its output selector, and Arduino meter into sub-tabs so every control remains
+and its output selector, Arduino meter, and HP 8152A meter into sub-tabs so every control remains
 visible on a laptop display.
+
+The **HP 8152A meter** hardware page streams triggered GPIB readings into a
+rolling plot and recent-samples table. Set the resource, channel, wavelength,
+range, and requested GPIB reads per second, then press **Start stream**. The
+default request is 5 Hz; **Apply read rate** changes the cadence while streaming
+(0.1–100 Hz). The status reports the achieved transfer rate, which may be lower
+than requested. **Stop** closes the connection and restores the meter's previous
+settings. Invalid or out-of-range readings appear as such in the table and as
+gaps in the plot. The meter settings are shared with Thermal crosstalk, and the
+stream must stop before a crosstalk meter test or scan can start. The GPIB read
+cadence does not change the meter's 2/8 Hz optical low-pass filter.
 
 Every tab and dialog stretches to fill its window and scrolls when the window
 is smaller than its content. Vertical and horizontal scrollbars appear only
@@ -72,11 +89,16 @@ below its scrolling table. Plots rescale with the window down to about
 
 The **Newport lasers** tab connects to the 9016 at `GPIB0::19::INSTR` by
 default. It reads the installed modules and shows separate **Laser current**
-and **TEC temperature** output states for each of the 16 slots. **Turn ON** and
-**Turn OFF** act on one output at a time; they use the current and temperature
-setpoints already configured on the Newport controller. **Refresh** rereads
-the output states. **ALL OFF** turns off every laser output first, then every
-TEC output, and reports any channel that could not be confirmed off.
+and **TEC temperature** output states and setpoints for each of the 16 slots.
+Enter a laser current in mA or TEC temperature in °C and press its **Set**
+button. When the corresponding output is off, Set selects constant current or
+constant temperature mode if needed, writes the value, and verifies readback.
+If the output is on in a different mode, turn it off before changing modes.
+**Turn ON** and **Turn OFF** act on one output at a time. The laser and TEC
+sections are highlighted green independently when their outputs are on.
+**Refresh** rereads output states and setpoints.
+**ALL CURRENT OFF** turns off every laser output while leaving TEC outputs
+unchanged and reports any channel that could not be confirmed off.
 
 **Detach** opens the controls in their own scrollable window; **Attach** or the
 window close button returns them to the main tab. The connection remains open
@@ -119,8 +141,13 @@ Physical mode needs NI-VISA and `python -m pip install pyvisa`.
 OSA/JDSU settling delay. **Evaluate Configuration** on the **Routing** tab
 always scans all six output ports using that persisted configuration. Its result
 window overlays the six spectra and includes a table for every wavelength:
-linear-sum power across all outputs, expected routed output, transmission at
-that output, and crosstalk at each other output in dBc.
+linear-sum power across all outputs in dBm, expected routed output, transmission
+there in dBm, and transmission and crosstalk ratios relative to the total in dB.
+Set **Evaluate sweeps per output** under **Dataset coverage** and save the
+six-laser configuration to average 1–16 fresh OSA sweeps at each output (default
+10). Each trace is averaged in linear power before the evaluation and spectra
+CSV are calculated; `wdm_scan.json` records the sweep count. More sweeps take
+longer and reduce sample variation, but cannot correct a shifted coupling mean.
 
 The saved plan records which comb wavelength enters each input. Configure the
 wavelengths under **Dataset coverage**; an input left empty carries no line. The
@@ -148,14 +175,21 @@ saved in `Results/WDM_scan/<timestamp>/`:
 - `wdm_spectra.csv`: all spectra.
 - `wdm_scan.json`: permutation, wavelength plan, delays, JDSU map, switch states and voltages.
 
+The **Export image, controls and data to results** button in the evaluation
+window adds `configuration_evaluation.png`, `configuration_evaluation.csv`, and
+`configuration_controls.csv` to that scan folder. The control CSV records each
+switch's state and voltage captured when the scan started; the existing
+`wdm_spectra.csv` holds the measured spectrum data (averaged for evaluation
+when the sweep count is greater than one).
+
 **Dataset Coverage** has separate actions to scan the active control state or
 to run all 720 output permutations. Each action records the six routed pairs in
 the linked dataset and restores the original control state when it finishes.
 **Run all 4096 switch states** additionally measures every one of the 12-MZI
 bar/cross configurations, including configurations that realize the same output
 permutation. The live metrics table has one row per state and input wavelength:
-total line power over the six outputs, normalized expected-port transmission,
-and normalized crosstalk at the other outputs.
+total line power over the six outputs in dBm, and expected-port transmission
+and crosstalk at the other outputs in dB relative to that total.
 
 ## Permutation measurement datasets
 
@@ -182,68 +216,71 @@ permutations.
 
 ## Arduino power meter
 
-The same tab can instead use the Arduino detector stream from the sibling
-`../ThorlabsControl/ArduinoSampler.py`. Enter its port, baud rate, and sampling
-burst duration, then connect and choose **Read current power**. The reader
-averages the raw ADC samples and displays `ADC × scale + offset`; set the scale,
-offset, and unit to match the power-meter calibration. The latest scalar result
-is retained by the application for calibration. Arduino settings are stored in
-`benes_power_meter_config.json`.
+The same tab can use the Arduino detector stream from the sibling
+`../ThorlabsControl/ArduinoSampler.py`. Upload
+[ArduinoOptical.ino](ArduinoOptical/ArduinoOptical.ino), connect the detector
+output to A0, and select **Stream: raw**. This sketch samples A0 only. Every
+optical value has a second status byte whose low bit marks a sudden jump of at
+least 24 of the 7-bit ADC counts. The bit is a transition heuristic, not a
+readout of the power meter's actual range. A real optical step can also set it.
+The reader discards marked samples, the following **Jump guard [ms]** (default
+5 ms), and values at or above **Ceiling [ADC]** (default 80) before averaging.
+If no clean samples remain, the read fails instead of returning a biased value.
+The GUI reports clean/rejected counts and the observed raw frame rate. Set the
+burst duration, scale, offset, and unit for the converted power value. Settings
+are stored in `benes_power_meter_config.json`.
+
+With the Uno's 16 MHz clock and ADC prescaler 32, the ADC's 13-clock normal
+conversion is about 26 µs, a theoretical ceiling of 38,500 optical readings/s
+before `analogRead` and serial overhead. Two bytes per reading need about
+770 kbit/s including UART framing, so 1,000,000 baud can carry the default
+stream. For more speed, change the sketch's ADC prescaler from 32 to 16 and
+use 2,000,000 baud; the theoretical ADC ceiling becomes about 77,000/s, but
+ADC accuracy falls further and the achieved rate must be checked in the GUI.
+No baud change alone can make the ADC convert faster. The old
+[ArduinoDualChannel.ino](ArduinoDualChannel/ArduinoDualChannel.ino) is archived;
+its two-byte A0/A1 format is not accepted by the new raw optical decoder.
+**Stream: dual** remains available for an older *six-byte framed* A0/A1 sketch,
+and **Stream: legacy** for one-byte A0 firmware.
 
 ## Impulse test
 
-The **Impulse test** tab drives the selected MZI through the voltage board and
-sends the same low/high pattern to unused board pin 8. Connect the optical
-detector to Arduino A0 and board pin 8 to A1 after verifying that its signal
-stays within 0–5 V. Each edge sends the MZI and pin 8 commands in one serial
-write, without VoltageTuner's 10 ms per-command pause, so pin 8 lags the MZI by
-one command (~0.9 ms at 115200 baud).
-Upload [ArduinoDualChannel.ino](ArduinoDualChannel/ArduinoDualChannel.ino) to the
-Uno R3, then select **Stream: raw** and set **Baud** to the sketch's
-`Serial.begin` rate (1000000 or 2000000) before connecting. 2000000 is needed
-only if a faster ADC prescaler (8) pushes the stream past ~100 kB/s.
-The sketch streams continuously from power-up, as fast as its `analogRead` loop
-runs, and needs no commands. Each pair is two bytes holding 7-bit values
-(0–127), tagged by the top bit: `0xxxxxxx` is A0 optical and `1xxxxxxx` is A1
-electrical, read right after A0. The PC pairs each A0 byte with the A1 byte
-after it, so it can join the stream at any byte and resynchronizes by itself
-after a dropped byte; the number of skipped bytes is shown and exported.
-Each reading discards bytes that arrived before it starts. Power readings for
-calibration and crosstalk scans use the A0 values. The detector saturates
-near 80 counts, well below the 127 full scale, so **Ceiling [ADC]** (default
-80) sets the raw level treated as saturated; it is capped at the full scale.
-Older framed A0/A1 sketches remain available through **Stream: dual**, and
-one-byte A0 firmware through **Stream: legacy**, at their original baud rates.
+The **Impulse test** tab can capture the same optical-only raw stream. The
+second plot line shows the voltage commanded by the PC, not a measured
+electrical waveform. The jump flags are retained in CSV and are not removed
+from impulse traces, since real optical pulse edges can set the bit. The older
+dual A0/A1 sketch can still capture a measured electrical trace when selected
+as **Stream: dual**; only that mode needs the A1 voltage confirmation and free
+voltage-board pin 8.
 
 Set low and high voltages, then either play a square wave with **Period** and
 **High time**, or take a **Single pulse** with pulse and total measurement
 durations. **Lead-in** records the baseline before the first high level. Click
-**Stop** to end a square wave; both voltage-board outputs return to the low
-voltage. While A1 is connected, impulse voltages must stay within 0–5 V.
+**Stop** to end a square wave; the selected MZI returns to the low voltage.
+Impulse voltages remain limited to 0–5 V.
 Time fields accept scientific notation in seconds: `1e-3` is 1 ms, `5e-2` is
 50 ms, and `2e0` is 2 s. The display-average field uses milliseconds.
 Fields start blank. Timing has no limits beyond being positive (and high time
 shorter than the period). Edges are scheduled on absolute PC deadlines with a
 spin-wait for the last 20 ms, so millisecond pulses and square waves work.
-Pulses shorter than one edge (~1.9 ms on the wire at 115200 baud) are
-stretched, and Windows/Python scheduling can add jitter. A1 records the actual
-pin 8 waveform on every pair, so check it for the delivered timing.
-The live plot labels both channels and shows the latest 10 seconds while
+Pulses shorter than the board's command latency can stretch, and Windows/Python
+scheduling can add jitter. Without A1, commanded times are host estimates.
+The live plot shows the latest 10 seconds while
 recording. It retains brief peaks when reducing points for display and shows
 the full recording after Stop. Time ticks use seconds, ms, or µs as appropriate,
 with contrasting labels. Use the plot toolbar to zoom into an edge or pan;
 incoming data preserves the selected view. Optical display averaging is blank
 or 0 for raw; enter a larger value to reduce displayed noise. CSV exports always
-retain raw A0/A1 samples, independent of display averaging.
+retain raw A0 samples and jump flags, independent of display averaging.
 Both **Single pulse** and **Play square wave** use the same continuous stream.
-**Export trace CSV** saves both measured channels and the commanded voltages.
-The sketch has no sample clock, so the pair period is measured as host
-recording time divided by pairs received. After a run, every sample is placed
-at pair index × that final period; USB delivery times do not determine the
+**Export trace CSV** saves optical samples and commanded voltages. The sketch
+has no sample clock, so the frame period is measured as host recording time
+divided by frames received. After a run, every sample is placed at frame index
+× that final period; USB delivery times do not determine the
 spacing. Alignment to PC command times is approximate because the stream
 contains no timestamps, and samples lost at a resync shift later times
 slightly. A stalled stream raises an error in the reader. The trace limit is
-2,000,000 paired samples.
+2,000,000 optical samples.
 
 To calibrate a switch from measured power, connect both the voltage board and
 Arduino power meter, then open **MZI / pin mapping / calibration** and click
@@ -294,9 +331,17 @@ V²/R. The voltage board has no readback, so power is computed from the
 commanded voltage, not measured.
 
 The **Thermal crosstalk** tab can scan several switches in sequence. Select switches
-with Ctrl or Shift, choose **Arduino** or **OSA**, enter the lower and upper
-voltage limits, step, and settling time, then start the scan. Arduino readings
-are burst averages. For OSA scans, each voltage produces a spectrum after the
+with Ctrl or Shift, choose **HP 8152A** or **OSA**, enter the lower and upper
+voltage limits, step, and settling time, then start the scan. The HP power meter
+defaults to `GPIB0::23::INSTR`, channel A, 1550 nm and autoranging. Select a
+fixed dBm range if the meter's automatic range changes are unsuitable. **Test
+reading and GPIB read rate** measures 12 triggered readings and reports the
+observed GPIB read rate and count of numeric values; no-voltage scan is started.
+This transfer rate is not the optical sampling bandwidth: the meter's low-pass
+filter is 8 Hz with filtering off or 2 Hz with filtering on. Its GPIB readings
+cannot resolve a 50–100 Hz coupling oscillation. The meter
+settings are saved in `benes_hp8152a_config.json` and restored on the instrument
+after each run. For OSA scans, each voltage produces a spectrum after the
 last two bins are discarded. The voltage response shows both peak power and
 the mean of the retained bins, calculated in linear mW and converted to dBm.
 Each switch gets its own
@@ -328,6 +373,25 @@ range-change rescans. The **X axis** toggle works on loaded results. It uses
 the heater resistances stored with the run, or the current ones when the run
 predates them. **Export CSV with comment** re-exports the loaded dataset.
 
+### One-source Arduino MZI calibration
+
+For a single connected laser, use **Arduino · one connected source** in the
+MZI calibration tab. Select the actual input and the output physically patched
+to the Arduino optical detector. Connect the physical voltage board and Arduino
+meter in **Hardware & OSA**. The MZI picker lists only switches whose cross/bar
+states change the measured power at that output while every other MZI is held
+at 0 V. **Sweep selected MZI with Arduino** measures one; **Calibrate reachable
+MZIs** measures all listed switches. A single input and fixed detector output
+cannot illuminate and observe every MZI, so change the input or detector output
+and repeat for the others.
+
+Each point uses the Arduino's configured burst-average reading. The calibration
+rejects saturated readings and optical swings below 2 ADC counts. It saves the
+bright and dark extrema as cross and bar according to the selected input/output
+path, then resets all MZIs to 0 V even on Stop or an error. Results are saved
+under `Results/MZI_calibration/` as JSON, CSV, and a power plot; the JSON records
+the selected ports, detector settings, and whether voltages were saved.
+
 ### Six-laser MZI calibration
 
 The **MZI calibration** tab assumes a laser on every input, each at its own
@@ -337,11 +401,11 @@ OSA reads one output at a time through the JDSU switch. For any MZI, two outputs
 receive a different input's line depending on its state, and the power of those
 two lines there gives the MZI's state. MZIs not being swept stay at 0 V (cross).
 
-Use **Read OSA + detect six channels** when all six laser lines are visible in
-the OSA trace. It finds the six strongest distinct peaks, saves them into the
-WDM comb plan, and assigns them by wavelength: highest wavelength to Input 1
-and lowest to Input 6. It reports an error instead of changing the plan unless
-all six peaks are distinct and prominent.
+Use **Detect six lasers (1550–1560 nm)** when all six laser lines are visible.
+It scans the mapped OSA outputs, finds prominent peaks within 1550–1560 nm,
+saves them into the WDM comb plan, and assigns them by wavelength: highest to
+Input 1 and lowest to Input 6. It reports an error instead of changing the plan
+unless all six peaks are distinct and prominent.
 
 - **Sweep selected MZI** (single MZI): sweeps one MZI while watching one of its two
   outputs (**Auto** picks one that sees both lines). Cross is the voltage where the

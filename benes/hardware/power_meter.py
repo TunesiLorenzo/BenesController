@@ -13,11 +13,12 @@ from typing import Callable
 from benes.paths import app_dir, sibling_module_path
 
 
-# Raw stream: 7-bit A0 byte (bit 7 clear) followed by a 7-bit A1 byte (bit 7 set).
+# Raw optical stream: 7-bit A0 value followed by 0xC0 or 0xC1 jump status.
 # The Uno's 16 MHz clock divides exactly to both rates; match the sketch's Serial.begin.
 RAW_BAUDS = (1_000_000, 2_000_000)
 RAW_FULL_SCALE = 127
-RAW_CHANNEL_TAG = 0x80
+RAW_STATUS_BASE = 0xC0
+DEFAULT_JUMP_GUARD_MS = 5.0
 # The detector flattens out near 80 counts, well below the 7-bit full scale.
 DEFAULT_CEILING = 80.0
 
@@ -30,6 +31,9 @@ class PowerReading:
     unit: str
     raw_mean: float
     sample_count: int
+    rejected_count: int = 0
+    jump_count: int = 0
+    sample_rate_hz: float | None = None
 
 
 class ArduinoPowerMeter:
@@ -60,6 +64,7 @@ class ArduinoPowerMeter:
             "unit": "ADC counts",
             "stream_format": "raw",
             "ceiling": DEFAULT_CEILING,
+            "jump_guard_ms": DEFAULT_JUMP_GUARD_MS,
         }
 
     def _load(self) -> dict:
@@ -89,14 +94,18 @@ class ArduinoPowerMeter:
         ceiling = float(settings.get("ceiling", DEFAULT_CEILING))
         if not math.isfinite(ceiling) or ceiling <= 0:
             raise ValueError("The power-meter ceiling must be a positive ADC count")
+        guard = float(settings.get("jump_guard_ms", DEFAULT_JUMP_GUARD_MS))
+        if not math.isfinite(guard) or not 0 <= guard <= 1000:
+            raise ValueError("Jump guard must be between 0 and 1000 ms")
         if settings.get("stream_format", "legacy") not in ("legacy", "dual", "raw"):
             raise ValueError("Arduino stream format must be raw, legacy, or dual")
         if settings.get("stream_format") == "raw" and int(settings["baud"]) not in RAW_BAUDS:
-            raise ValueError("The raw A0/A1 sketch runs at 1000000 or 2000000 baud")
+            raise ValueError("The raw optical sketch runs at 1000000 or 2000000 baud")
 
     def configure(self, port: object, baud: object, duration: object, scale: object, offset: object,
                   unit: object, stream_format: str = "legacy",
-                  ceiling: object = DEFAULT_CEILING) -> None:
+                  ceiling: object = DEFAULT_CEILING,
+                  jump_guard_ms: object = DEFAULT_JUMP_GUARD_MS) -> None:
         settings = {
             "port": str(port).strip(),
             "baud": int(baud),
@@ -106,6 +115,7 @@ class ArduinoPowerMeter:
             "unit": str(unit).strip() or "ADC counts",
             "stream_format": stream_format,
             "ceiling": float(ceiling),
+            "jump_guard_ms": float(jump_guard_ms),
         }
         self._validate_settings(settings)
         self.settings = settings
@@ -153,21 +163,38 @@ class ArduinoPowerMeter:
             raise RuntimeError("Connect the Arduino power meter first")
         if self.settings["stream_format"] in ("dual", "raw"):
             try:
-                samples, _ = self.read_timed_samples(self.settings["duration"])
+                samples, timing = self.read_timed_samples(self.settings["duration"])
             finally:
                 if self.settings["stream_format"] == "raw":
                     self.stop_stream()
-            samples = [optical for optical, _electrical in samples]
+            if self.settings["stream_format"] == "raw":
+                period = timing.get("sample_period_s")
+                guard_samples = (math.ceil(self.settings["jump_guard_ms"] / 1000 / period)
+                                 if period and period > 0 else 0)
+                raw_count = len(samples)
+                samples, rejected, jumps = self._filter_optical_jumps(samples, guard_samples,
+                                                                       self.ceiling)
+                sample_rate = (raw_count / self.settings["duration"] if raw_count else None)
+            else:
+                samples = [optical for optical, _electrical in samples]
+                rejected = jumps = 0
+                sample_rate = None
         else:
             samples = self.sampler.burst_read_binary(self.serial, duration=self.settings["duration"])
+            rejected = jumps = 0
+            sample_rate = None
         if not samples:
-            raise RuntimeError("The Arduino returned no samples")
+            raise RuntimeError("The Arduino returned no usable optical samples; check the uploaded sketch, "
+                               "jump guard, detector range, and ceiling")
         raw_mean = sum(samples) / len(samples)
         reading = PowerReading(
             value=raw_mean * self.settings["scale"] + self.settings["offset"],
             unit=self.settings["unit"],
             raw_mean=raw_mean,
             sample_count=len(samples),
+            rejected_count=rejected,
+            jump_count=jumps,
+            sample_rate_hz=sample_rate,
         )
         self.last_reading = reading
         return reading
@@ -188,39 +215,57 @@ class ArduinoPowerMeter:
         return pairs
 
     @staticmethod
-    def _decode_tagged_pairs(data: bytes) -> tuple[list[tuple[int, int]], bytes, int]:
-        """Pair each untagged A0 byte with a following tagged A1 byte.
+    def _decode_optical_frames(data: bytes) -> tuple[list[tuple[int, bool]], bytes, int]:
+        """Decode optical/status frames, preserving an unfinished A0 across reads.
 
-        Returns the pairs, an unfinished trailing A0 byte, and how many bytes
+        Returns the frames, an unfinished trailing A0 byte, and how many bytes
         were skipped to resynchronize.
         """
-        pairs = []
+        frames = []
         index = 0
         skipped = 0
         end = len(data) - 1
         while index < end:
-            optical, electrical = data[index], data[index + 1]
-            if not optical & RAW_CHANNEL_TAG and electrical & RAW_CHANNEL_TAG:
-                pairs.append((optical, electrical & ~RAW_CHANNEL_TAG))
+            optical, status = data[index], data[index + 1]
+            if optical < 0x80 and status in (RAW_STATUS_BASE, RAW_STATUS_BASE | 1):
+                frames.append((optical, bool(status & 1)))
                 index += 2
             else:
                 skipped += 1
                 index += 1
         tail = data[index:]
-        if tail and tail[0] & RAW_CHANNEL_TAG:
-            # A lone A1 byte can never start a pair.
+        if tail and tail[0] >= 0x80:
+            # A lone status byte can never start a frame.
             skipped += 1
             tail = b""
-        return pairs, bytes(tail), skipped
+        return frames, bytes(tail), skipped
+
+    @staticmethod
+    def _filter_optical_jumps(frames, guard_samples: int, ceiling: float):
+        """Discard flagged jumps and their settling window from power averages."""
+        clean = []
+        remaining = 0
+        rejected = jumps = 0
+        for optical, jump in frames:
+            if jump:
+                jumps += 1
+                remaining = max(remaining, guard_samples + 1)
+            if jump or remaining > 0 or optical >= ceiling:
+                rejected += 1
+            else:
+                clean.append(optical)
+            if remaining > 0:
+                remaining -= 1
+        return clean, rejected, jumps
 
     def read_timed_samples(self, duration: float, reset_buffer: bool = True):
-        """Return optical/electrical pairs with measured-rate or host chunk timing."""
+        """Return optical/status frames (raw) or optical/electrical pairs (dual)."""
         if self.serial is None:
             raise RuntimeError("Connect the Arduino power meter first")
         if self.settings["stream_format"] == "raw":
             return self._read_raw_samples(duration, reset_buffer)
         if self.settings["stream_format"] != "dual":
-            raise RuntimeError("Select the dual A0/A1 Arduino stream for impulse tests")
+            raise RuntimeError("Select the raw optical or dual A0/A1 Arduino stream")
         if reset_buffer:
             self._dual_buffer.clear()
         raw, timing = self.sampler.burst_read_binary(
@@ -235,9 +280,9 @@ class ArduinoPowerMeter:
         self._raw_tail = b""
 
     def start_stream(self) -> None:
-        """Begin a capture at the newest bytes; channel tags restore the pairing."""
+        """Begin a capture at the newest bytes; status markers restore pairing."""
         if self.serial is None or self.settings["stream_format"] != "raw":
-            raise RuntimeError("Connect the raw A0/A1 Arduino stream first")
+            raise RuntimeError("Connect the raw optical Arduino stream first")
         self.serial.reset_input_buffer()
         self._raw_tail = b""
         self._raw_index = 0
@@ -247,7 +292,7 @@ class ArduinoPowerMeter:
         self._raw_last_received = self.stream_start_time
 
     def _read_raw_samples(self, duration: float, restart: bool):
-        """Decode tagged pairs; retain only an unfinished pair across reads."""
+        """Decode optical/status frames; retain only an unfinished frame."""
         if not math.isfinite(duration) or duration <= 0:
             raise ValueError("Sample duration must be positive and finite")
         if restart or not self._raw_running:
@@ -263,11 +308,11 @@ class ArduinoPowerMeter:
                 time.sleep(0.0005)
         if time.perf_counter() - self._raw_last_received > 0.5:
             raise RuntimeError("Raw Arduino stream stopped; check the connection, baud rate, and sketch")
-        pairs, self._raw_tail, skipped = self._decode_tagged_pairs(data)
+        pairs, self._raw_tail, skipped = self._decode_optical_frames(data)
         self._raw_skipped += skipped
         first_index = self._raw_index
         self._raw_index += len(pairs)
-        # The loop has no clock, so its pair rate is measured from arrival times.
+        # The loop has no clock, so its frame rate is measured from arrival times.
         elapsed = self._raw_last_received - self.stream_start_time
         return pairs, {
             "start_time": self.stream_start_time,

@@ -39,11 +39,18 @@ def write_crosstalk_csv(path, data, source, description="", response_unit=""):
         raise ValueError("There is no crosstalk dataset to export")
     with open(path, "w", encoding="utf-8", newline="") as file:
         file.write(f"# Crosstalk {source} scan exported {datetime.now().isoformat()}\n")
-        file.write(f"# Response power: {'OSA spectrum peak and linear-bin mean [dBm]' if source == 'OSA' else 'Arduino calibrated power'}\n")
+        reference = next((point for points in data.values() for point in points
+                          if isinstance(point, SpectrumScanPoint) and point.reference_wavelength_nm is not None), None)
+        file.write(f"# Response power: {'OSA reference line peak and window mean [dBm]' if reference is not None else 'OSA spectrum peak and linear-bin mean [dBm]' if source == 'OSA' else 'Arduino calibrated power'}\n")
         file.write(f"# Response unit: {response_unit or ('dBm' if source == 'OSA' else 'unspecified')}\n")
         if source == "OSA":
             file.write(f"# Final OSA bins discarded per trace: {SPURIOUS_TAIL_POINTS}\n")
-            file.write("# Mean: average of linear mW values across retained bins, converted to dBm\n")
+            if reference is not None:
+                file.write(f"# Reference wavelength: {reference.reference_wavelength_nm:g} nm; "
+                           f"window: ±{reference.half_window_nm:g} nm\n")
+                file.write("# Mean: average of linear mW values in the reference window, converted to dBm\n")
+            else:
+                file.write("# Mean: average of linear mW values across retained bins, converted to dBm\n")
         for line in description.splitlines() or [""]:
             file.write(f"# Description: {line}\n")
         writer = csv.writer(file)

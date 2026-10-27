@@ -51,6 +51,16 @@ class LaserChannelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Found only 1 of 6"):
             find_laser_wavelengths(wave, power)
 
+    def test_range_ignores_stronger_peaks_outside_1550_to_1560(self):
+        expected = [1550.0, 1551.5, 1553.0, 1555.0, 1557.0, 1560.0]
+        wave = [1548.0 + step * 0.01 for step in range(1401)]
+        power = [-65 + sum(35 * math.exp(-((item - center) / 0.025) ** 2)
+                           for center in expected)
+                 + sum(50 * math.exp(-((item - center) / 0.025) ** 2)
+                       for center in (1549.0, 1561.0)) for item in wave]
+        self.assertEqual(find_laser_wavelengths(
+            wave, power, wavelength_range_nm=(1550.0, 1560.0)), list(reversed(expected)))
+
     def test_combines_one_peak_from_each_output_in_wavelength_order(self):
         self.assertEqual(distinct_laser_wavelengths([1551.1, 1549.2, 1550.5, 1552.3, 1548.9, 1553.0]),
                          [1553.0, 1552.3, 1551.1, 1550.5, 1549.2, 1548.9])

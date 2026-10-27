@@ -8,7 +8,8 @@ from pathlib import Path
 from benes.measurements.laser_calibration import (CalibrationStopped, CompleteCalibration, ProbePoint, SimulatedChip, SwitchProbe,
                                calibrate_all, calibrate_switch, extract_calibration,
                                calibration_plan, check_alignment, check_calibrated_states, reference_states,
-                               save_calibration_results, switch_probes, wavelengths_from_assignment)
+                               create_calibration_folder, save_calibration_results, switch_probes,
+                               wavelengths_from_assignment)
 from benes.core.network import BenesNetwork
 
 WAVELENGTHS = {row: 1540.0 + 2 * row for row in range(6)}
@@ -178,11 +179,21 @@ class CalibrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             files = save_calibration_results(Path(directory), {"comment": "six lasers"}, result.switches,
                                              [result.alignment, *result.checks])
-            self.assertEqual(files, ["mzi_calibration.json", "mzi_sweeps.csv", "output_readouts.csv",
-                                     "readout_spectra.csv"])
+            self.assertEqual(files[:2], ["mzi_calibration.json", "mzi_sweeps.csv"])
+            self.assertEqual(len([file for file in files if file.endswith("_sweep.png")]), 12)
+            self.assertTrue(all((Path(directory) / file).is_file() for file in files))
+            self.assertIn("output_readouts.csv", files)
+            self.assertIn("readout_spectra.csv", files)
             record = json.loads((Path(directory) / "mzi_calibration.json").read_text(encoding="utf-8"))
             self.assertEqual(len(record["mzi_calibrations"]), 12)
             self.assertEqual(len(record["state_checks"]), 3)
+
+    def test_calibration_folder_is_inside_dataset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "Dataset01"
+            folder = create_calibration_folder(Path(directory), "complete", root)
+            self.assertEqual(folder.parent, root / "calibration")
+            self.assertTrue(folder.is_dir())
 
 
 class SimulatedChipTests(unittest.TestCase):

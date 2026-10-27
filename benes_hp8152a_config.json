@@ -1,0 +1,6 @@
+{
+  "resource": "GPIB0::23::INSTR",
+  "channel": "A",
+  "wavelength_nm": 1550.0,
+  "range": "Auto"
+}

@@ -50,6 +50,7 @@ class SpectraMixin:
             messagebox.showerror("OSA read unavailable", str(error), parent=self)
             return
         self.set_osa_reading(True)
+        self.begin_activity("osa_read", f"Reading OSA {'output ' + str(output) if output is not None else 'trace'}...")
 
         def acquire():
             try:
@@ -73,6 +74,7 @@ class SpectraMixin:
             )
         self.show_spectrum(*data, name=None if output is None else self.osa_trace_name(output),
                            output_port=output)
+        self.finish_activity("osa_read", "OSA trace read complete")
 
     def read_selected_osa_output(self):
         self.start_osa_read(self.osa_switch_output_var.get())
@@ -89,6 +91,7 @@ class SpectraMixin:
             messagebox.showerror("OSA read unavailable", str(error), parent=self)
             return
         self.set_osa_reading(True)
+        self.begin_activity("osa_read", "Reading all OSA outputs...", len(outputs) + 1)
         self.osa_switch_status_var.set(f"Reading OSA spectra from outputs {', '.join(map(str, outputs))}...")
 
         def acquire_all():
@@ -99,6 +102,8 @@ class SpectraMixin:
                     spectrum = osa.simulated_spectrum() if simulate else osa.get_spectrum(
                         host, port, fresh_sweeps=POST_SWITCH_SWEEPS)
                     spectra.append((output, spectrum))
+                    self.after(0, lambda o=output, i=len(spectra): self.update_activity(
+                        "osa_read", i, detail=f"OSA output {o} read ({i}/{len(outputs)})"))
             except Exception as error:
                 self.after(0, lambda error=error: self.osa_failed(str(error)))
             else:
@@ -116,12 +121,14 @@ class SpectraMixin:
         if spectra:
             self.osa_output_var.set(str(spectra[-1][0]))
         self.osa_switch_status_var.set(f"Read {len(spectra)} OSA output spectra; export them from the plot window.")
+        self.finish_activity("osa_read", f"Read {len(spectra)} OSA outputs")
 
     def read_spectrum(self):
         """Read the currently connected OSA without changing the output selector."""
         self.start_osa_read()
 
     def osa_failed(self, error):
+        self.finish_activity("osa_read", "OSA read failed")
         self.set_osa_reading(False)
         self.osa_switch_status_var.set(f"OSA read failed: {error}")
         messagebox.showerror("OSA read failed", error, parent=self)

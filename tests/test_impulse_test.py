@@ -30,6 +30,9 @@ class FakeController:
         now = time.perf_counter()
         return now, now
 
+    def drive_voltage(self, name, voltage):
+        self.board.send(self.settings["mapping"][name], voltage)
+
 
 class FakeMeter:
     connected = True
@@ -59,7 +62,7 @@ class FakeRawMeter(FakeMeter):
         self.index += 3
         # The measured period settles from 200 us to 100 us as the run goes on.
         period = 0.0002 if self.index <= 3 else 0.0001
-        return [(100, 40)] * 3, {
+        return [(100, False), (110, True), (100, False)], {
             "start_time": self.stream_start_time, "end_time": time.perf_counter(),
             "first_index": self.index - 3, "sample_period_s": period, "skipped_bytes": 2,
         }
@@ -77,16 +80,20 @@ class ImpulseTests(unittest.TestCase):
             self.assertAlmostEqual(sample[0], index * 0.0001, places=7)
         self.assertEqual(trace.sample_period_s, 0.0001)
         self.assertEqual(trace.skipped_bytes, 2)
-        self.assertEqual(controller.board.sent[-2:], [(3, 0), (8, 0)])
+        self.assertEqual(controller.board.sent[-1:], [(3, 0)])
+        self.assertNotIn((8, 0), controller.board.sent)
+        self.assertTrue(trace.jump_indices)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "raw.csv"
             write_impulse_csv(path, trace)
             text = path.read_text(encoding="utf-8")
             rows = list(csv.reader(line for line in text.splitlines() if not line.startswith("#")))
-        self.assertIn("pair period measured over the whole run", text)
+        self.assertIn("frame period measured over the whole run", text)
         self.assertIn("2 byte(s) were skipped to resynchronize", text)
         self.assertIn("alignment to host command timestamps approximate", text)
-        self.assertEqual(rows[1][-2:], ["0", "0"])
+        self.assertEqual(rows[1][2], "")
+        self.assertEqual(rows[1][5], "")
+        self.assertIn("1", [row[-1] for row in rows[1:]])
 
     def test_raw_capture_error_stops_stream_and_returns_both_board_pins_to_low(self):
         class FailingMeter(FakeRawMeter):
@@ -99,7 +106,7 @@ class ImpulseTests(unittest.TestCase):
             run_impulse_test(controller, meter, "S1.1", "single", 0, 2,
                              threading.Event(), pulse_s=0.05, measure_s=0.2, lead_in_s=0)
         self.assertTrue(meter.stopped)
-        self.assertEqual(controller.board.sent[-2:], [(3, 0), (8, 0)])
+        self.assertEqual(controller.board.sent[-1:], [(3, 0)])
 
     def test_live_raw_times_stay_sorted_while_the_measured_period_settles(self):
         seen = []
@@ -159,7 +166,8 @@ class ImpulseTests(unittest.TestCase):
             rows = list(csv.reader(line for line in path.read_text(encoding="utf-8").splitlines()
                                    if not line.startswith("#")))
         self.assertEqual(rows[0], ["time_s", "optical_adc_a0", "electrical_adc_a1",
-                                   "optical_power", "target_command_v", "dummy_pin8_command_v"])
+                                   "optical_power", "target_command_v", "dummy_pin8_command_v",
+                                   "jump_flag"])
         self.assertEqual(rows[1][1:4], ["100", "60", "51.0"])
 
     def test_impulse_rejects_unsafe_a1_voltage_and_occupied_pin_8(self):

@@ -42,10 +42,12 @@ class ImpulseTrace:
     sample_period_s: float | None = None
     skipped_bytes: int = 0
     capture_elapsed_s: float = 0.0
+    stream_format: str = "dual"
+    jump_indices: list[int] = field(default_factory=list)
 
 
 def received_pair_rate(samples, window_s=None):
-    """Estimate paired A0/A1 samples received per second from trace timestamps."""
+    """Estimate Arduino frames received per second from trace timestamps."""
     if len(samples) < 2:
         return 0.0
     start = 0 if window_s is None else bisect_left(
@@ -58,7 +60,7 @@ def received_pair_rate(samples, window_s=None):
 
 def plot_trace_samples(samples, window_s=None, max_bins=500, optical_average_s=0,
                        time_range=None):
-    """Average optical values for display, then retain both channels' extrema."""
+    """Average optical values for display, then retain available channels' extrema."""
     import numpy as np
 
     if not samples:
@@ -90,7 +92,8 @@ def plot_trace_samples(samples, window_s=None, max_bins=500, optical_average_s=0
     bin_size = max(1, math.ceil(count / max_bins))
     indices = {0, count - 1}
     full = count // bin_size * bin_size
-    for values in (electrical, optical):
+    values_to_preserve = (optical,) if np.isnan(electrical).all() else (electrical, optical)
+    for values in values_to_preserve:
         if full:
             bins = values[:full].reshape(-1, bin_size)
             offsets = np.arange(0, full, bin_size)
@@ -108,7 +111,7 @@ def validate_impulse_settings(mode, low_v, high_v, period_s=None, high_time_s=No
                               pulse_s=None, measure_s=None, lead_in_s=0.2):
     values = (low_v, high_v, lead_in_s)
     if not all(math.isfinite(value) for value in values) or not all(0 <= value <= 5 for value in values[:2]):
-        raise ValueError("Impulse voltages must stay within 0–5 V while Arduino A1 is connected")
+        raise ValueError("Impulse voltages must stay within 0–5 V")
     if low_v == high_v:
         raise ValueError("Low and high voltages must differ")
     if lead_in_s < 0:
@@ -137,28 +140,33 @@ def run_impulse_test(controller, meter, switch, mode, low_v, high_v, stop_event,
         raise RuntimeError("Connect the physical voltage board first")
     if controller.settings["mapping"].get(switch) is None:
         raise ValueError(f"Assign a voltage-board pin to {switch} first")
-    if MONITOR_PIN in controller.settings["mapping"].values():
-        raise ValueError("Voltage-board pin 8 is mapped to an MZI; leave it free for the electrical monitor")
     if not meter.connected:
         raise RuntimeError("Connect the Arduino power meter first")
     if meter.settings.get("stream_format") not in ("raw", "dual"):
-        raise RuntimeError("Select the raw A0/A1 Arduino stream in Boards & measurement")
+        raise RuntimeError("Select the raw optical or legacy dual Arduino stream in Hardware & OSA")
+    raw_stream = meter.settings["stream_format"] == "raw"
+    if not raw_stream and MONITOR_PIN in controller.settings["mapping"].values():
+        raise ValueError("Voltage-board pin 8 is mapped to an MZI; leave it free for the electrical monitor")
     trace = ImpulseTrace(mode, switch, low_v, high_v, meter.settings["unit"],
                          period_s, high_time_s, pulse_s, measure_s, lead_in_s)
-    raw_stream = meter.settings["stream_format"] == "raw"
+    trace.stream_format = meter.settings["stream_format"]
     if raw_stream:
         meter.start_stream()
     origin = meter.stream_start_time if raw_stream else time.perf_counter()
     if raw_stream:
-        trace.time_reference = "pair index x measured pair period; host start is approximate"
+        trace.time_reference = "optical frame index x measured period; host start is approximate"
     drive_error = []
     # Suppresses live redraws while a single pulse is high, so plotting cannot delay its end.
     pulse_active = threading.Event()
 
     def drive(voltage):
-        target_time, mirror_time = controller.drive_with_mirror(switch, voltage, MONITOR_PIN)
-        trace.voltage_events.append((target_time - origin, voltage))
-        trace.dummy_events.append((mirror_time - origin, voltage))
+        if raw_stream:
+            controller.drive_voltage(switch, voltage)
+            trace.voltage_events.append((time.perf_counter() - origin, voltage))
+        else:
+            target_time, mirror_time = controller.drive_with_mirror(switch, voltage, MONITOR_PIN)
+            trace.voltage_events.append((target_time - origin, voltage))
+            trace.dummy_events.append((mirror_time - origin, voltage))
 
     def wait_until(deadline):
         """Return True if stopped; edges are scheduled on absolute deadlines."""
@@ -216,7 +224,7 @@ def run_impulse_test(controller, meter, switch, mode, low_v, high_v, stop_event,
             raw, timing = meter.read_timed_samples(duration, reset_buffer=first_chunk)
             first_chunk = False
             if not raw and not trace.samples and time.perf_counter() - origin > 1.0:
-                raise RuntimeError("No A0/A1 samples received; check the Arduino firmware and baud rate")
+                raise RuntimeError("No Arduino samples received; check the firmware and baud rate")
             if raw:
                 start = timing["start_time"]
                 span = timing["end_time"] - start
@@ -229,11 +237,18 @@ def run_impulse_test(controller, meter, switch, mode, low_v, high_v, stop_event,
                     # Continue from the previous chunk so live times stay sorted while
                     # the measured period settles; the whole trace is retimed at the end.
                     last = trace.samples[-1][0] if trace.samples else -period
+                    first_index = len(trace.samples)
+                    trace.jump_indices.extend(first_index + index for index, (_, jump) in enumerate(raw) if jump)
                     trace.samples.extend(
-                        (last + (index + 1) * period,
-                         optical, electrical, optical * scale + offset)
-                        for index, (optical, electrical) in enumerate(raw)
-                    )
+                        (last + (index + 1) * period, optical, math.nan, optical * scale + offset)
+                        for index, (optical, _jump) in enumerate(raw))
+                elif raw_stream:
+                    first_index = len(trace.samples)
+                    trace.jump_indices.extend(first_index + index for index, (_, jump) in enumerate(raw) if jump)
+                    trace.samples.extend(
+                        (start + (index + 0.5) * span / len(raw) - origin,
+                         optical, math.nan, optical * scale + offset)
+                        for index, (optical, _jump) in enumerate(raw))
                 else:
                     trace.samples.extend(
                         (start + (index + 0.5) * span / len(raw) - origin,
@@ -280,31 +295,35 @@ def write_impulse_csv(path, trace: ImpulseTrace):
         raise ValueError("There are no optical samples to export")
     with Path(path).open("w", encoding="utf-8", newline="") as file:
         if trace.sample_period_s is not None:
-            file.write("# Sample times are pair index x the pair period measured over the whole run.\n")
-            file.write("# Values are 7-bit (0-127); A1 is read right after A0 in each row.\n")
+            file.write("# Sample times are frame index x the frame period measured over the whole run.\n")
+            file.write("# Raw stream: 7-bit A0 optical values with a jump flag; A1 is not sampled.\n")
             file.write("# USB latency makes alignment to host command timestamps approximate.\n")
         else:
             file.write("# Sample times are estimated uniformly within each Arduino read chunk.\n")
         for key in ("mode", "switch", "low_v", "high_v", "period_s", "high_time_s",
                     "pulse_s", "measure_s", "lead_in_s", "unit", "stopped",
-                    "time_reference", "sample_period_s", "skipped_bytes", "capture_elapsed_s"):
+                    "time_reference", "sample_period_s", "skipped_bytes", "capture_elapsed_s",
+                    "stream_format"):
             file.write(f"# {key}: {getattr(trace, key)}\n")
         if trace.skipped_bytes:
             file.write(f"# {trace.skipped_bytes} byte(s) were skipped to resynchronize; "
                        "samples were lost there and later times may shift slightly.\n")
-        file.write("# Command times are estimated from the serial write start and 115200-baud wire time.\n")
+        file.write("# Command timestamps are host estimates and may differ from optical sample times.\n")
         writer = csv.writer(file)
         writer.writerow(("time_s", "optical_adc_a0", "electrical_adc_a1", "optical_power",
-                         "target_command_v", "dummy_pin8_command_v"))
+                         "target_command_v", "dummy_pin8_command_v", "jump_flag"))
         target_events = sorted(trace.voltage_events)
         dummy_events = sorted(trace.dummy_events)
         target_index = dummy_index = 0
         target_v = dummy_v = trace.low_v
-        for sample_time, optical, electrical, power in trace.samples:
+        jump_indices = set(trace.jump_indices)
+        for sample_index, (sample_time, optical, electrical, power) in enumerate(trace.samples):
             while target_index < len(target_events) and target_events[target_index][0] <= sample_time:
                 target_v = target_events[target_index][1]
                 target_index += 1
             while dummy_index < len(dummy_events) and dummy_events[dummy_index][0] <= sample_time:
                 dummy_v = dummy_events[dummy_index][1]
                 dummy_index += 1
-            writer.writerow((sample_time, optical, electrical, power, target_v, dummy_v))
+            writer.writerow((sample_time, optical, "" if trace.stream_format == "raw" else electrical,
+                             power, target_v, "" if trace.stream_format == "raw" else dummy_v,
+                             int(sample_index in jump_indices)))

@@ -59,15 +59,15 @@ class ArduinoPowerMeterTests(unittest.TestCase):
         self.assertEqual(pairs, [(120, 80)])
         self.assertEqual(meter.read_current_power().value, 40.0)
 
-    def test_tagged_pairs_align_mid_stream_and_resync_after_a_dropped_byte(self):
-        pairs, tail, skipped = ArduinoPowerMeter._decode_tagged_pairs(
-            bytes((0x85, 10, 0x8B, 20, 21, 0x96, 30)))
-        # Leading A1 byte skipped; A0 "20" lost its A1 byte, so it is skipped too.
-        self.assertEqual(pairs, [(10, 11), (21, 22)])
+    def test_optical_frames_align_mid_stream_and_resync_after_a_dropped_byte(self):
+        pairs, tail, skipped = ArduinoPowerMeter._decode_optical_frames(
+            bytes((0xC0, 10, 0xC1, 20, 21, 0xC0, 30)))
+        # Leading status skipped; A0 "20" lost its status, so it is skipped too.
+        self.assertEqual(pairs, [(10, True), (21, False)])
         self.assertEqual(tail, bytes((30,)))
         self.assertEqual(skipped, 2)
-        self.assertEqual(ArduinoPowerMeter._decode_tagged_pairs(bytes((5, 0x86, 0x87))),
-                         ([(5, 6)], b"", 1))
+        self.assertEqual(ArduinoPowerMeter._decode_optical_frames(bytes((5, 0xC0, 0xC1))),
+                         ([(5, False)], b"", 1))
 
     def test_raw_stream_sends_no_commands_and_measures_the_pair_period(self):
         clock = SimpleNamespace(now=10.0)
@@ -102,27 +102,27 @@ class ArduinoPowerMeterTests(unittest.TestCase):
         meter.serial = serial
         with patch("benes.hardware.power_meter.time.perf_counter", side_effect=lambda: clock.now),                 patch("benes.hardware.power_meter.time.sleep", side_effect=sleep):
             meter.start_stream()
-            serial.chunks = [bytes((0x81, 1)), bytes((0x82, 3))]
+            serial.chunks = [bytes((0xC1, 1, 0xC1))]
             first, timing1 = meter.read_timed_samples(0.001, reset_buffer=False)
-            serial.chunks = [bytes((0x84, 5, 0x86))]
+            serial.chunks = [bytes((3, 0xC0, 5, 0xC0, 6))]
             second, timing2 = meter.read_timed_samples(0.001, reset_buffer=False)
-            self.assertEqual(first + second, [(1, 2), (3, 4), (5, 6)])
+            self.assertEqual(first + second, [(1, True), (3, False), (5, False)])
             self.assertEqual(timing1["skipped_bytes"], 1)
             self.assertEqual(timing2["first_index"], 1)
             elapsed = timing2["end_time"] - timing2["start_time"]
             self.assertAlmostEqual(timing2["sample_period_s"], elapsed / 3)
             # A restart drops stale bytes and any unfinished pair.
             meter.start_stream()
-            serial.chunks = [bytes((10, 0x8A))]
+            serial.chunks = [bytes((10, 0xC0))]
             pairs, _ = meter.read_timed_samples(0.001, reset_buffer=False)
-            self.assertEqual(pairs, [(10, 10)])
+            self.assertEqual(pairs, [(10, False)])
             self.assertEqual(meter._raw_index, 1)
         self.assertEqual(meter.full_scale, 127)
 
     def test_raw_power_averages_a0_and_pauses_the_stream_even_on_error(self):
         meter = ArduinoPowerMeter(self.path)
         meter.serial = object()
-        with patch.object(meter, "read_timed_samples", return_value=([(10, 255), (30, 0)], {})), \
+        with patch.object(meter, "read_timed_samples", return_value=([(10, False), (30, False)], {})), \
                 patch.object(meter, "stop_stream") as stop:
             reading = meter.read_current_power()
             self.assertEqual(reading.raw_mean, 20)
@@ -166,6 +166,28 @@ class ArduinoPowerMeterTests(unittest.TestCase):
         self.assertEqual(meter.ceiling, 127)
         with self.assertRaisesRegex(ValueError, "ceiling"):
             meter.configure("COM9", 2_000_000, 0.1, 1, 0, "ADC counts", "raw", 0)
+
+    def test_jump_guard_rejects_transition_and_saturation(self):
+        meter = ArduinoPowerMeter(self.path)
+        meter.serial = object()
+        meter.settings["jump_guard_ms"] = 2
+        frames = [(10, False), (70, True), (68, False), (65, False),
+                  (64, False), (90, False), (63, False)]
+        with patch.object(meter, "read_timed_samples", return_value=(frames, {"sample_period_s": 0.001})), \
+                patch.object(meter, "stop_stream"):
+            reading = meter.read_current_power()
+        self.assertEqual(reading.raw_mean, (10 + 64 + 63) / 3)
+        self.assertEqual(reading.sample_count, 3)
+        self.assertEqual(reading.rejected_count, 4)
+        self.assertEqual(reading.jump_count, 1)
+
+    def test_all_flagged_samples_are_rejected(self):
+        meter = ArduinoPowerMeter(self.path)
+        meter.serial = object()
+        with patch.object(meter, "read_timed_samples", return_value=([(10, True)], {})), \
+                patch.object(meter, "stop_stream"):
+            with self.assertRaisesRegex(RuntimeError, "no usable optical samples"):
+                meter.read_current_power()
 
 
 if __name__ == "__main__":

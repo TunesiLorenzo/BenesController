@@ -113,7 +113,9 @@ def load_scan_folder(folder) -> dict:
             if spectrum is not None:
                 name, voltage, peak, wavelengths, powers = spectrum
                 data.setdefault(name, []).append(
-                    SpectrumScanPoint(voltage, peak, tuple(wavelengths), tuple(powers)))
+                    SpectrumScanPoint(voltage, peak, tuple(wavelengths), tuple(powers),
+                                      context.get("reference_wavelength_nm"),
+                                      context.get("reference_half_window_nm")))
 
         for row in rows:
             if not row:
@@ -162,14 +164,18 @@ def save_scan_artifacts(folder: Path, context: dict, data: dict, source: str,
         xs, x_label = plot_x_values([point.voltage for point in points], resistance, mode, total)
         response.plot(xs, [point.power for point in points],
                       marker=".", linewidth=1.4, color=ROUTE_COLOR,
-                      label="Peak" if source == "OSA" else "Power")
+                      label="Reference line peak" if source == "OSA" and context.get("reference_wavelength_nm")
+                      else "Peak" if source == "OSA" else "Power")
         if source == "OSA":
             response.plot(xs, [point.mean_power_dbm for point in points],
-                          marker=".", linewidth=1.4, color=POWER_COLOR, label="Mean")
+                          marker=".", linewidth=1.4, color=POWER_COLOR,
+                          label="Reference window mean" if context.get("reference_wavelength_nm") else "Mean")
             response.legend(loc="best")
         response.set(xlabel=x_label,
                      ylabel=f"Power [{response_unit}]",
-                     title=f"{name}: response")
+                     title=(f"{name}: {context['reference_wavelength_nm']:g} nm response"
+                            if source == "OSA" and context.get("reference_wavelength_nm") is not None
+                            else f"{name}: response"))
         response.grid(True)
         response.autoscale(enable=True, axis="y")
         rescans = {phase: context.get(key, {}).get(name) for phase, (key, _, _) in RESCAN_STYLES.items()}
@@ -194,6 +200,8 @@ def save_scan_artifacts(folder: Path, context: dict, data: dict, source: str,
                 if isinstance(point, SpectrumScanPoint):
                     spectra.plot(point.wavelength_nm, point.spectrum_dbm, linewidth=0.8,
                                  alpha=0.65, color=cmap(norm(point.voltage)))
+            if context.get("reference_wavelength_nm") is not None:
+                spectra.axvline(context["reference_wavelength_nm"], color=OSA_COLOR, linestyle="--")
             spectra.set(xlabel="Wavelength [nm]", ylabel="Power [dBm]", title=f"{name}: spectra")
             spectra.grid(True)
             spectra.autoscale(enable=True, axis="y")

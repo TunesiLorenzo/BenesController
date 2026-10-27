@@ -9,7 +9,7 @@
   },
   "dry_run": false,
   "resource": "GPIB0::25::INSTR",
-  "selected_output": 6,
+  "selected_output": 5,
   "settle_s": 3.0,
   "timeout_s": 5.0
 }

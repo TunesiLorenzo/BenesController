@@ -243,11 +243,13 @@ class MappingMixin:
         ttk.Label(frame, text=note, wraplength=360).grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 4))
         progress = tk.StringVar(value="Choose a range and start the scan.")
         ttk.Label(frame, textvariable=progress, wraplength=390).grid(row=5, column=0, columnspan=3, sticky="w", pady=6)
+        progress_bar = ttk.Progressbar(frame, maximum=1, style="Activity.Horizontal.TProgressbar")
+        progress_bar.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(0, 6))
         extrema = tk.StringVar(value="")
-        ttk.Label(frame, textvariable=extrema, wraplength=390).grid(row=6, column=0, columnspan=3, sticky="w", pady=6)
+        ttk.Label(frame, textvariable=extrema, wraplength=390).grid(row=7, column=0, columnspan=3, sticky="w", pady=6)
         straight_choice = tk.StringVar()
         cross_choice = tk.StringVar()
-        for row, (label, variable) in enumerate((("Straight", straight_choice), ("Cross", cross_choice)), start=7):
+        for row, (label, variable) in enumerate((("Straight", straight_choice), ("Cross", cross_choice)), start=8):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=3)
             ttk.Combobox(frame, textvariable=variable, values=("Maximum", "Minimum"), state="readonly", width=12).grid(row=row, column=1, sticky="w", padx=8, pady=3)
         result = {"maximum": None, "minimum": None}
@@ -307,6 +309,8 @@ class MappingMixin:
                 return
             self.scan_settings[name] = {key: value.get() for key, value in fields.items()}
             running["value"] = True
+            self.begin_activity("mapping_scan", f"Scanning {name} voltage response...", len(voltages) + 1)
+            progress_bar.configure(maximum=len(voltages) + 1, value=0)
             result.update(maximum=None, minimum=None)
             straight_choice.set("")
             cross_choice.set("")
@@ -317,6 +321,9 @@ class MappingMixin:
 
             def on_point(index, total, point):
                 self.after(0, lambda: progress.set(f"{index}/{total}: {point.voltage:.2f} V, {point.power:.4g} {self.power_meter.settings['unit']}"))
+                self.after(0, lambda i=index: progress_bar.configure(value=i))
+                self.after(0, lambda i=index, t=total, v=point.voltage: self.update_activity(
+                    "mapping_scan", i, detail=f"{name}: voltage {i}/{t} ({v:.2f} V)"))
 
             def worker():
                 try:
@@ -330,11 +337,15 @@ class MappingMixin:
 
         def finish_error(message):
             running["value"] = False
+            progress_bar.configure(value=0)
+            self.finish_activity("mapping_scan", f"{name} voltage scan failed")
             scan_button.configure(state="normal")
             progress.set(f"Scan failed: {message}")
 
         def finish_scan(points):
             running["value"] = False
+            progress_bar.configure(value=len(points) + 1)
+            self.finish_activity("mapping_scan", f"{name} voltage scan complete")
             scan_button.configure(state="normal")
             save_button.configure(state="normal")
             result["maximum"] = max(points, key=lambda point: point.power)
@@ -344,8 +355,8 @@ class MappingMixin:
             progress.set(f"Scan complete: {len(points)} points. Choose the state for each extreme.")
 
         scan_button = ttk.Button(frame, text="Start scan", command=start_scan)
-        scan_button.grid(row=9, column=0, sticky="w", pady=(12, 0))
+        scan_button.grid(row=10, column=0, sticky="w", pady=(12, 0))
         save_button = ttk.Button(frame, text="Save calibration", command=save_scan, state="disabled")
-        save_button.grid(row=9, column=1, sticky="w", pady=(12, 0))
-        ttk.Button(frame, text="Close", command=close_scan).grid(row=9, column=2, sticky="e", pady=(12, 0))
+        save_button.grid(row=10, column=1, sticky="w", pady=(12, 0))
+        ttk.Button(frame, text="Close", command=close_scan).grid(row=10, column=2, sticky="e", pady=(12, 0))
         fit_to_screen(window)

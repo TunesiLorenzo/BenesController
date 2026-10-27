@@ -1,4 +1,4 @@
-"""Calibrate the Beneš MZIs with a laser on every input.
+"""Check the Beneš MZI states with a laser on every input.
 
 Each input carries its own WDM comb line (the plan in the WDM comb tab), so in
 any switch configuration every MZI carries two distinguishable lines.  The OSA
@@ -7,11 +7,9 @@ that output shows which way every MZI sent it.
 
 * ``switch_probes`` finds the two outputs whose arriving line depends on one
   MZI, and which input arrives there in its cross and in its straight state.
-* ``sweep_switch`` sweeps one MZI while the OSA watches one of those outputs:
-  cross is where the cross-state line is strongest relative to the other.
 * ``check_states`` reads every output and grades the state of each MZI.
-* ``calibrate_switch`` and ``calibrate_all`` hold every other MZI at 0 V (its
-  unbiased cross state) and save the extracted straight/cross voltages.
+
+The calibration sweeps themselves live in ``mzi_characterization``.
 """
 
 from __future__ import annotations
@@ -21,8 +19,7 @@ import json
 import math
 import random
 import time
-from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -35,8 +32,6 @@ from benes.measurements.wdm_comb import input_fiber_number, line_power
 CALIBRATION_SUBFOLDER = "MZI_calibration"
 # A state check passes when the commanded line beats the other by this margin.
 DEFAULT_PASS_DB = 10.0
-# Sweep points this close to the best contrast are treated as equally good.
-EXTREME_TIE_DB = 0.5
 
 
 class CalibrationStopped(RuntimeError):
@@ -54,51 +49,6 @@ class SwitchProbe:
 
     def expected_input(self, crossed: bool) -> int:
         return self.cross_input if crossed else self.straight_input
-
-
-@dataclass(frozen=True)
-class ProbePoint:
-    voltage: float
-    cross_dbm: float | None
-    straight_dbm: float | None
-
-    @property
-    def contrast_db(self) -> float | None:
-        """Cross-state line minus straight-state line at the probed output.
-
-        With only one of the two lines in the plan, its own power (negated for
-        the straight line) stands in; only the extremes of a sweep are used.
-        """
-        if self.cross_dbm is None:
-            return None if self.straight_dbm is None else -self.straight_dbm
-        if self.straight_dbm is None:
-            return self.cross_dbm
-        return self.cross_dbm - self.straight_dbm
-
-
-@dataclass(frozen=True)
-class MZICalibration:
-    probe: SwitchProbe
-    points: tuple[ProbePoint, ...]
-    cross: ProbePoint
-    straight: ProbePoint
-
-    @property
-    def name(self) -> str:
-        return self.probe.name
-
-    def _both_lines(self) -> bool:
-        return all(point.cross_dbm is not None and point.straight_dbm is not None
-                   for point in (self.cross, self.straight))
-
-    @property
-    def cross_margin_db(self) -> float | None:
-        """At the cross voltage, how far the cross line exceeds the other line."""
-        return self.cross.contrast_db if self._both_lines() else None
-
-    @property
-    def straight_margin_db(self) -> float | None:
-        return -self.straight.contrast_db if self._both_lines() else None
 
 
 @dataclass(frozen=True)
@@ -159,15 +109,6 @@ class StateCheck:
         return errors
 
 
-@dataclass
-class CompleteCalibration:
-    """Filled step by step, so a stopped run still holds what was measured."""
-
-    alignment: StateCheck | None = None
-    switches: dict[str, MZICalibration] = field(default_factory=dict)
-    checks: list[StateCheck] = field(default_factory=list)
-
-
 def strongest_input(lines: dict[int, float | None]) -> int | None:
     """The input whose line is strongest in one output's line powers."""
     powers = {source: power for source, power in lines.items() if power is not None}
@@ -190,37 +131,6 @@ def switch_probes(network, states, name) -> tuple[SwitchProbe, ...]:
     straight = network.mapping({**states, name: False})
     return tuple(SwitchProbe(name, output, crossed.index(output), straight.index(output))
                  for output in range(network.size) if crossed.index(output) != straight.index(output))
-
-
-def _lit_lines(probe, wavelengths) -> int:
-    return (probe.cross_input in wavelengths) + (probe.straight_input in wavelengths)
-
-
-def calibration_plan(network, states, wavelengths, names=None) -> list[SwitchProbe]:
-    """Choose one probe per MZI, grouped by output so the JDSU moves as little as possible.
-
-    A probe that sees both of the MZI's lines is preferred. Within a group the
-    output-side MZIs come first.
-    """
-    names = list(network.switches if names is None else names)
-    options = {}
-    for name in names:
-        probes = switch_probes(network, states, name)
-        best = max(_lit_lines(probe, wavelengths) for probe in probes)
-        if not best:
-            inputs = sorted({probe.cross_input + 1 for probe in probes})
-            raise ValueError(f"No laser line reaches {name}; assign a comb wavelength to input "
-                             f"{' or '.join(map(str, inputs))} in the WDM comb tab")
-        options[name] = [probe for probe in probes if _lit_lines(probe, wavelengths) == best]
-    plan, remaining = [], names
-    while remaining:
-        counts = Counter(probe.output for name in remaining for probe in options[name])
-        output = min(counts, key=lambda candidate: (-counts[candidate], candidate))
-        group = sorted((name for name in remaining if any(probe.output == output for probe in options[name])),
-                       key=lambda name: (-network.switches[name][0], name))
-        plan.extend(next(probe for probe in options[name] if probe.output == output) for name in group)
-        remaining = [name for name in remaining if name not in group]
-    return plan
 
 
 def line_powers(wave, power, wavelengths, half_window_nm) -> dict[int, float | None]:
@@ -258,46 +168,6 @@ def _read(read_spectrum, output) -> tuple[list, list]:
     if not all(math.isfinite(value) for value in (*wave, *power)):
         raise ValueError("The OSA returned non-finite spectrum values")
     return wave, power
-
-
-def extract_calibration(probe, points, tie_db=EXTREME_TIE_DB) -> MZICalibration:
-    """Cross is the strongest cross-state contrast, straight the weakest.
-
-    A sweep past 2π reaches a second maximum or null; any point within
-    ``tie_db`` of an extreme counts as that extreme, and the lowest voltage wins.
-    """
-    measured = [point for point in points if point.contrast_db is not None]
-    if not measured:
-        raise ValueError(f"{probe.name}: no comb line was found at output {probe.output + 1}; "
-                         "check the wavelength plan and line window")
-    highest = max(point.contrast_db for point in measured)
-    lowest = min(point.contrast_db for point in measured)
-    cross = min((point for point in measured if point.contrast_db >= highest - tie_db),
-                key=lambda point: (abs(point.voltage), -point.contrast_db))
-    straight = min((point for point in measured if point.contrast_db <= lowest + tie_db),
-                   key=lambda point: (abs(point.voltage), point.contrast_db))
-    return MZICalibration(probe, tuple(points), cross, straight)
-
-
-def sweep_switch(controller, switch, read_spectrum, probe, voltages, settle_s, wavelengths,
-                 half_window_nm, on_point=None, stop_event=None, sleep=time.sleep) -> MZICalibration:
-    """Sweep one MZI while the OSA watches ``probe.output``; the MZI stays at the last voltage.
-
-    ``read_spectrum(output)`` takes a 1-based output and must return a trace
-    that started after the last voltage change.
-    """
-    _select(switch, probe.output)
-    points = []
-    for voltage in voltages:
-        _check_stop(stop_event)
-        controller.drive_voltage(probe.name, voltage)
-        _wait(settle_s, stop_event, sleep)
-        lines = line_powers(*_read(read_spectrum, probe.output), wavelengths, half_window_nm)
-        point = ProbePoint(voltage, lines.get(probe.cross_input), lines.get(probe.straight_input))
-        points.append(point)
-        if on_point is not None:
-            on_point(probe, len(points), len(voltages), point)
-    return extract_calibration(probe, points)
 
 
 def evaluate_switches(network, states, matrix) -> dict[str, SwitchCheck]:
@@ -389,88 +259,14 @@ def check_calibrated_states(controller, switch, read_spectrum, network, states, 
                         label, on_output, stop_event)
 
 
-def calibrate_switch(controller, switch, read_spectrum, network, name, voltages, settle_s, wavelengths,
-                     half_window_nm, output=None, save=True, on_probe=None, on_point=None,
-                     stop_event=None, sleep=time.sleep) -> MZICalibration:
-    """Sweep one MZI with every other MZI at 0 V, then return all of them to 0 V.
-
-    ``output`` is the 0-based output to watch; by default the plan picks one
-    that sees both of the MZI's lines.
-    """
-    _require_ready(controller, network, voltages, settle_s)
-    states = reference_states(network)
-    if output is None:
-        probe = calibration_plan(network, states, wavelengths, [name])[0]
-    else:
-        probe = next((probe for probe in switch_probes(network, states, name) if probe.output == output), None)
-        if probe is None:
-            raise ValueError(f"{name} does not steer light to output {output + 1} while the others are at 0 V")
-        if not _lit_lines(probe, wavelengths):
-            raise ValueError(f"Neither input {probe.cross_input + 1} nor {probe.straight_input + 1} "
-                             "has a comb wavelength in the WDM plan")
-    try:
-        reset_all(controller, network)
-        if on_probe is not None:
-            on_probe(probe)
-        result = sweep_switch(controller, switch, read_spectrum, probe, voltages, settle_s, wavelengths,
-                              half_window_nm, on_point, stop_event, sleep)
-        if save:
-            controller.set_calibration(name, result.straight.voltage, result.cross.voltage)
-        return result
-    finally:
-        reset_all(controller, network)
-
-
-def calibrate_all(controller, switch, read_spectrum, network, voltages, settle_s, wavelengths, half_window_nm,
-                  verify=True, confirm_alignment=None, on_check=None, on_output=None, on_probe=None,
-                  on_point=None, on_switch=None, stop_event=None, result=None,
-                  sleep=time.sleep) -> CompleteCalibration:
-    """Alignment check, one sweep per MZI, then optional calibrated all-cross/all-bar checks.
-
-    Every sweep starts with all MZIs at 0 V, and every MZI is back at 0 V when
-    this returns or fails. ``confirm_alignment(check)`` may stop the run after
-    the alignment readout.
-    """
-    _require_ready(controller, network, voltages, settle_s)
-    plan = calibration_plan(network, reference_states(network), wavelengths)
-    result = CompleteCalibration() if result is None else result
-    try:
-        reset_all(controller, network)
-        _wait(settle_s, stop_event, sleep)
-        result.alignment = check_states(network, reference_states(network), switch, read_spectrum, wavelengths,
-                                        half_window_nm, "Alignment (all 0 V)", on_output, stop_event)
-        if on_check is not None:
-            on_check(result.alignment)
-        if confirm_alignment is not None and not confirm_alignment(result.alignment):
-            raise CalibrationStopped("Calibration stopped after the alignment check")
-        for probe in plan:
-            if on_probe is not None:
-                on_probe(probe)
-            calibration = sweep_switch(controller, switch, read_spectrum, probe, voltages, settle_s,
-                                       wavelengths, half_window_nm, on_point, stop_event, sleep)
-            controller.drive_voltage(probe.name, 0.0)
-            controller.set_calibration(probe.name, calibration.straight.voltage, calibration.cross.voltage)
-            result.switches[probe.name] = calibration
-            if on_switch is not None:
-                on_switch(calibration)
-        if verify:
-            for label, crossed in (("All cross (calibrated)", True), ("All bar (calibrated)", False)):
-                check = check_calibrated_states(controller, switch, read_spectrum, network,
-                                                dict.fromkeys(network.switches, crossed), wavelengths,
-                                                half_window_nm, label, settle_s, on_output, stop_event, sleep)
-                result.checks.append(check)
-                if on_check is not None:
-                    on_check(check)
-    finally:
-        reset_all(controller, network)
-    return result
-
-
 class SimulatedChip:
     """Dry-run optics: cos² MZIs, cross at 0 V, whose heater phase grows with V².
 
     Each input's line is followed through the network separately, so the
-    simulated OSA sees every MZI's finite extinction as leakage.
+    simulated OSA sees every MZI's finite extinction as leakage. ``lit`` holds
+    the inputs whose lasers are on. Each heater also warms the other MZIs by
+    ``coupling[aggressor, victim]`` of its own heating: a few percent in the
+    same stage, less one stage away.
     """
 
     def __init__(self, network, voltage: Callable[[str], float], wavelengths, seed=7):
@@ -481,9 +277,19 @@ class SimulatedChip:
         self.v_pi = {name: rng.uniform(2.8, 4.3) for name in network.switches}
         self.phase = {name: rng.uniform(-0.3, 0.3) for name in network.switches}
         self.input_dbm = {source: rng.uniform(-11.0, -7.0) for source in range(network.size)}
+        self.lit = set(range(network.size))
+        self.coupling = {}
+        for aggressor, (stage, _) in network.switches.items():
+            for victim, (other_stage, _) in network.switches.items():
+                distance = abs(stage - other_stage)
+                if victim != aggressor and distance <= 1:
+                    self.coupling[aggressor, victim] = rng.uniform(0.02, 0.05) / (1 + 2 * distance)
 
     def cross_fraction(self, name) -> float:
-        phase = math.pi * (self.voltage(name) / self.v_pi[name]) ** 2 + self.phase[name]
+        heating = self.voltage(name) ** 2 + sum(self.voltage(aggressor) ** 2 * share
+                                                for (aggressor, victim), share in self.coupling.items()
+                                                if victim == name)
+        phase = math.pi * heating / self.v_pi[name] ** 2 + self.phase[name]
         return min(0.998, max(0.002, math.cos(phase / 2) ** 2))
 
     def output_mw(self) -> dict[int, dict[int, float]]:
@@ -491,7 +297,7 @@ class SimulatedChip:
         result = {output: {} for output in range(self.network.size)}
         for source in range(self.network.size):
             rows = [0.0] * self.network.size
-            rows[source] = 10 ** (self.input_dbm[source] / 10)
+            rows[source] = 10 ** (self.input_dbm[source] / 10) if source in self.lit else 0.0
             for stage, pairs in enumerate(self.network.pairs):
                 for index, (a, b) in enumerate(pairs):
                     cross = self.cross_fraction(f"S{stage + 1}.{index + 1}")
@@ -517,10 +323,16 @@ class SimulatedChip:
                  for wavelength in wave]
         return wave, power
 
+    def meter_dbm(self, output) -> float:
+        """Total power a broadband meter reads at a 1-based output, over a -70 dBm floor."""
+        return 10 * math.log10(1e-7 + sum(self.output_mw()[int(output) - 1].values()))
 
-def create_calibration_folder(project_dir: Path, kind: str) -> Path:
+
+def create_calibration_folder(project_dir: Path, kind: str, dataset_root: Path | None = None) -> Path:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    folder = Path(project_dir) / "Results" / CALIBRATION_SUBFOLDER / f"{stamp}_{kind}"
+    parent = (Path(dataset_root) / "calibration" if dataset_root is not None else
+              Path(project_dir) / "Results" / CALIBRATION_SUBFOLDER)
+    folder = parent / f"{stamp}_{kind}"
     folder.mkdir(parents=True, exist_ok=False)
     return folder
 
@@ -548,41 +360,17 @@ def _check_record(check: StateCheck, pass_db: float) -> dict:
     }
 
 
-def save_calibration_results(folder: Path, context: dict, calibrations: dict, checks: list,
-                             pass_db: float = DEFAULT_PASS_DB) -> list[str]:
-    """Write the run summary, MZI sweeps, output readouts and their spectra into ``folder``."""
+def save_state_checks(folder: Path, context: dict, checks: list, pass_db: float = DEFAULT_PASS_DB) -> list[str]:
+    """Write the run summary, output readouts and their spectra into ``folder``."""
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     comment = context.get("comment", "")
-    header = [f"# Six-laser MZI calibration saved {datetime.now().isoformat(timespec='seconds')}\n"]
+    header = [f"# Six-laser state check saved {datetime.now().isoformat(timespec='seconds')}\n"]
     header += [f"# Comment: {line}\n" for line in comment.splitlines() or [""]]
-    files = ["mzi_calibration.json"]
-    record = {
-        **context,
-        "pass_margin_db": pass_db,
-        "mzi_calibrations": {
-            name: {"watched_output": item.probe.output + 1,
-                   "watched_output_fiber": fiber_number(item.probe.output + 1),
-                   "cross_input": item.probe.cross_input + 1, "straight_input": item.probe.straight_input + 1,
-                   "cross_voltage_v": item.cross.voltage, "straight_voltage_v": item.straight.voltage,
-                   "cross_margin_db": item.cross_margin_db, "straight_margin_db": item.straight_margin_db}
-            for name, item in calibrations.items()},
-        "state_checks": [_check_record(check, pass_db) for check in checks],
-    }
-    (folder / "mzi_calibration.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
-    if calibrations:
-        files.append("mzi_sweeps.csv")
-        with (folder / "mzi_sweeps.csv").open("w", encoding="utf-8", newline="") as file:
-            file.writelines(header)
-            file.write("# Peak power of the line that reaches the watched output in each MZI state\n")
-            writer = csv.writer(file)
-            writer.writerow(["switch", "watched_output", "cross_input", "straight_input", "voltage_v",
-                             "cross_line_dbm", "straight_line_dbm", "contrast_db"])
-            for name, item in calibrations.items():
-                for point in item.points:
-                    writer.writerow([name, item.probe.output + 1, item.probe.cross_input + 1,
-                                     item.probe.straight_input + 1, point.voltage, _number(point.cross_dbm),
-                                     _number(point.straight_dbm), _number(point.contrast_db)])
+    files = ["state_checks.json"]
+    record = {**context, "pass_margin_db": pass_db,
+              "state_checks": [_check_record(check, pass_db) for check in checks]}
+    (folder / "state_checks.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     if checks:
         files += ["output_readouts.csv", "readout_spectra.csv"]
         with (folder / "output_readouts.csv").open("w", encoding="utf-8", newline="") as file:

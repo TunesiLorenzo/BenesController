@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import threading
+import time
 import tkinter as tk
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -18,6 +20,8 @@ class ModuleState:
     model: str = ""
     laser: bool | None = None
     tec: bool | None = None
+    laser_setpoint: float | None = None
+    tec_setpoint: float | None = None
 
 
 class NewportLaserController:
@@ -135,6 +139,11 @@ class NewportLaserController:
             raise RuntimeError(f"Unexpected {channel} output state: {reply!r}")
         return reply == "1"
 
+    def _read_setpoint(self, slot, kind):
+        channel = self._select(slot, kind)
+        command = "SET:LDI?" if kind == "laser" else "SET:T?"
+        return float(self.instrument.query(f"{channel}:{command}").strip())
+
     def read_states(self):
         with self._lock:
             if not self.connected:
@@ -148,8 +157,10 @@ class NewportLaserController:
                             self._subchannel(module.model, kind)
                         except ValueError:
                             values[kind] = None
+                            values[f"{kind}_setpoint"] = None
                         else:
                             values[kind] = self._read(slot, kind)
+                            values[f"{kind}_setpoint"] = self._read_setpoint(slot, kind)
                     states.append(ModuleState(module.model, **values))
             self.modules = states
             return list(states)
@@ -166,35 +177,108 @@ class NewportLaserController:
             old = self.modules[slot - 1]
             self.modules[slot - 1] = ModuleState(
                 old.model, actual if kind == "laser" else old.laser,
-                actual if kind == "tec" else old.tec)
+                actual if kind == "tec" else old.tec,
+                old.laser_setpoint, old.tec_setpoint)
             if actual != enabled:
                 raise RuntimeError(f"Module {slot} {kind} did not turn {'on' if enabled else 'off'}")
             return actual
 
+    def set_setpoint(self, slot, kind, value):
+        if kind not in ("laser", "tec"):
+            raise ValueError("Choose laser current or TEC temperature")
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError("Enter a numeric setpoint") from error
+        if not math.isfinite(value) or (kind == "laser" and value < 0):
+            raise ValueError("Enter a finite setpoint; laser current cannot be negative")
+        with self._lock:
+            self._module(slot)
+            with self._preserve_channels():
+                channel = self._select(slot, kind)
+                mode = self.instrument.query(f"{channel}:MODE?").strip().upper()
+                desired_modes = ("I", "ICW", "ILBW", "IHBW", "LDI") if kind == "laser" else ("T",)
+                if mode not in desired_modes:
+                    if self._read(slot, kind):
+                        unit = "current" if kind == "laser" else "temperature"
+                        raise RuntimeError(
+                            f"Slot {slot} {kind} is ON in {mode} mode. Turn it OFF before "
+                            f"setting {unit}; changing mode would turn the output off.")
+                    self._select(slot, kind)
+                    self.instrument.write(f"{channel}:MODE:{'ILBW' if kind == 'laser' else 'T'}")
+                    selected_mode = self.instrument.query(f"{channel}:MODE?").strip().upper()
+                    if selected_mode not in desired_modes:
+                        raise RuntimeError(f"Slot {slot} {kind} did not enter the required mode "
+                                           f"(controller reports {selected_mode})")
+                    mode = selected_mode
+                # The 9016 reports invalid parameters through an error queue.
+                # Drain old entries so the next response belongs to this write.
+                for _ in range(10):
+                    if self.instrument.query("ERRSTR?").strip() in ("", "0"):
+                        break
+                command = "LDI" if kind == "laser" else "T"
+                write_command = f"{channel}:{command} {value:.6f}"
+                attempts = []
+                self.instrument.write(write_command)
+                error = self.instrument.query("ERRSTR?").strip()
+                attempts.append((write_command + " (CR+LF)", error))
+                if error.lstrip().startswith("106"):
+                    # The manual permits LF as a message terminator. Send the
+                    # same command without PyVISA appending CR+LF.
+                    self.instrument.write_raw((write_command + "\n").encode("ascii"))
+                    error = self.instrument.query("ERRSTR?").strip()
+                    attempts.append((write_command + " (LF only)", error))
+                tolerance = 0.05 if kind == "laser" else 0.1
+                for attempt in range(4):
+                    query = "SET:LDI?" if kind == "laser" else "SET:T?"
+                    actual = float(self.instrument.query(f"{channel}:{query}").strip())
+                    if math.isclose(actual, value, rel_tol=0, abs_tol=tolerance):
+                        break
+                    if attempt < 3:
+                        time.sleep(0.1)
+                else:
+                    unit = "mA" if kind == "laser" else "°C"
+                    read_error = self.instrument.query("ERRSTR?").strip()
+                    details = "".join(
+                        f" Sent: {candidate}. Error after write: {error}."
+                        for candidate, error in attempts)
+                    if read_error not in ("", "0"):
+                        details += f" Error after readback: {read_error}."
+                    if kind == "laser":
+                        limit = self.instrument.query("LAS:LIM:LDI?").strip()
+                        details += f" Current limit: {limit} mA."
+                    raise RuntimeError(
+                        f"Slot {slot} {kind} setpoint was not accepted: requested {value:g} {unit}, "
+                        f"controller reports {actual:g} {unit}. Mode: {mode}." + details)
+            old = self.modules[slot - 1]
+            self.modules[slot - 1] = ModuleState(
+                old.model, old.laser, old.tec,
+                actual if kind == "laser" else old.laser_setpoint,
+                actual if kind == "tec" else old.tec_setpoint)
+            return actual
+
     def all_off(self):
-        """Attempt every laser and TEC output even if one channel fails."""
+        """Attempt every laser output even if one channel fails; leave TEC alone."""
         with self._lock:
             if not self.connected:
                 raise RuntimeError("Connect the Newport controller first")
             errors = []
             with self._preserve_channels():
-                for kind in ("laser", "tec"):
-                    for slot, module in enumerate(self.modules, 1):
-                        try:
-                            self._subchannel(module.model, kind)
-                        except ValueError:
-                            continue
-                        try:
-                            channel = self._select(slot, kind)
-                            self.instrument.write(f"{channel}:OUTPUT 0")
-                            if self._read(slot, kind):
-                                raise RuntimeError("output still on")
-                            old = self.modules[slot - 1]
-                            self.modules[slot - 1] = ModuleState(
-                                old.model, False if kind == "laser" else old.laser,
-                                False if kind == "tec" else old.tec)
-                        except Exception as error:
-                            errors.append(f"slot {slot} {kind}: {error}")
+                for slot, module in enumerate(self.modules, 1):
+                    try:
+                        self._subchannel(module.model, "laser")
+                    except ValueError:
+                        continue
+                    try:
+                        channel = self._select(slot, "laser")
+                        self.instrument.write(f"{channel}:OUTPUT 0")
+                        if self._read(slot, "laser"):
+                            raise RuntimeError("output still on")
+                        old = self.modules[slot - 1]
+                        self.modules[slot - 1] = ModuleState(
+                            old.model, False, old.tec, old.laser_setpoint, old.tec_setpoint)
+                    except Exception as error:
+                        errors.append(f"slot {slot} laser: {error}")
             return errors
 
 
@@ -224,30 +308,58 @@ class NewportPanel(ttk.Frame):
             ttk.Button(bar, text="Detach" if detach else "Attach",
                        command=detach or attach).pack(side="right")
 
-        ttk.Label(self, text="Laser current and TEC temperature outputs are independent. "
-                  "ON uses the setpoints already stored in the controller.", wraplength=850).pack(anchor="w")
-        self.all_off_button = ttk.Button(self, text="ALL OFF · laser and TEC", command=self.all_off)
+        ttk.Label(self, text="Set laser current (mA) and TEC temperature (°C) for each module, "
+                  "then use the separate output switches. Setpoints apply in constant current "
+                  "and constant temperature modes respectively.", wraplength=1000).pack(anchor="w")
+        self.all_off_button = ttk.Button(self, text="ALL CURRENT OFF · leave TEC on", command=self.all_off)
         self.all_off_button.pack(anchor="w", pady=(10, 8))
         ttk.Label(self, textvariable=self.status_var, wraplength=850).pack(anchor="w", pady=(0, 8))
 
         grid = ttk.Frame(self)
         grid.pack(fill="x")
-        for col, label in enumerate(("Slot", "Module", "Laser current", "", "TEC temperature", "")):
+        self._active_color = "#1f6b4e"
+        self._idle_color = ttk.Style(self).lookup("TLabel", "background") or "#101827"
+        ttk.Style(self).configure("NewportActive.TLabel", background=self._active_color,
+                                  foreground="#f0fff5", font=("Segoe UI", 10, "bold"))
+        for col, label in enumerate(("Slot", "Module", "Laser", "", "Current (mA)", "",
+                                     "TEC", "", "Temperature (°C)", "")):
             ttk.Label(grid, text=label, font=("Segoe UI", 10, "bold")).grid(
                 row=0, column=col, sticky="w", padx=(4, 12), pady=4)
         for slot in range(1, SLOT_COUNT + 1):
+            module_highlight = tk.Frame(grid, background=self._idle_color)
+            laser_highlight = tk.Frame(grid, background=self._idle_color)
+            tec_highlight = tk.Frame(grid, background=self._idle_color)
+            module_highlight.grid(row=slot, column=0, columnspan=2, sticky="nsew")
+            laser_highlight.grid(row=slot, column=2, columnspan=4, sticky="nsew")
+            tec_highlight.grid(row=slot, column=6, columnspan=4, sticky="nsew")
+            slot_label = ttk.Label(grid, text=f"{slot:02d}")
             model = ttk.Label(grid, width=20)
             laser_state = ttk.Label(grid, width=8)
             tec_state = ttk.Label(grid, width=8)
             laser_button = ttk.Button(grid, width=11, command=lambda s=slot: self.toggle(s, "laser"))
             tec_button = ttk.Button(grid, width=11, command=lambda s=slot: self.toggle(s, "tec"))
-            ttk.Label(grid, text=f"{slot:02d}").grid(row=slot, column=0, sticky="w", padx=4, pady=2)
+            laser_var = tk.StringVar()
+            tec_var = tk.StringVar()
+            laser_entry = ttk.Entry(grid, textvariable=laser_var, width=10)
+            tec_entry = ttk.Entry(grid, textvariable=tec_var, width=10)
+            laser_set = ttk.Button(grid, text="Set", width=5,
+                                   command=lambda s=slot, v=laser_var: self.set_setpoint(s, "laser", v.get()))
+            tec_set = ttk.Button(grid, text="Set", width=5,
+                                 command=lambda s=slot, v=tec_var: self.set_setpoint(s, "tec", v.get()))
+            slot_label.grid(row=slot, column=0, sticky="w", padx=4, pady=2)
             model.grid(row=slot, column=1, sticky="w", padx=(4, 12))
             laser_state.grid(row=slot, column=2, sticky="w")
             laser_button.grid(row=slot, column=3, padx=(4, 18), pady=2)
-            tec_state.grid(row=slot, column=4, sticky="w")
-            tec_button.grid(row=slot, column=5, padx=4, pady=2)
-            self.rows.append((model, laser_state, laser_button, tec_state, tec_button))
+            laser_entry.grid(row=slot, column=4, padx=(0, 4))
+            laser_set.grid(row=slot, column=5, padx=(0, 18))
+            tec_state.grid(row=slot, column=6, sticky="w")
+            tec_button.grid(row=slot, column=7, padx=(4, 18), pady=2)
+            tec_entry.grid(row=slot, column=8, padx=(0, 4))
+            tec_set.grid(row=slot, column=9, padx=4)
+            self.rows.append((model, laser_state, laser_button, laser_var, laser_entry,
+                              laser_set, tec_state, tec_button, tec_var, tec_entry, tec_set,
+                              module_highlight, laser_highlight, tec_highlight, slot_label))
+        self._show_setpoints()
         self.render()
 
     def render(self):
@@ -257,7 +369,18 @@ class NewportPanel(ttk.Frame):
         self.refresh_button.configure(state="normal" if connected and not self.busy else "disabled")
         self.all_off_button.configure(state="normal" if connected and not self.busy else "disabled")
         for module, widgets in zip(self.controller.modules, self.rows):
-            model, laser_state, laser_button, tec_state, tec_button = widgets
+            (model, laser_state, laser_button, _, laser_entry, laser_set,
+             tec_state, tec_button, _, tec_entry, tec_set,
+             module_highlight, laser_highlight, tec_highlight, slot_label) = widgets
+            laser_on = connected and module.laser is True
+            tec_on = connected and module.tec is True
+            for highlight, active in ((module_highlight, laser_on or tec_on),
+                                      (laser_highlight, laser_on), (tec_highlight, tec_on)):
+                highlight.configure(background=self._active_color if active else self._idle_color)
+            for label, active in ((slot_label, laser_on or tec_on),
+                                  (model, laser_on or tec_on),
+                                  (laser_state, laser_on), (tec_state, tec_on)):
+                label.configure(style="NewportActive.TLabel" if active else "TLabel")
             model.configure(text=module.model or ("Empty" if connected else "—"))
             for kind, state_label, button in (("laser", laser_state, laser_button),
                                               ("tec", tec_state, tec_button)):
@@ -269,6 +392,16 @@ class NewportPanel(ttk.Frame):
                                       else "—" if not available and not module.model else "?")
                 button.configure(text="Turn OFF" if value is True else "Turn ON",
                                  state="normal" if available and value is not None else "disabled")
+                entry, set_button = ((laser_entry, laser_set) if kind == "laser"
+                                     else (tec_entry, tec_set))
+                entry.configure(state="normal" if available else "disabled")
+                set_button.configure(state="normal" if available else "disabled")
+
+    def _show_setpoints(self):
+        for module, widgets in zip(self.controller.modules, self.rows):
+            for kind, variable in (("laser", widgets[3]), ("tec", widgets[8])):
+                value = getattr(module, f"{kind}_setpoint")
+                variable.set(f"{value:g}" if value is not None else "")
 
     def _run(self, message, operation, success):
         if self.busy:
@@ -304,16 +437,39 @@ class NewportPanel(ttk.Frame):
         def operation():
             identity = self.controller.connect(resource)
             return identity, self.controller.read_states()
-        self._run("Connecting and reading outputs…", operation,
-                  lambda result: self.status_var.set(f"Connected: {result[0]} · {self.controller.resource}"))
+        def finish(result):
+            self._show_setpoints()
+            self.status_var.set(f"Connected: {result[0]} · {self.controller.resource}")
+        self._run("Connecting and reading outputs and setpoints…", operation, finish)
 
     def disconnect_controller(self):
-        self._run("Disconnecting…", self.controller.disconnect,
-                  lambda _: self.status_var.set("Disconnected"))
+        def finish(_):
+            self._show_setpoints()
+            self.status_var.set("Disconnected")
+        self._run("Disconnecting…", self.controller.disconnect, finish)
 
     def refresh(self):
-        self._run("Reading outputs…", self.controller.read_states,
-                  lambda _: self.status_var.set("Output states refreshed"))
+        def finish(_):
+            self._show_setpoints()
+            self.status_var.set("Output states and setpoints refreshed")
+        self._run("Reading outputs and setpoints…", self.controller.read_states, finish)
+
+    def set_setpoint(self, slot, kind, text):
+        try:
+            value = float(text)
+            if not math.isfinite(value) or (kind == "laser" and value < 0):
+                raise ValueError
+        except ValueError:
+            unit = "mA" if kind == "laser" else "°C"
+            messagebox.showerror("Newport 9016", f"Enter a valid {kind} setpoint in {unit}.",
+                                 parent=self.winfo_toplevel())
+            return
+        unit = "mA" if kind == "laser" else "°C"
+        def finish(actual):
+            self._show_setpoints()
+            self.status_var.set(f"Slot {slot} {kind} setpoint: {actual:g} {unit}")
+        self._run(f"Setting slot {slot} {kind} setpoint…",
+                  lambda: self.controller.set_setpoint(slot, kind, value), finish)
 
     def toggle(self, slot, kind):
         current = getattr(self.controller.modules[slot - 1], kind)
@@ -327,10 +483,10 @@ class NewportPanel(ttk.Frame):
     def all_off(self):
         def finish(errors):
             if errors:
-                self.status_var.set(f"ALL OFF incomplete: {len(errors)} output(s) failed")
+                self.status_var.set(f"ALL CURRENT OFF incomplete: {len(errors)} output(s) failed")
                 messagebox.showerror("Newport 9016", "Some outputs could not be confirmed off:\n" +
                                      "\n".join(errors), parent=self.winfo_toplevel())
             else:
-                self.status_var.set("All 16 modules: laser and TEC outputs OFF")
-        self._run("Turning all laser outputs off, then all TEC outputs off…",
+                self.status_var.set("All laser current outputs OFF; TEC outputs unchanged")
+        self._run("Turning all laser current outputs off…",
                   self.controller.all_off, finish)
