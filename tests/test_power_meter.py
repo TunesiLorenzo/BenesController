@@ -189,6 +189,25 @@ class ArduinoPowerMeterTests(unittest.TestCase):
         self.assertEqual(reading.rejected_count, 4)
         self.assertEqual(reading.jump_count, 1)
 
+    def test_raw_range_tracking_compensates_decade_steps_across_reads(self):
+        meter = ArduinoPowerMeter(self.path)
+        meter.serial = object()
+        meter.configure("COM9", 2_000_000, 0.1, 1, 0, "ADC counts", "raw", 80, 0,
+                        "range_up_falls")
+        with patch.object(meter, "read_timed_samples", side_effect=[
+                ([(60, False), (6, True), (6, False)], {"sample_period_s": 0.001}),
+                ([(60, True), (60, False)], {"sample_period_s": 0.001})]), \
+                patch.object(meter, "stop_stream"):
+            higher_range = meter.read_current_power()
+            lower_range = meter.read_current_power()
+        self.assertEqual(higher_range.raw_mean, 33)
+        self.assertEqual(higher_range.value, 60)
+        self.assertEqual(higher_range.range_steps, 1)
+        self.assertEqual(higher_range.range_changes, 1)
+        self.assertEqual(lower_range.value, 60)
+        self.assertEqual(lower_range.range_steps, 0)
+        self.assertEqual(lower_range.range_changes, 1)
+
     def test_all_flagged_samples_are_rejected(self):
         meter = ArduinoPowerMeter(self.path)
         meter.serial = object()

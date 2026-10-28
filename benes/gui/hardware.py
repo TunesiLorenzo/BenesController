@@ -12,6 +12,7 @@ from benes.core.heater_setup import BREAK_CURRENT_DENSITY, SAFE_CURRENT_DENSITY
 from benes.gui.theme import ACCENT, BG
 from benes.hardware.hp8152a import RANGES_DBM, validate_stream_rate
 from benes.hardware.osa_output_switch import JDSU_CHANNELS, OUTPUTS, fiber_number
+from benes.hardware.power_meter import RANGE_TRACKING_LABELS
 
 
 class HardwareMixin:
@@ -104,10 +105,16 @@ class HardwareMixin:
         ttk.Label(arduino, text="Jump guard [ms]").grid(row=3, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(arduino, textvariable=self.arduino_jump_guard_var, width=10).grid(
             row=3, column=1, sticky="w", pady=(8, 0))
-        ttk.Label(arduino, text="Raw optical stream discards flagged jumps, the guard window, and saturated samples.",
-                  wraplength=520).grid(row=3, column=2, columnspan=6, sticky="w", pady=(8, 0))
+        ttk.Label(arduino, text="Autorange correction").grid(row=3, column=2, sticky="w", pady=(8, 0))
+        ttk.Combobox(arduino, textvariable=self.arduino_range_tracking_var,
+                     values=tuple(RANGE_TRACKING_LABELS.values()), state="readonly", width=28).grid(
+            row=3, column=3, columnspan=2, sticky="w", padx=(4, 12), pady=(8, 0))
+        ttk.Label(arduino, text="For a 10 dB step, choose whether A0 falls or rises as the meter moves to a higher range.",
+                  wraplength=520).grid(row=3, column=5, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(arduino, text="Raw stream rejects flagged jumps and the guard window; correction accepts only decade-sized jumps.",
+                  wraplength=520).grid(row=4, column=0, columnspan=8, sticky="w", pady=(8, 0))
         ttk.Label(arduino, textvariable=self.power_reading_var, font=("Segoe UI", 10, "bold")).grid(
-            row=4, column=0, columnspan=8, sticky="w", pady=(12, 0))
+            row=5, column=0, columnspan=8, sticky="w", pady=(12, 0))
 
         self.build_hp_meter_page(hp_page)
 
@@ -401,6 +408,8 @@ class HardwareMixin:
                 self.arduino_scale_var.get(), self.arduino_offset_var.get(), self.arduino_unit_var.get(),
                 self.arduino_stream_var.get(), self.arduino_ceiling_var.get(),
                 self.arduino_jump_guard_var.get(),
+                next(mode for mode, label in RANGE_TRACKING_LABELS.items()
+                     if label == self.arduino_range_tracking_var.get()),
             )
             self.power_meter.connect()
             self._approved_unsafe_voltages.clear()
@@ -591,6 +600,8 @@ class HardwareMixin:
             f"Current power: {reading.value:.4g} {reading.unit} "
             f"(ADC mean {reading.raw_mean:.2f}, {reading.sample_count} clean samples"
             + (f", {reading.rejected_count} rejected, {reading.jump_count} jumps" if reading.rejected_count else "")
+            + (f", {reading.range_changes} range change(s), offset {reading.range_steps:+d} decade(s)"
+               if reading.range_changes else "")
             + (f", ~{reading.sample_rate_hz:,.0f} raw samples/s" if reading.sample_rate_hz else "")
             + ")"
         )

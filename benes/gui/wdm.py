@@ -24,9 +24,8 @@ class WDMMixin:
 
     def build_wdm_tab(self):
         """Wavelength plan for the WDM comb at the inputs and the per-output OSA scan."""
-        controls_column = ttk.Frame(self.wdm_tab, padding=(18, 18, 8, 18), width=390)
+        controls_column = ttk.Frame(self.wdm_tab, padding=(18, 18, 8, 18))
         controls_column.pack(side="left", fill="y")
-        controls_column.pack_propagate(False)
         control_scroll = VerticalScrolledFrame(controls_column)
         control_scroll.pack(fill="both", expand=True)
         controls = ttk.Frame(control_scroll.content, padding=(0, 0, 12, 0))

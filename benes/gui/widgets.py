@@ -137,27 +137,49 @@ def fit_to_screen(window, margin_x: int = 80, margin_y: int = 120):
     window.geometry(f"{min(width, max_width)}x{min(height, max_height)}")
 
 
-class VerticalScrolledFrame(ttk.Frame):
-    """A compact scroll container for dialogs whose content exceeds the display."""
+class VerticalScrolledFrame(ScrollableFrame):
+    """A tab column that scrolls vertically on its own, e.g. controls beside a plot.
+
+    Put content in ``.content``. The column is as wide as its content, plus the
+    scrollbar when one is needed, and the content is stretched to fill a larger
+    column. It does not request its content's height, so a long column scrolls by
+    itself instead of making the whole tab scroll around a second scrollbar.
+    """
 
     def __init__(self, parent, **kwargs):
-        super().__init__(parent, **kwargs)
-        self.canvas = tk.Canvas(self, bg=BG, highlightthickness=0, borderwidth=0)
-        vertical = ttk.Scrollbar(self, orient="vertical", style="Accent.Vertical.TScrollbar",
-                                 command=self.canvas.yview)
-        horizontal = ttk.Scrollbar(self, orient="horizontal", style="Accent.Horizontal.TScrollbar",
-                                   command=self.canvas.xview)
-        self.canvas.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
-        horizontal.pack(side="bottom", fill="x")
-        vertical.pack(side="right", fill="y")
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.content = ttk.Frame(self.canvas)
-        self.content_id = self.canvas.create_window((0, 0), window=self.content, anchor="nw")
-        self.content.bind("<Configure>", self._update_region)
-        self.canvas.bind("<MouseWheel>", self._scroll)
+        super().__init__(parent, background=BG)
+        if kwargs:
+            self.configure(**kwargs)
+        self.content = self.inner
 
-    def _update_region(self, _event=None):
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+    def sync(self):
+        want_w, want_h = self.inner.winfo_reqwidth(), self.inner.winfo_reqheight()
+        view_w, view_h = self.canvas.winfo_width(), self.canvas.winfo_height()
+        state = (want_w, want_h, view_w, view_h)
+        if state == self._last:
+            return
+        self._last = state
+        self.canvas.configure(width=want_w, height=1)
+        if view_w <= 1 or view_h <= 1:
+            return  # Not laid out yet.
+        width, height = max(want_w, view_w), max(want_h, view_h)
+        self.canvas.itemconfigure(self._item, width=width, height=height)
+        self.canvas.configure(scrollregion=(0, 0, width, height))
+        self._show(self.vbar, want_h > view_h, row=0, column=1, sticky="ns")
+        if want_h <= view_h:
+            self.canvas.yview_moveto(0)
 
-    def _scroll(self, event):
-        self.canvas.yview_scroll(-1 * (event.delta // 120), "units")
+    def can_scroll(self, horizontal: bool) -> bool:
+        return not horizontal and super().can_scroll(horizontal)
+
+
+def cap_width(frame, width: int):
+    """Request ``width`` for a frame whose content is wider and scrolls sideways.
+
+    Keeps the frame's natural height. Use it for a wide table that has its own
+    horizontal scrollbar, so the table does not widen the whole tab.
+    """
+    frame.update_idletasks()
+    frame.configure(width=width, height=frame.winfo_reqheight())
+    frame.pack_propagate(False)
+    frame.grid_propagate(False)

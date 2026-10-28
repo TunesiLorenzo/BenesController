@@ -16,9 +16,8 @@ class ImpulseMixin:
 
     def build_impulse_tab(self):
         # The settings scroll on their own so the plot stays in view.
-        control_column = ttk.Frame(self.impulse_tab, padding=18, width=310)
+        control_column = ttk.Frame(self.impulse_tab, padding=18)
         control_column.pack(side="left", fill="y")
-        control_column.pack_propagate(False)
         settings_scroll = VerticalScrolledFrame(control_column)
         settings_scroll.pack(fill="both", expand=True)
         controls = ttk.Frame(settings_scroll.content, padding=(0, 0, 10, 0))

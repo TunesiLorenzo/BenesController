@@ -23,6 +23,18 @@ RAW_STATUS_MASK = 0xE2
 DEFAULT_JUMP_GUARD_MS = 5.0
 # The detector flattens out near 80 counts, well below the 7-bit full scale.
 DEFAULT_CEILING = 80.0
+RANGE_TRACKING_OFF = "off"
+RANGE_TRACKING_UP_FALLS = "range_up_falls"
+RANGE_TRACKING_UP_RISES = "range_up_rises"
+RANGE_TRACKING_MODES = (RANGE_TRACKING_OFF, RANGE_TRACKING_UP_FALLS, RANGE_TRACKING_UP_RISES)
+RANGE_TRACKING_LABELS = {
+    RANGE_TRACKING_OFF: "Off (no range correction)",
+    RANGE_TRACKING_UP_FALLS: "Higher range: A0 falls",
+    RANGE_TRACKING_UP_RISES: "Higher range: A0 rises",
+}
+# The analogue signal should move by one decade when the meter steps range.
+# Keep this deliberately tighter than the Arduino's general-purpose jump flag.
+RANGE_STEP_TOLERANCE_DECADES = 0.20
 
 
 @dataclass(frozen=True)
@@ -36,6 +48,8 @@ class PowerReading:
     rejected_count: int = 0
     jump_count: int = 0
     sample_rate_hz: float | None = None
+    range_steps: int = 0
+    range_changes: int = 0
 
 
 class ArduinoPowerMeter:
@@ -55,6 +69,10 @@ class ArduinoPowerMeter:
         self.stream_start_time = None
         self._raw_last_received = 0.0
         self._raw_skipped = 0
+        # ``scale`` is calibrated at the range present on connection.  This
+        # state carries later decade changes relative to that starting range.
+        self._range_steps = 0
+        self._range_previous_optical = None
 
     def _defaults(self) -> dict:
         return {
@@ -67,6 +85,7 @@ class ArduinoPowerMeter:
             "stream_format": "raw",
             "ceiling": DEFAULT_CEILING,
             "jump_guard_ms": DEFAULT_JUMP_GUARD_MS,
+            "range_tracking": RANGE_TRACKING_OFF,
         }
 
     def _load(self) -> dict:
@@ -103,11 +122,14 @@ class ArduinoPowerMeter:
             raise ValueError("Arduino stream format must be raw, legacy, or dual")
         if settings.get("stream_format") == "raw" and int(settings["baud"]) not in RAW_BAUDS:
             raise ValueError("The raw optical sketch runs at 1000000 or 2000000 baud")
+        if settings.get("range_tracking", RANGE_TRACKING_OFF) not in RANGE_TRACKING_MODES:
+            raise ValueError("Select a valid Arduino autorange correction mode")
 
     def configure(self, port: object, baud: object, duration: object, scale: object, offset: object,
                   unit: object, stream_format: str = "legacy",
                   ceiling: object = DEFAULT_CEILING,
-                  jump_guard_ms: object = DEFAULT_JUMP_GUARD_MS) -> None:
+                  jump_guard_ms: object = DEFAULT_JUMP_GUARD_MS,
+                  range_tracking: str = RANGE_TRACKING_OFF) -> None:
         settings = {
             "port": str(port).strip(),
             "baud": int(baud),
@@ -118,6 +140,7 @@ class ArduinoPowerMeter:
             "stream_format": stream_format,
             "ceiling": float(ceiling),
             "jump_guard_ms": float(jump_guard_ms),
+            "range_tracking": str(range_tracking),
         }
         self._validate_settings(settings)
         self.settings = settings
@@ -150,6 +173,8 @@ class ArduinoPowerMeter:
         self._dual_buffer.clear()
         self._raw_tail = b""
         self._raw_running = False
+        self._range_steps = 0
+        self._range_previous_optical = None
 
     def disconnect(self) -> None:
         if self.serial is not None:
@@ -174,29 +199,34 @@ class ArduinoPowerMeter:
                 guard_samples = (math.ceil(self.settings["jump_guard_ms"] / 1000 / period)
                                  if period and period > 0 else 0)
                 raw_count = len(samples)
-                samples, rejected, jumps = self._filter_optical_jumps(samples, guard_samples,
-                                                                       self.ceiling)
+                samples, corrected_samples, rejected, jumps, range_changes = self._process_raw_samples(
+                    samples, guard_samples, self.ceiling)
                 sample_rate = (raw_count / self.settings["duration"] if raw_count else None)
             else:
                 samples = [optical for optical, _electrical in samples]
-                rejected = jumps = 0
+                corrected_samples = samples
+                rejected = jumps = range_changes = 0
                 sample_rate = None
         else:
             samples = self.sampler.burst_read_binary(self.serial, duration=self.settings["duration"])
-            rejected = jumps = 0
+            corrected_samples = samples
+            rejected = jumps = range_changes = 0
             sample_rate = None
         if not samples:
             raise RuntimeError("The Arduino returned no usable optical samples; check the uploaded sketch, "
                                "jump guard, detector range, and ceiling")
         raw_mean = sum(samples) / len(samples)
         reading = PowerReading(
-            value=raw_mean * self.settings["scale"] + self.settings["offset"],
+            value=(sum(corrected_samples) / len(corrected_samples) * self.settings["scale"]
+                   + self.settings["offset"]),
             unit=self.settings["unit"],
             raw_mean=raw_mean,
             sample_count=len(samples),
             rejected_count=rejected,
             jump_count=jumps,
             sample_rate_hz=sample_rate,
+            range_steps=self._range_steps,
+            range_changes=range_changes,
         )
         self.last_reading = reading
         return reading
@@ -261,6 +291,49 @@ class ArduinoPowerMeter:
             if remaining > 0:
                 remaining -= 1
         return clean, rejected, jumps
+
+    def _process_raw_samples(self, frames, guard_samples: int, ceiling: float):
+        """Reject raw-stream transitions and correct configured decade range steps.
+
+        The firmware only supplies a generic jump bit. A step is accepted as a
+        range transition only when its raw ratio is close to a decade; other
+        jumps retain the original rejection-only behavior.
+        """
+        clean = []
+        corrected = []
+        remaining = rejected = jumps = range_changes = 0
+        previous = self._range_previous_optical
+        mode = self.settings.get("range_tracking", RANGE_TRACKING_OFF)
+        for optical, jump in frames:
+            if jump:
+                jumps += 1
+                change = self._range_change(previous, optical, mode)
+                if change:
+                    self._range_steps += change
+                    range_changes += 1
+                remaining = max(remaining, guard_samples + 1)
+            if jump or remaining > 0 or optical >= ceiling:
+                rejected += 1
+            else:
+                clean.append(optical)
+                corrected.append(optical * 10 ** self._range_steps)
+            if remaining > 0:
+                remaining -= 1
+            previous = optical
+        self._range_previous_optical = previous
+        return clean, corrected, rejected, jumps, range_changes
+
+    @staticmethod
+    def _range_change(previous, optical, mode: str) -> int:
+        """Return the signed range-step implied by a decade-sized raw jump."""
+        if mode == RANGE_TRACKING_OFF or previous is None or previous <= 0 or optical <= 0:
+            return 0
+        decades = math.log10(optical / previous)
+        if abs(abs(decades) - 1) > RANGE_STEP_TOLERANCE_DECADES:
+            return 0
+        raw_rose = decades > 0
+        range_up = raw_rose if mode == RANGE_TRACKING_UP_RISES else not raw_rose
+        return 1 if range_up else -1
 
     def read_timed_samples(self, duration: float, reset_buffer: bool = True):
         """Return optical/status frames (raw) or optical/electrical pairs (dual)."""

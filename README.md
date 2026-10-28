@@ -226,6 +226,12 @@ readout of the power meter's actual range. A real optical step can also set it.
 The reader discards marked samples, the following **Jump guard [ms]** (default
 5 ms), and values at or above **Ceiling [ADC]** (default 80) before averaging.
 If no clean samples remain, the read fails instead of returning a biased value.
+For a meter left in autorange, choose its A0 polarity in **Autorange correction**:
+the reader treats a flagged raw change close to one decade as a range step and
+multiplies or divides later samples by ten. The configured power scale is the
+starting-range calibration. This is a heuristic: a real one-decade optical step
+can look identical, so leave correction off unless the selected polarity has
+been confirmed with a fixed optical input.
 The GUI reports clean/rejected counts and the observed raw frame rate. Set the
 burst duration, scale, offset, and unit for the converted power value. Settings
 are stored in `benes_power_meter_config.json`.

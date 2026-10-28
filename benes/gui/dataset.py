@@ -9,7 +9,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from benes.gui.theme import ACCENT, PANEL, POST_SWITCH_SWEEPS, TEXT, WDM_COLORS, WIRE
-from benes.gui.widgets import VerticalScrolledFrame
+from benes.gui.widgets import VerticalScrolledFrame, cap_width
 from benes.hardware import osa
 from benes.hardware.osa_output_switch import OUTPUTS
 from benes.measurements.dataset_registry import (analyze_dataset, create_dataset, save_measurement,
@@ -31,15 +31,17 @@ class DatasetMixin:
         metadata file.  File names alone cannot tell whether a trace represents
         one route, a fan-in measurement, or a full parallel acquisition.
         """
-        controls_column = ttk.Frame(self.dataset_tab, padding=(18, 18, 8, 18), width=335)
+        controls_column = ttk.Frame(self.dataset_tab, padding=(18, 18, 8, 18))
         controls_column.pack(side="left", fill="y")
-        controls_column.pack_propagate(False)
         control_scroll = VerticalScrolledFrame(controls_column)
         control_scroll.pack(fill="both", expand=True)
         controls = ttk.Frame(control_scroll.content, padding=(0, 0, 12, 0))
         controls.pack(anchor="nw", fill="x")
-        summary = ttk.Frame(self.dataset_tab, padding=(8, 18, 18, 18))
-        summary.pack(side="left", fill="both", expand=True)
+        # Both columns scroll on their own, so the tab itself never needs a second scrollbar.
+        summary_scroll = VerticalScrolledFrame(self.dataset_tab)
+        summary_scroll.pack(side="left", fill="both", expand=True)
+        summary = ttk.Frame(summary_scroll.content, padding=(8, 18, 18, 18))
+        summary.pack(fill="both", expand=True)
 
         self.dataset_folder_var = tk.StringVar()
         self.dataset_mode_var = tk.StringVar(value="Routed pairs")
@@ -132,12 +134,12 @@ class DatasetMixin:
         ttk.Label(summary, text="Coverage", foreground=ACCENT,
                   font=("Segoe UI", 14, "bold")).pack(anchor="w")
         ttk.Label(summary, text="The report counts the six routed input→output paths required for each expected permutation.",
-                  wraplength=700).pack(anchor="w", pady=(2, 8))
+                  wraplength=600).pack(anchor="w", pady=(2, 8))
         ttk.Label(summary, text="Live optical power ratios", foreground=ACCENT,
                   font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(4, 2))
         ttk.Label(summary, text=("Each row is one input wavelength at one switch state. Transmission and crosstalk "
                                  "are in dB relative to that wavelength's linear power summed across measured outputs."),
-                  foreground="#9baec6", wraplength=700).pack(anchor="w", pady=(0, 4))
+                  foreground="#9baec6", wraplength=600).pack(anchor="w", pady=(0, 4))
         metrics_frame = ttk.Frame(summary)
         metrics_frame.pack(fill="x", pady=(0, 10))
         metric_columns = ("state", "permutation", "input", "wavelength", "total", "expected", "transmission") + \
@@ -150,17 +152,19 @@ class DatasetMixin:
                   "expected": 75, "transmission": 115, **{f"out{port}": 125 for port in OUTPUTS}}
         for column in metric_columns:
             self.dataset_metrics_table.heading(column, text=headings[column])
-            self.dataset_metrics_table.column(column, width=widths[column], anchor="center")
+            self.dataset_metrics_table.column(column, width=widths[column], anchor="center", stretch=False)
         metrics_scroll = ttk.Scrollbar(metrics_frame, orient="horizontal", command=self.dataset_metrics_table.xview,
                                        style="Accent.Horizontal.TScrollbar")
         self.dataset_metrics_table.configure(xscrollcommand=metrics_scroll.set)
         self.dataset_metrics_table.pack(fill="x")
         metrics_scroll.pack(fill="x")
+        # The table scrolls sideways rather than widening the tab.
+        cap_width(metrics_frame, 600)
         report_frame = ttk.Frame(summary)
         report_frame.pack(fill="both", expand=True)
         report_scroll = ttk.Scrollbar(report_frame, orient="vertical", style="Accent.Vertical.TScrollbar")
         self.dataset_report = tk.Text(report_frame, wrap="word", bg=PANEL, fg=TEXT, insertbackground=TEXT,
-                                      font=("Consolas", 10), borderwidth=0, highlightthickness=1,
+                                      font=("Consolas", 10), height=10, borderwidth=0, highlightthickness=1,
                                       highlightbackground=WIRE, padx=12, pady=10, state="disabled")
         report_scroll.configure(command=self.dataset_report.yview)
         self.dataset_report.configure(yscrollcommand=report_scroll.set)

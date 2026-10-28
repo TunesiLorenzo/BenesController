@@ -42,15 +42,17 @@ class CalibrationMixin:
 
     def build_calibration_tab(self):
         """Detection settings, calibration and state-check controls beside the live view."""
-        controls_column = ttk.Frame(self.calibration_tab, padding=(18, 18, 8, 18), width=370)
+        controls_column = ttk.Frame(self.calibration_tab, padding=(18, 18, 8, 18))
         controls_column.pack(side="left", fill="y")
-        controls_column.pack_propagate(False)
         control_scroll = VerticalScrolledFrame(controls_column)
         control_scroll.pack(fill="both", expand=True)
         controls = ttk.Frame(control_scroll.content, padding=(0, 0, 12, 0))
         controls.pack(anchor="nw", fill="x")
-        results = ttk.Frame(self.calibration_tab, padding=(8, 18, 18, 18))
-        results.pack(side="left", fill="both", expand=True)
+        # Both columns scroll on their own, so the tab itself never needs a second scrollbar.
+        results_scroll = VerticalScrolledFrame(self.calibration_tab)
+        results_scroll.pack(side="left", fill="both", expand=True)
+        results = ttk.Frame(results_scroll.content, padding=(8, 18, 18, 18))
+        results.pack(fill="both", expand=True)
 
         ttk.Label(controls, text="MZI CALIBRATION", foreground=ACCENT,
                   font=("Segoe UI", 10, "bold")).pack(anchor="w")
@@ -137,16 +139,18 @@ class CalibrationMixin:
         ttk.Label(controls, textvariable=self.cal_status_var, wraplength=330).pack(anchor="w", pady=(8, 4))
 
         # Live view: expected light in each input's colour, MZI status colours, detector ring on the read output.
-        self.cal_canvas = tk.Canvas(results, bg=BG, highlightthickness=0, height=330)
+        self.cal_canvas = tk.Canvas(results, bg=BG, highlightthickness=0, height=260)
         self.cal_canvas.pack(fill="x")
         self.cal_canvas.bind("<Configure>", lambda event: self.draw_calibration_diagram())
         legend = ttk.Frame(results)
         legend.pack(fill="x", pady=(2, 8))
-        for status in ("pending", "saved", "active", "calibrated", "partial", "inverted", "hidden"):
+        # Four entries per row so the legend does not widen the tab.
+        for index, status in enumerate(("pending", "saved", "active", "calibrated", "partial", "inverted", "hidden")):
             color, text = CAL_STATUS[status]
-            ttk.Label(legend, text=f"■ {text}", foreground=color).pack(side="left", padx=(0, 12))
+            ttk.Label(legend, text=f"■ {text}", foreground=color).grid(
+                row=index // 4, column=index % 4, sticky="w", padx=(0, 12))
         ttk.Label(legend, text="Solid: lit path · dashes: the other state",
-                  foreground="#9baec6").pack(side="left")
+                  foreground="#9baec6").grid(row=1, column=3, columnspan=2, sticky="w")
 
         views = ttk.Notebook(results)
         views.pack(fill="both", expand=True)
@@ -161,11 +165,12 @@ class CalibrationMixin:
         style = ttk.Style(self)
         style.configure("Treeview", background=PANEL, fieldbackground=PANEL, foreground=TEXT, rowheight=24)
         style.configure("Treeview.Heading", background="#263650", foreground=TEXT, font=("Segoe UI", 9, "bold"))
-        columns = (("mzi", "MZI", 60), ("status", "Status", 105), ("probe", "Probe", 300),
-                   ("cross", "Cross [V]", 75), ("bar", "Bar [V]", 75), ("extinction", "Extinction [dB]", 105),
-                   ("check", "State checks", 200))
+        # Modest starting widths; the columns stretch to fill a wider window.
+        columns = (("mzi", "MZI", 50), ("status", "Status", 90), ("probe", "Probe", 170),
+                   ("cross", "Cross [V]", 70), ("bar", "Bar [V]", 70), ("extinction", "Extinction [dB]", 100),
+                   ("check", "State checks", 120))
         self.cal_table = ttk.Treeview(table_page, columns=[name for name, _, _ in columns], show="headings",
-                                      height=12)
+                                      height=8)
         for name, heading, width in columns:
             self.cal_table.heading(name, text=heading)
             self.cal_table.column(name, width=width, anchor="w" if name == "probe" else "center")
@@ -174,7 +179,7 @@ class CalibrationMixin:
         self.cal_table.pack(fill="both", expand=True)
         self.cal_table.bind("<<TreeviewSelect>>", self.select_calibration_row)
 
-        ttk.Label(matrix_page, foreground="#9baec6", wraplength=760, text=(
+        ttk.Label(matrix_page, foreground="#9baec6", wraplength=600, text=(
             "Peak power [dBm] of each input's line at each output for the last OSA readout. ● marks the line "
             "expected at that output; the row colour is the strongest line.")).pack(anchor="w", pady=(6, 4))
         self.cal_matrix_title = tk.StringVar(value="No readout yet")
@@ -185,7 +190,7 @@ class CalibrationMixin:
             heading = ("Output" if name == "output" else "Strongest" if name == "strongest"
                        else f"In {name[2:]}")
             self.cal_matrix.heading(name, text=heading)
-            self.cal_matrix.column(name, width=90, anchor="center")
+            self.cal_matrix.column(name, width=80, anchor="center")
         for port in INPUTS:
             self.cal_matrix.tag_configure(f"input{port}", foreground=WDM_COLORS[port - 1])
         self.cal_matrix.pack(fill="both", expand=True)

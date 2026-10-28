@@ -12,7 +12,7 @@ from benes.hardware.laser_bank import LaserBank
 from benes.hardware.newport_laser import NewportLaserController, NewportPanel
 from benes.hardware.hp8152a import DEFAULT_RESOURCE
 from benes.hardware.osa_output_switch import OUTPUTS, OSAOutputSwitch
-from benes.hardware.power_meter import ArduinoPowerMeter
+from benes.hardware.power_meter import ArduinoPowerMeter, RANGE_TRACKING_LABELS
 from benes.hardware.voltage_controller import BenesVoltageController
 from benes.measurements.wdm_comb import WDMPlan
 from benes.gui.calibration import DETECT_OSA, METER_HP, METER_VIA_JDSU, CalibrationMixin
@@ -124,6 +124,8 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
         self.arduino_stream_var = tk.StringVar(value=self.power_meter.settings["stream_format"])
         self.arduino_ceiling_var = tk.StringVar(value=f"{self.power_meter.settings['ceiling']:g}")
         self.arduino_jump_guard_var = tk.StringVar(value=f"{self.power_meter.settings['jump_guard_ms']:g}")
+        self.arduino_range_tracking_var = tk.StringVar(
+            value=RANGE_TRACKING_LABELS[self.power_meter.settings["range_tracking"]])
         self.power_reading_var = tk.StringVar(value="No Arduino reading yet")
         try:
             hp_settings = json.loads((app_dir() / "benes_hp8152a_config.json").read_text(encoding="utf-8"))
