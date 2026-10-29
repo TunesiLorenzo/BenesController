@@ -18,7 +18,11 @@ from benes.gui.widgets import VerticalScrolledFrame
 from benes.hardware import osa
 from benes.hardware.laser_bank import LaserBank, SimulatedLaserController
 from benes.hardware.osa_output_switch import OUTPUTS, fiber_number
+from benes.hardware.power_meter import RANGE_TRACKING_OFF
 from benes.measurements.calibration_scan import scan_voltages
+from benes.measurements.crosstalk_results import PLOT_X_POWER, PLOT_X_VOLTAGE, plot_x_values
+from benes.measurements.arduino_hp_range import (ArduinoHPRangeSweep, BNC_CLIP_ADC,
+                                                 DEFAULT_RANGE_SETTLE_S)
 from benes.measurements.laser_calibration import (DEFAULT_PASS_DB, CalibrationStopped, SimulatedChip,
                                                   check_alignment, check_calibrated_states,
                                                   create_calibration_folder, reference_states, reset_all,
@@ -26,6 +30,8 @@ from benes.measurements.laser_calibration import (DEFAULT_PASS_DB, CalibrationSt
 from benes.measurements.mzi_characterization import (OSALineDetector, PowerMeterDetector, dbm_to_mw,
                                                      mw_to_dbm, run_calibration, save_calibration)
 from benes.measurements.mzi_probing import plan_calibration
+from benes.measurements.power_route_check import (plan_route_checks, run_power_route_check,
+                                                   save_power_route_check)
 from benes.measurements.wdm_comb import INPUTS
 from benes.paths import app_dir
 
@@ -34,6 +40,7 @@ DETECT_OSA = "OSA · all lasers on"
 DETECT_POWER_METER = "Power meter · one laser at a time"
 METER_HP = "HP 8152A"
 METER_ARDUINO = "Arduino"
+METER_ARDUINO_HP = "Arduino + HP BNC"
 METER_VIA_JDSU = "JDSU common (any output)"
 
 
@@ -116,8 +123,9 @@ class CalibrationMixin:
                                          command=self.start_complete_calibration)
         self.cal_all_button.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
-        checks = ttk.LabelFrame(controls, text="State checks (OSA, all lasers on)", padding=10)
+        checks = ttk.LabelFrame(controls, text="State checks", padding=10)
         checks.pack(fill="x", pady=(12, 0))
+        ttk.Label(checks, text="OSA · all lasers on", foreground="#9baec6").pack(anchor="w")
         self.cal_alignment_button = ttk.Button(checks, text="Alignment check (all 0 V)",
                                                command=self.start_alignment_check)
         self.cal_alignment_button.pack(fill="x")
@@ -126,6 +134,14 @@ class CalibrationMixin:
         ttk.Label(checks, foreground="#9baec6", wraplength=320, text=(
             "Routed states applies the Routing tab's switch states with their saved voltages and leaves them "
             "applied.")).pack(anchor="w", pady=(6, 0))
+        ttk.Separator(checks).pack(fill="x", pady=(10, 8))
+        self.cal_power_route_button = ttk.Button(
+            checks, text="Check all routes with power meter", command=self.start_power_route_check)
+        self.cal_power_route_button.pack(fill="x")
+        ttk.Label(checks, foreground="#9baec6", wraplength=320, text=(
+            "One Newport laser at a time; 36 input-to-output routes and six JDSU output readings "
+            "per route. Uses saved cross/bar voltages on the path and 0 V elsewhere. "
+            "Select Power meter on JDSU common in Detection first.")).pack(anchor="w", pady=(6, 0))
 
         self.cal_comment_var = tk.StringVar()
         ttk.Label(controls, text="Comment").pack(anchor="w", pady=(12, 0))
@@ -154,14 +170,16 @@ class CalibrationMixin:
 
         views = ttk.Notebook(results)
         views.pack(fill="both", expand=True)
-        table_page, matrix_page, overlay_page, sweep_page = (ttk.Frame(views) for _ in range(4))
+        table_page, matrix_page, overlay_page, sweep_page, power_route_page = (ttk.Frame(views) for _ in range(5))
         views.add(table_page, text="MZIs")
         views.add(sweep_page, text="Sweeps")
         views.add(matrix_page, text="Output matrix")
         views.add(overlay_page, text="OSA overlay")
+        views.add(power_route_page, text="Power routes")
         self.cal_views = views
         self.cal_overlay_page = overlay_page
         self.cal_sweep_page = sweep_page
+        self.cal_power_route_page = power_route_page
         style = ttk.Style(self)
         style.configure("Treeview", background=PANEL, fieldbackground=PANEL, foreground=TEXT, rowheight=24)
         style.configure("Treeview.Heading", background="#263650", foreground=TEXT, font=("Segoe UI", 9, "bold"))
@@ -195,12 +213,51 @@ class CalibrationMixin:
             self.cal_matrix.tag_configure(f"input{port}", foreground=WDM_COLORS[port - 1])
         self.cal_matrix.pack(fill="both", expand=True)
 
+        self.cal_power_route_summary = tk.StringVar(value="Run the power meter route check to inspect all 36 paths.")
+        ttk.Label(power_route_page, textvariable=self.cal_power_route_summary,
+                  wraplength=850).pack(anchor="w", pady=(4, 8))
+        route_columns = ("input", "target", "strongest", "margin", "verdict", "suspects") + \
+                        tuple(f"out{port}" for port in OUTPUTS)
+        route_table_frame = ttk.Frame(power_route_page)
+        route_table_frame.pack(fill="both", expand=True)
+        self.cal_power_route_table = ttk.Treeview(route_table_frame, columns=route_columns,
+                                                   show="headings", height=12)
+        route_headings = {"input": "Input", "target": "Target", "strongest": "Strongest",
+                          "margin": "Margin [dB]", "verdict": "Result", "suspects": "Possible switch"}
+        for column in route_columns:
+            self.cal_power_route_table.heading(column, text=route_headings.get(column, column.upper() + " [dBm]"))
+            self.cal_power_route_table.column(column, width=120 if column == "suspects" else 86,
+                                              anchor="center")
+        for verdict, color in (("pass", ACCENT), ("misroute", "#ff6b6b"),
+                               ("ambiguous", "#ffa94d"), ("no_signal", "#9baec6")):
+            self.cal_power_route_table.tag_configure(verdict, foreground=color)
+        self.cal_power_route_table.pack(side="top", fill="both", expand=True)
+        route_scroll = ttk.Scrollbar(route_table_frame, orient="horizontal",
+                                     command=self.cal_power_route_table.xview)
+        route_scroll.pack(side="bottom", fill="x")
+        self.cal_power_route_table.configure(xscrollcommand=route_scroll.set)
+        self.cal_power_route_table.bind("<<TreeviewSelect>>", self.select_power_route_result)
+        self.cal_power_route_results = {}
+        self.cal_power_route_preview = False
+        self.cal_power_route_suspects = set()
+        self.cal_power_route_plan = ()
+
         self.cal_overlay_plots = ttk.Notebook(overlay_page)
         self.cal_overlay_plots.pack(fill="both", expand=True)
         self.cal_overlay_items = {}
         self.cal_overlay_hint = ttk.Label(overlay_page, text="State-check OSA curves appear here, overlaid by output.")
         self.cal_overlay_hint.place(relx=0.5, rely=0.5, anchor="center")
 
+        sweep_bar = ttk.Frame(sweep_page)
+        sweep_bar.pack(side="top", fill="x", pady=(4, 4))
+        ttk.Label(sweep_bar, text="X axis").pack(side="left")
+        self.cal_x_axis_var = tk.StringVar(value="Voltage [V]")
+        cal_x_box = ttk.Combobox(sweep_bar, textvariable=self.cal_x_axis_var,
+                                 values=("Voltage [V]", "Heater power [mW]"), state="readonly", width=18)
+        cal_x_box.pack(side="left", padx=(8, 10))
+        cal_x_box.bind("<<ComboboxSelected>>", lambda event: self.replot_calibration_x_axis())
+        ttk.Label(sweep_bar, text="Heater power uses R heater and R total from MZI / pin mapping.",
+                  foreground="#9baec6").pack(side="left")
         self.cal_plots = ttk.Notebook(sweep_page)
         self.cal_plots.pack(fill="both", expand=True)
         self.cal_plot_items = {}
@@ -237,8 +294,9 @@ class CalibrationMixin:
         meter = ttk.Frame(frame)
         meter.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         ttk.Label(meter, text="Meter").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(meter, textvariable=self.detection_meter_var, values=(METER_HP, METER_ARDUINO),
-                     state="readonly", width=12).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        ttk.Combobox(meter, textvariable=self.detection_meter_var,
+                     values=(METER_HP, METER_ARDUINO, METER_ARDUINO_HP),
+                     state="readonly", width=20).grid(row=0, column=1, sticky="w", padx=(10, 0))
         ttk.Label(meter, text="Meter on").grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Combobox(meter, textvariable=self.detection_position_var,
                      values=(METER_VIA_JDSU,) + tuple(f"Output {output}" for output in OUTPUTS),
@@ -256,11 +314,21 @@ class CalibrationMixin:
         ttk.Label(meter, text="Laser settle [s]").grid(row=4, column=0, sticky="w", pady=(6, 0))
         ttk.Entry(meter, textvariable=self.laser_settle_var, width=8).grid(row=4, column=1, sticky="w",
                                                                          padx=(10, 0), pady=(6, 0))
+        limits = ttk.Frame(meter)
+        limits.grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(limits, text="HP BNC low mean ADC").pack(side="left")
+        ttk.Entry(limits, textvariable=self.hp_bnc_low_adc_var, width=6).pack(side="left", padx=(6, 14))
+        ttk.Label(limits, text="high mean ADC").pack(side="left")
+        ttk.Entry(limits, textvariable=self.hp_bnc_high_adc_var, width=6).pack(side="left", padx=(6, 0))
         ttk.Label(meter, foreground="#9baec6", wraplength=320, text=(
             "Connect the Newport controller in its tab; the TECs must be on. Each probe lights its input "
-            "only, and the lasers return to their previous states afterwards. HP 8152A settings are in "
-            "Thermal crosstalk, Arduino settings in Hardware & OSA.")).grid(
-            row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            "only, and the lasers return to their previous states afterwards. Arduino + HP BNC uses "
+            "Arduino A0 measures each voltage. If its ADC mean is outside the limits, the heater is held, "
+            "GPIB changes the fixed HP range, waits for settling, and Arduino measures that voltage "
+            f"again. Keep the high limit below {BNC_CLIP_ADC:g}, where the HP BNC output clips. "
+            "Individual ADC samples are integers; their mean can be decimal. HP settings are in "
+            "Thermal crosstalk; Arduino settings are in Hardware.")).grid(
+            row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         def show_meter(*_):
             if self.detection_method_var.get() == DETECT_POWER_METER:
@@ -317,6 +385,8 @@ class CalibrationMixin:
         self.show_selected_probe()
 
     def show_selected_probe(self):
+        self.cal_power_route_preview = False
+        self.cal_power_route_suspects = set()
         name = self.cal_switch_var.get()
         probe = None if self.cal_plan is None else self.cal_plan.probe_for(name)
         if probe is not None:
@@ -472,7 +542,7 @@ class CalibrationMixin:
 
     def measurement_busy(self):
         return (self.mzi_calibration_running or self.crosstalk_running or self.wdm_running or
-                self.dataset_batch_running or self.impulse_running)
+                self.dataset_batch_running or getattr(self, "route_optimizer_running", False))
 
     def calibration_hardware(self):
         """Validate the OSA instruments and wavelength plan; return (read_spectrum, wavelengths, half window, simulated)."""
@@ -482,7 +552,7 @@ class CalibrationMixin:
             raise RuntimeError("Wait for the current OSA read to finish")
         host, port, simulate = self.osa_connection()
         if not self.controller.connected:
-            raise RuntimeError("Connect the voltage board first (Hardware & OSA)")
+            raise RuntimeError("Connect the voltage board first (Hardware)")
         if self.controller.settings["dry_run"] != simulate:
             raise RuntimeError("Use the physical voltage board with the real OSA, or a dry-run board with "
                                "OSA Simulate for a rehearsal")
@@ -532,7 +602,7 @@ class CalibrationMixin:
         if self.measurement_busy():
             raise RuntimeError("Wait for the current measurement to finish")
         if not self.controller.connected:
-            raise RuntimeError("Connect the voltage board first (Hardware & OSA)")
+            raise RuntimeError("Connect the voltage board first (Hardware)")
         simulate = self.controller.settings["dry_run"]
         self.laser_bank.configure({port: variable.get() for port, variable in self.laser_slot_vars.items()},
                                   self.laser_settle_var.get())
@@ -551,8 +621,12 @@ class CalibrationMixin:
             context["jdsu_channel_map"] = dict(switch.settings["channel_map"])
         fixed = None if via_jdsu else outputs[0]
 
-        def detector(read_power, lasers, unit, label):
-            return PowerMeterDetector(read_power, lasers, unit, switch, fixed, label)
+        def detector(read_power, lasers, unit, label, begin_curve=None, end_curve=None,
+                     rescan_points=None, finish_curve_points=None):
+            return PowerMeterDetector(read_power, lasers, unit, switch, fixed, label,
+                                      begin_curve=begin_curve, end_curve=end_curve,
+                                      rescan_points=rescan_points,
+                                      finish_curve_points=finish_curve_points)
 
         if simulate:
             def open_simulated():
@@ -569,7 +643,7 @@ class CalibrationMixin:
                     "inputs": inputs, "outputs": outputs, "context": context}
 
         if not self.newport_controller.connected:
-            raise RuntimeError("Connect the Newport laser controller in the Newport lasers tab first")
+            raise RuntimeError("Connect the Newport laser controller in Hardware → Newport lasers first")
         if self.newport_panel.busy:
             raise RuntimeError("Wait for the Newport command to finish")
         if meter_name == METER_HP:
@@ -579,31 +653,99 @@ class CalibrationMixin:
             context["hp_meter"] = options
 
             def open_hp():
-                meter = self.open_hp_meter(options)
+                meter, release = self.acquire_hp_meter(options)
                 return (detector(lambda: dbm_to_mw(meter.read_dbm_or_none()), self.laser_bank, "mW", METER_HP),
-                        meter.disconnect)
+                        release)
 
             return {"open": open_hp, "simulate": False, "unit": "mW", "osa": None, "hp": True,
                     "inputs": inputs, "outputs": outputs, "context": context}
         meter = self.power_meter
         if not meter.connected:
-            raise RuntimeError("Connect the Arduino meter in Hardware & OSA first")
-        if meter.settings["scale"] <= 0:
-            raise ValueError("Set a positive Arduino power scale in Hardware & OSA")
+            raise RuntimeError("Connect the Arduino meter in Hardware first")
         if self.read_power_button.instate(["disabled"]):
             raise RuntimeError("Wait for the current Arduino reading to finish")
         context["arduino_settings"] = dict(meter.settings)
 
-        def read_arduino():
-            reading = meter.read_current_power()
-            if not math.isfinite(reading.raw_mean) or reading.raw_mean >= meter.ceiling:
-                raise ValueError("The Arduino detector saturated or returned an invalid value")
-            return reading.value
+        if meter_name == METER_ARDUINO_HP:
+            if meter.settings["stream_format"] != "raw":
+                raise ValueError("Arduino + HP BNC requires the raw Arduino optical stream")
+            if self.bnc_reference is None:
+                raise ValueError("Set the BNC dBm reference in the Routing tab before Arduino + HP BNC calibration")
+            if self.hp_meter_busy:
+                raise RuntimeError("Stop the HP meter stream or test first")
+            low_adc = float(self.hp_bnc_low_adc_var.get())
+            high_adc = float(self.hp_bnc_high_adc_var.get())
+            if not (math.isfinite(low_adc) and math.isfinite(high_adc) and
+                    0 < low_adc < high_adc < meter.full_scale and high_adc > 10 * low_adc):
+                raise ValueError("HP BNC ADC limits need 0 < low < high < full scale and high > 10 × low")
+            if high_adc >= BNC_CLIP_ADC:
+                raise ValueError(f"HP BNC high limit must be below {BNC_CLIP_ADC:g} ADC counts, "
+                                 "where the HP analog output clips")
+            options = self.hp_meter_options()
+            channel = 1 if options["channel"] == "A" else 2
+            reference = self.bnc_reference
+            if (reference.resource, reference.channel) != (options["resource"], channel):
+                raise ValueError("Reconnect the HP meter and set a new BNC dBm reference for this channel")
+            context["hp_bnc"] = {"hp_meter": options, "low_adc": low_adc,
+                                 "high_adc": high_adc,
+                                 "range_settle_s": DEFAULT_RANGE_SETTLE_S,
+                                 "recovery_method": "adaptive_fixed_range",
+                                 "bnc_reference": reference.record()}
 
-        unit = meter.settings["unit"]
-        return {"open": lambda: (detector(read_arduino, self.laser_bank, unit, METER_ARDUINO), lambda: None),
-                "simulate": False, "unit": unit, "osa": None, "inputs": inputs, "outputs": outputs,
-                "context": context}
+            def open_arduino_hp():
+                hp = None
+                release = None
+                try:
+                    hp, release = self.acquire_hp_meter(options, configure=False)
+                    range_reader = ArduinoHPRangeSweep(
+                        meter, hp, channel,
+                        None if options["range"] == "Auto" else int(options["range"]),
+                        low_adc=low_adc, high_adc=high_adc, bnc_reference=reference)
+                    context["hp_bnc"]["reference_range_dbm"] = range_reader.reference_range_dbm
+                    context["hp_bnc"]["point_ranges"] = range_reader.history
+                    return (detector(range_reader.read, self.laser_bank, "mW",
+                                     METER_ARDUINO_HP, begin_curve=range_reader.begin_curve,
+                                     finish_curve_points=range_reader.finish_curve_points), release)
+                except Exception:
+                    if release is not None:
+                        release()
+                    raise
+
+            return {"open": open_arduino_hp, "simulate": False, "unit": "mW",
+                    "osa": None, "hp": True, "inputs": inputs, "outputs": outputs,
+                    "context": context}
+
+        if self.bnc_reference is None or self.hp_meter_session is None:
+            raise ValueError("Connect the HP 8152A and set the BNC dBm reference in Routing before Arduino calibration")
+        if self.hp_meter_busy:
+            raise RuntimeError("Stop the HP meter stream or test first")
+        options = self.hp_meter_options()
+        channel = 1 if options["channel"] == "A" else 2
+        reference = self.bnc_reference
+        if (reference.resource, reference.channel) != (options["resource"], channel):
+            raise ValueError("Set a new BNC dBm reference for this HP channel")
+        context["bnc_reference"] = reference.record()
+
+        def open_arduino_dbm():
+            hp, release = self.acquire_hp_meter(options, configure=False)
+
+            def read_arduino():
+                for _ in range(3):
+                    range_before = hp.read_range_dbm(channel)
+                    reading = meter.read_current_power(
+                        ceiling_override=meter.full_scale + 1,
+                        range_tracking_mode=RANGE_TRACKING_OFF, ignore_jumps=True)
+                    range_after = hp.read_range_dbm(channel)
+                    if range_before == range_after:
+                        if reading.raw_mean >= meter.ceiling:
+                            raise ValueError("The Arduino detector is above its configured ADC ceiling")
+                        return reference.mw(reading.raw_mean, range_before)
+                raise RuntimeError("HP autorange changed during every Arduino sample; use Arduino + HP BNC")
+
+            return (detector(read_arduino, self.laser_bank, "mW", METER_ARDUINO), release)
+
+        return {"open": open_arduino_dbm, "simulate": False, "unit": "mW", "osa": None,
+                "inputs": inputs, "outputs": outputs, "hp": True, "context": context}
 
     def claim_detection(self, setup, claim):
         """Keep the Newport panel and HP meter away from a running measurement."""
@@ -613,6 +755,207 @@ class CalibrationMixin:
         self.newport_panel.render()
         if setup.get("hp"):
             self.hp_meter_busy = "measurement" if claim else None
+            self.refresh_hp_connection_buttons()
+
+    def start_power_route_check(self):
+        """Exercise one calibrated path for every input/output pair."""
+        try:
+            if self.mzi_calibration_running:
+                raise RuntimeError("Wait for the current calibration or check to finish")
+            if not self.power_meter_method() or self.detection_position_var.get() != METER_VIA_JDSU:
+                raise ValueError("Select Power meter on JDSU common in Detection first")
+            setup = self.detection_setup()
+            settle_ms = float(self.cal_fields["Settle [ms]"].get())
+            pass_db = float(self.cal_fields["Pass margin [dB]"].get())
+            if not math.isfinite(settle_ms) or not 0 <= settle_ms <= 10000:
+                raise ValueError("Settling time must be between 0 and 10000 ms")
+            if not math.isfinite(pass_db) or not 0 < pass_db <= 60:
+                raise ValueError("Pass margin must be between 0 and 60 dB")
+            settle_s = settle_ms / 1000
+            calibration = self.controller.settings["calibration"]
+            missing = [name for name in self.network.switches
+                       if calibration[name]["cross"] is None or calibration[name]["straight"] is None]
+            if missing:
+                raise ValueError("Save cross and bar voltages for every MZI first: " + ", ".join(missing))
+            plan = plan_route_checks(self.network)
+            for name in self.network.switches:
+                self.confirm_voltage_sweep(
+                    [calibration[name]["cross"], calibration[name]["straight"]], names=[name])
+        except (OSError, RuntimeError, ValueError, tk.TclError) as error:
+            messagebox.showerror("Power route check unavailable", str(error), parent=self)
+            return
+
+        self.cal_power_route_preview = False
+        self.cal_power_route_suspects = set()
+        self.cal_power_route_plan = plan
+        self.cal_power_route_results.clear()
+        for row in self.cal_power_route_table.get_children():
+            self.cal_power_route_table.delete(row)
+        self.cal_power_route_summary.set("Checking 36 paths; six outputs are read for each path.")
+        self.cal_views.select(self.cal_power_route_page)
+        self.mzi_calibration_running = True
+        self.calibration_stop_event = stop_event = threading.Event()
+        self.cal_mzi_total = len(plan)
+        self.cal_mzi_finished = 0
+        self.cal_sweep_total = self.network.size
+        self.cal_mzi_progress.configure(maximum=len(plan), value=0)
+        self.cal_mzi_progress_var.set(f"Routes completed: 0/{len(plan)}")
+        self.cal_sweep_progress.configure(maximum=self.network.size, value=0)
+        self.cal_sweep_progress_var.set(f"Output readings: 0/{self.network.size}")
+        self.begin_activity("calibration", "Checking calibrated power routes...",
+                            len(plan) * self.network.size + 1)
+        self.set_calibration_controls(True)
+        self.claim_detection(setup, True)
+        self.cal_status_var.set("Checking calibrated cross/bar paths with one laser at a time...")
+        context = {
+            "kind": "power_route_sanity",
+            "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "comment": self.cal_comment_var.get().strip(),
+            "pass_margin_db": pass_db,
+            "settle_s": settle_s,
+            "minimum_laser_change_settle_s": 5.0,
+            "jdsu_extra_settle_s": 0.0,
+            "detection": setup["context"],
+            "calibration": {name: dict(value) for name, value in calibration.items()},
+            "jdsu_channel_map": dict(self.osa_output_switch.settings["channel_map"]),
+        }
+        dataset_text = self.dataset_folder_var.get().strip()
+        dataset_root = Path(dataset_text) if dataset_text and (Path(dataset_text) / "benes_dataset.json").is_file() else None
+        results = []
+
+        def on_output(source, target, output, power, route_index, total):
+            self.after(0, lambda: self.power_route_output_read(
+                source, target, output, route_index, total))
+
+        def on_route(result, index, total):
+            self.after(0, lambda: self.power_route_result_read(result, index, total))
+
+        def on_timing(timing):
+            context["jdsu_sweep_timing"] = {
+                key: timing[key] for key in ("count", "total_s", "minimum_s", "median_s", "maximum_s",
+                                           "per_output_median_s")
+            }
+            self.after(0, lambda: self.cal_power_route_summary.set(
+                f"JDSU readback: median {timing['median_s']:.3f} s/output, "
+                f"max {timing['maximum_s']:.3f} s/output. Checking routes..."))
+
+        def worker():
+            error = save_error = None
+            stopped = False
+            folder = None
+            detector = close = None
+            try:
+                detector, close = setup["open"]()
+                run_power_route_check(
+                    self.controller, detector.lasers, self.osa_output_switch, detector.read_power,
+                    self.network, settle_s, pass_db, on_route=on_route, on_output=on_output,
+                    on_timing=on_timing, stop_event=stop_event, plan=plan, results=results)
+            except CalibrationStopped:
+                stopped = True
+            except Exception as failure:
+                error = str(failure)
+            finally:
+                if close is not None:
+                    try:
+                        close()
+                    except Exception as failure:
+                        error = error or str(failure)
+            if results:
+                try:
+                    folder = create_calibration_folder(app_dir(), "power_route_sanity", dataset_root)
+                    save_power_route_check(folder, {**context, "status": "stopped" if stopped else
+                                                    "failed" if error else "complete", "error": error}, results)
+                except Exception as failure:
+                    save_error = str(failure)
+            self.after(0, lambda: self.finish_power_route_check(
+                setup, results, error, stopped, folder, save_error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def power_route_output_read(self, source, target, output, route_index, total):
+        self.update_activity("calibration", (route_index - 1) * self.network.size + output + 1,
+                             detail=f"Input {source + 1} to output {target + 1}: reading output {output + 1}")
+        self.cal_sweep_progress.configure(value=output + 1)
+        self.cal_sweep_progress_var.set(f"Output readings: {output + 1}/{self.network.size}")
+        route = self.cal_power_route_plan[route_index - 1][2]
+        states = dict.fromkeys(self.network.switches, True)
+        states.update(route.states)
+        self.cal_view.update(states=states, probe=None, reading=output, lit={source},
+                             dominant={}, note=f"Input {source + 1} → target output {target + 1}: "
+                                               f"reading output {output + 1}.")
+        self.draw_calibration_diagram()
+
+    def power_route_result_read(self, result, index, total):
+        self.cal_power_route_results[(result.source, result.target)] = result
+        powers = [mw_to_dbm(power) for power in result.powers_mw]
+        def display(power):
+            return "—" if power is None else f"{power:.1f}"
+        suspects = ", ".join(result.suspects) if result.suspects else (
+            "path" if result.verdict != "pass" else "")
+        key = f"{result.source}-{result.target}"
+        values = (result.source + 1, result.target + 1,
+                  "—" if result.strongest is None else result.strongest + 1,
+                  display(result.margin_db), result.verdict, suspects,
+                  *(display(power) for power in powers))
+        if self.cal_power_route_table.exists(key):
+            self.cal_power_route_table.item(key, values=values, tags=(result.verdict.replace(" ", "_"),))
+        else:
+            self.cal_power_route_table.insert("", "end", iid=key, values=values,
+                                               tags=(result.verdict.replace(" ", "_"),))
+        self.cal_mzi_finished = index
+        self.cal_mzi_progress.configure(value=index)
+        self.cal_mzi_progress_var.set(f"Routes completed: {index}/{total}")
+        failures = sum(item.verdict != "pass" for item in self.cal_power_route_results.values())
+        self.cal_power_route_summary.set(f"{index}/{total} paths checked · {failures} need inspection")
+
+    def select_power_route_result(self, event=None):
+        selection = self.cal_power_route_table.selection()
+        if not selection:
+            return
+        source, target = map(int, selection[0].split("-"))
+        result = self.cal_power_route_results.get((source, target))
+        if result is None:
+            return
+        states = dict.fromkeys(self.network.switches, True)
+        states.update(result.route.states)
+        self.cal_power_route_preview = True
+        self.cal_power_route_suspects = (
+            set(result.suspects or (name for name, _ in result.route.states))
+            if result.verdict != "pass" else set())
+        location = "no measurable output" if result.strongest is None else f"strongest at output {result.strongest + 1}"
+        note = (f"Input {source + 1} → target output {target + 1}: {result.verdict}; {location}. "
+                + ("Red outlines mark possible switches on this failed path."
+                   if self.cal_power_route_suspects else ""))
+        self.cal_view.update(states=states, probe=None, reading=target,
+                             lit={source},
+                             dominant={} if result.strongest is None else {result.strongest: source},
+                             note=note)
+        self.cal_status_var.set(note)
+        self.draw_calibration_diagram()
+
+    def finish_power_route_check(self, setup, results, error, stopped, folder, save_error):
+        self.claim_detection(setup, False)
+        self.finish_mzi_job(error, stopped, folder, save_error, leaves_zero=True)
+        finish_status = self.cal_status_var.get()
+        self.cal_views.select(self.cal_power_route_page)
+        for index, result in enumerate(results, start=1):
+            if (result.source, result.target) not in self.cal_power_route_results:
+                self.power_route_result_read(result, index, len(results))
+        failed = [result for result in results if result.verdict != "pass"]
+        passed = len(results) - len(failed)
+        self.cal_power_route_summary.set(
+            f"{passed}/{len(results)} paths pass the power margin; "
+            f"{len(failed)} need inspection." + (f" Results: {folder}" if folder else ""))
+        if results:
+            selected = failed[0] if failed else results[0]
+            key = f"{selected.source}-{selected.target}"
+            self.cal_power_route_table.selection_set(key)
+            self.cal_power_route_table.see(key)
+            self.select_power_route_result()
+        if not error and not stopped and not save_error:
+            self.cal_status_var.set(self.cal_power_route_summary.get())
+        else:
+            self.cal_status_var.set(finish_status)
 
     def start_alignment_check(self):
         try:
@@ -684,6 +1027,8 @@ class CalibrationMixin:
             messagebox.showerror("MZI calibration unavailable", str(error), parent=self)
             return
         verify = verify and setup["osa"] is not None and not plan.unreachable
+        self.cal_power_route_preview = False
+        self.cal_power_route_suspects = set()
         context = {
             "kind": kind, **setup["context"],
             "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -702,7 +1047,11 @@ class CalibrationMixin:
         self.cal_mzi_finished = 0
         self.cal_sweep_total = len(voltages)
         self.cal_unit = setup["unit"]
+        self.cal_arduino_log = "arduino_settings" in setup["context"] and setup["unit"] != "mW"
+        self.cal_arduino_linthresh = max(abs(setup["context"].get("arduino_settings", {}).get("scale", 1.0)), 1e-12)
         self.cal_reference_lines = setup["osa"] is not None
+        self.cal_hp_bnc_overlay = ("hp_bnc" in setup["context"] and
+                                   (setup["context"].get("hp_bnc") or {}).get("recovery_method") != "adaptive_fixed_range")
         self.begin_activity("calibration", f"Calibrating {len(plan.steps)} MZI(s)...",
                             len(plan.steps) * len(voltages) + 1)
         self.cal_mzi_progress.configure(maximum=len(plan.steps), value=0)
@@ -787,11 +1136,10 @@ class CalibrationMixin:
     def set_calibration_controls(self, running):
         state = "disabled" if running else "normal"
         for button in (self.cal_single_button, self.cal_all_button, self.cal_alignment_button,
-                       self.cal_routed_button):
+                       self.cal_routed_button, self.cal_power_route_button):
             button.configure(state=state)
         self.cal_stop_button.configure(state="normal" if running else "disabled")
-        for tab in (self.route_tab, self.hardware_tab, self.crosstalk_tab, self.dataset_tab, self.impulse_tab,
-                    self.newport_tab):
+        for tab in (self.route_tab, self.hardware_tab, self.crosstalk_tab, self.dataset_tab):
             self.set_tab_state(tab, state)
         self.set_osa_reading(running)
 
@@ -802,6 +1150,8 @@ class CalibrationMixin:
         ``job(hooks)`` fills ``hooks["checks"]`` and reports progress through
         the hook callbacks.
         """
+        self.cal_power_route_preview = False
+        self.cal_power_route_suspects = set()
         context = {
             "kind": kind,
             "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -1036,35 +1386,37 @@ class CalibrationMixin:
         self.draw_calibration_diagram()
 
     def plotted_power(self, power):
-        """dBm for powers in mW, otherwise the meter's own linear unit; NaN when missing."""
-        if self.cal_unit == "mW":
+        """Convert linear optical power to dBm for the calibration plots."""
+        if self.cal_unit == "mW" and not getattr(self, "cal_arduino_log", False):
             value = mw_to_dbm(power)
         else:
             value = power
         return float("nan") if value is None else value
 
     def calibration_point(self, name, index, total, point):
-        self.update_activity("calibration", self.cal_mzi_finished * self.cal_sweep_total + index,
-                             detail=f"Calibrating {name}: point {index}/{total} at {point.voltage:.2f} V")
-        self.cal_sweep_progress.configure(maximum=total, value=index)
-        self.cal_sweep_progress_var.set(f"{name} sweep points completed: {index}/{total}")
-        unit = "dBm" if self.cal_unit == "mW" else self.cal_unit
-        self.cal_status_var.set(f"{name}: {index}/{total} at {point.voltage:.2f} V · "
-                                f"{self.plotted_power(point.power):.4g} {unit}")
         plot = self.cal_plot_items.get(name)
+        rescan = plot is not None and index <= len(plot["points"])
+        verb = "Rescanning" if rescan else "Calibrating"
+        progress = total if rescan else index
+        self.update_activity("calibration", self.cal_mzi_finished * self.cal_sweep_total + progress,
+                             detail=f"{verb} {name}: point {index}/{total} at {point.voltage:.2f} V")
+        self.cal_sweep_progress.configure(maximum=total, value=progress)
+        phase = "rescan" if rescan else "sweep"
+        self.cal_sweep_progress_var.set(f"{name} {phase} point {index}/{total}")
+        unit = "dBm" if self.cal_unit == "mW" and not self.cal_arduino_log else self.cal_unit
+        self.cal_status_var.set(f"{name}: {'rescan ' if rescan else ''}{index}/{total} at {point.voltage:.2f} V · "
+                                f"{self.plotted_power(point.power):.4g} {unit}")
         if plot is None:
             return
-        plot["points"].append(point)
-        voltages = [item.voltage for item in plot["points"]]
-        plot["power_line"].set_data(voltages, [self.plotted_power(item.power) for item in plot["points"]])
-        if plot["reference_line"] is not None:
-            plot["reference_line"].set_data(voltages, [self.plotted_power(item.reference) for item in plot["points"]])
-            plot["contrast_line"].set_data(voltages, [float("nan") if item.contrast_db is None else item.contrast_db
-                                                      for item in plot["points"]])
-        for axis in plot["axes"]:
-            axis.relim()
-            axis.autoscale_view()
-        plot["canvas"].draw_idle()
+        if rescan and plot["reconstructed_line"] is not None:
+            if not plot["reconstructed_points"]:
+                plot["reconstructed_points"] = list(plot["points"])
+            plot["reconstructed_points"][index - 1] = point
+        elif rescan:
+            plot["points"][index - 1] = point
+        else:
+            plot["points"].append(point)
+        self.draw_calibration_sweep(name)
 
     def calibration_switch_done(self, result, saved):
         self.cal_mzi_finished += 1
@@ -1085,14 +1437,55 @@ class CalibrationMixin:
                                  + ("" if saved else " (not saved)"))
         plot = self.cal_plot_items.get(name)
         if plot is not None:
-            for axis in plot["axes"]:
-                axis.axvline(result.cross.voltage, color=ACCENT, linestyle="--", linewidth=1.2,
-                             label=f"Cross {result.cross.voltage:.2f} V")
-                axis.axvline(result.bar.voltage, color="#e0a100", linestyle="--", linewidth=1.2,
-                             label=f"Bar {result.bar.voltage:.2f} V")
-            plot["axes"][-1].legend(loc="best", fontsize=8)
-            plot["canvas"].draw_idle()
+            if plot["reconstructed_line"] is not None:
+                plot["reconstructed_points"] = list(result.points)
+            plot["result"] = result
+            self.draw_calibration_sweep(name)
         self.draw_calibration_diagram()
+
+    def calibration_x(self, name, voltages):
+        """X values and label for an MZI's sweep voltages under the Sweeps tab's axis mode."""
+        mode = PLOT_X_POWER if self.cal_x_axis_var.get().startswith("Heater power") else PLOT_X_VOLTAGE
+        return plot_x_values(voltages, self.controller.heater_resistance(name), mode,
+                             self.controller.total_resistance(name))
+
+    def draw_calibration_sweep(self, name):
+        """Set every line of an MZI's sweep plot from its points, against volts or heater power."""
+        plot = self.cal_plot_items.get(name)
+        if plot is None:
+            return
+        points = plot["points"]
+        xs, label = self.calibration_x(name, [item.voltage for item in points])
+        plot["power_line"].set_data(xs, [self.plotted_power(item.power) for item in points])
+        if plot["reference_line"] is not None:
+            plot["reference_line"].set_data(xs, [self.plotted_power(item.reference) for item in points])
+            plot["contrast_line"].set_data(xs, [float("nan") if item.contrast_db is None else item.contrast_db
+                                                for item in points])
+        if plot["reconstructed_line"] is not None and plot["reconstructed_points"]:
+            reconstructed = plot["reconstructed_points"]
+            plot["reconstructed_line"].set_data(
+                self.calibration_x(name, [item.voltage for item in reconstructed])[0],
+                [self.plotted_power(item.power) for item in reconstructed])
+        for marker in plot["markers"]:
+            marker.remove()
+        plot["markers"] = []
+        result = plot["result"]
+        if result is not None:
+            for axis in plot["axes"]:
+                for found, color, text in ((result.cross, ACCENT, "Cross"), (result.bar, "#e0a100", "Bar")):
+                    plot["markers"].append(axis.axvline(
+                        self.calibration_x(name, [found.voltage])[0][0], color=color, linestyle="--",
+                        linewidth=1.2, label=f"{text} {found.voltage:.2f} V"))
+            plot["axes"][-1].legend(loc="best", fontsize=8)
+        plot["axes"][-1].set_xlabel(label)
+        for axis in plot["axes"]:
+            axis.relim()
+            axis.autoscale_view()
+        plot["canvas"].draw_idle()
+
+    def replot_calibration_x_axis(self):
+        for name in self.cal_plot_items:
+            self.draw_calibration_sweep(name)
 
     def add_calibration_plot(self, probe):
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
@@ -1106,7 +1499,7 @@ class CalibrationMixin:
         self.cal_plots.add(tab, text=probe.name)
         self.cal_plots.select(tab)
         figure = Figure(figsize=(7, 4.6))
-        unit = "dBm" if self.cal_unit == "mW" else self.cal_unit
+        unit = "dBm" if self.cal_unit == "mW" and not self.cal_arduino_log else self.cal_unit
         if self.cal_reference_lines:
             lines_axis = figure.add_subplot(211)
             contrast_axis = figure.add_subplot(212, sharex=lines_axis)
@@ -1116,7 +1509,13 @@ class CalibrationMixin:
             axes = (lines_axis,)
         state = "cross" if probe.bright_crossed else "bar"
         power_line, = lines_axis.plot([], [], marker=".", linewidth=1.4, color=WDM_COLORS[probe.input],
-                                      label=f"In {probe.input + 1} (arrives if {state})")
+                                      label=("Initial HP range" if self.cal_hp_bnc_overlay else
+                                             f"In {probe.input + 1} (arrives if {state})"))
+        reconstructed_line = None
+        if self.cal_hp_bnc_overlay:
+            reconstructed_line, = lines_axis.plot([], [], marker=".", linewidth=1.4,
+                                                   color="#d97706", linestyle="--",
+                                                   label="After range adjustment")
         reference_line = contrast_line = None
         if self.cal_reference_lines:
             other = "bar" if probe.bright_crossed else "cross"
@@ -1124,10 +1523,12 @@ class CalibrationMixin:
                                               label=f"In {probe.other_input + 1} (arrives if {other})")
             contrast_line, = contrast_axis.plot([], [], marker=".", linewidth=1.4, color="#315b78")
             contrast_axis.axhline(0, color="#9baec6", linewidth=0.8)
-            contrast_axis.set(xlabel="Voltage [V]", ylabel=f"In {probe.input + 1} − In {probe.other_input + 1} [dB]")
+            contrast_axis.set(ylabel=f"In {probe.input + 1} − In {probe.other_input + 1} [dB]")
             contrast_axis.grid(True)
-        else:
-            lines_axis.set_xlabel("Voltage [V]")
+        axes[-1].set_xlabel(self.calibration_x(probe.name, [])[1])
+        if self.cal_arduino_log:
+            # Symmetric log keeps zero and any offset-corrected negative readings visible.
+            lines_axis.set_yscale("symlog", base=10, linthresh=self.cal_arduino_linthresh)
         lines_axis.set(ylabel=f"Power [{unit}]",
                        title=f"{probe.name}: output {probe.output + 1} (fiber {fiber_number(probe.output + 1)})")
         lines_axis.legend(loc="best", fontsize=8)
@@ -1139,8 +1540,9 @@ class CalibrationMixin:
         canvas.get_tk_widget().configure(**PLOT_MIN_SIZE)
         canvas.get_tk_widget().pack(fill="both", expand=True)
         self.cal_plot_items[probe.name] = {"tab": tab, "canvas": canvas, "axes": axes, "power_line": power_line,
+                                           "reconstructed_line": reconstructed_line, "reconstructed_points": [],
                                            "reference_line": reference_line, "contrast_line": contrast_line,
-                                           "points": []}
+                                           "points": [], "result": None, "markers": []}
 
     def draw_calibration_diagram(self):
         """Draw the network with each lit input's path in its colour and each MZI's status."""
@@ -1154,7 +1556,8 @@ class CalibrationMixin:
         view = self.cal_view
         states = view["states"]
         probe = view["probe"]
-        if probe is None and not self.mzi_calibration_running and self.cal_plan is not None:
+        if (probe is None and not self.mzi_calibration_running and self.cal_plan is not None
+                and not getattr(self, "cal_power_route_preview", False)):
             # Preview the selected MZI's probe.
             probe = self.cal_plan.probe_for(self.cal_switch_var.get())
             if probe is not None:
@@ -1202,10 +1605,11 @@ class CalibrationMixin:
                 status = self.cal_rows[name]["status"]
                 color = CAL_STATUS[status][0]
                 active = probe is not None and probe.name == name
+                suspect = name in getattr(self, "cal_power_route_suspects", ())
                 c.create_rectangle(x - half, ys[a] - 7, x + half, ys[b] + 7,
                                    fill="#2b2a1c" if active else PANEL,
-                                   outline=ZERO_VOLT_COLOR if active else color,
-                                   width=3 if active or status not in ("pending", "saved") else 2)
+                                   outline="#ff6b6b" if suspect else ZERO_VOLT_COLOR if active else color,
+                                   width=3 if suspect or active or status not in ("pending", "saved") else 2)
                 for start, end in ((a, b), (b, a)) if states[name] else ((a, a), (b, b)):
                     c.create_line(x - half, ys[start], x + half, ys[end], fill="#a4bad4", width=1.5)
                 c.create_text(x, ys[a] - 16, text=name + (" =" if name in biased else ""),

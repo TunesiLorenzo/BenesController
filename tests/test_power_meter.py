@@ -175,6 +175,30 @@ class ArduinoPowerMeterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ceiling"):
             meter.configure("COM9", 2_000_000, 0.1, 1, 0, "ADC counts", "raw", 0)
 
+    def test_explicit_ceiling_keeps_high_bnc_adc_sample_for_range_rescan(self):
+        meter = ArduinoPowerMeter(self.path)
+        meter.serial = object()
+        with patch.object(meter, "read_timed_samples", return_value=([(88, False)], {})), \
+                patch.object(meter, "stop_stream"):
+            with self.assertRaisesRegex(RuntimeError, "no usable optical samples"):
+                meter.read_current_power()
+            reading = meter.read_current_power(ceiling_override=meter.full_scale + 1)
+        self.assertEqual(reading.raw_mean, 88)
+
+    def test_fixed_hp_range_read_keeps_real_square_wave_jumps(self):
+        meter = ArduinoPowerMeter(self.path)
+        meter.serial = object()
+        meter.settings["jump_guard_ms"] = 5
+        frames = [(10, False), (88, True), (88, False)]
+        with patch.object(meter, "read_timed_samples", return_value=(frames, {"sample_period_s": 0.001})), \
+                patch.object(meter, "stop_stream"):
+            reading = meter.read_current_power(ceiling_override=128, range_tracking_mode="off",
+                                               ignore_jumps=True)
+        self.assertEqual(reading.raw_mean, 62)
+        self.assertEqual(reading.sample_count, 3)
+        self.assertEqual(reading.jump_count, 1)
+        self.assertEqual(reading.rejected_count, 0)
+
     def test_jump_guard_rejects_transition_and_saturation(self):
         meter = ArduinoPowerMeter(self.path)
         meter.serial = object()
@@ -207,6 +231,91 @@ class ArduinoPowerMeterTests(unittest.TestCase):
         self.assertEqual(lower_range.value, 60)
         self.assertEqual(lower_range.range_steps, 0)
         self.assertEqual(lower_range.range_changes, 1)
+
+    def test_range_change_uses_stable_samples_after_the_guard_in_both_directions(self):
+        meter = ArduinoPowerMeter(self.path)
+        meter.serial = object()
+        meter.settings["range_tracking"] = "range_up_falls"
+        meter.settings["jump_guard_ms"] = 1
+        captures = [
+            [(60, False), (30, True), (20, False), (6, False), (6, False)],
+            [(6, False), (20, True), (30, False), (60, False), (60, False)],
+        ]
+        with patch.object(meter, "read_timed_samples", side_effect=[
+                (capture, {"sample_period_s": 0.001}) for capture in captures]), \
+                patch.object(meter, "stop_stream"):
+            down = meter.read_current_power()
+            up = meter.read_current_power()
+        self.assertEqual((down.value, down.range_steps, down.range_changes), (60, 1, 1))
+        self.assertEqual((up.value, up.range_steps, up.range_changes), (60, 0, 1))
+
+    def test_range_change_during_settling_or_guard_crossing_captures(self):
+        meter = ArduinoPowerMeter(self.path)
+        meter.serial = object()
+        meter.settings["range_tracking"] = "range_up_falls"
+        meter.settings["jump_guard_ms"] = 1
+        captures = [
+            [(60, False), (30, True), (20, False)],
+            [(6, False), (6, False)],
+            [(20, True), (60, False), (60, False)],
+        ]
+        with patch.object(meter, "read_timed_samples", side_effect=[
+                (capture, {"sample_period_s": 0.001}) for capture in captures]), \
+                patch.object(meter, "stop_stream"):
+            first = meter.read_current_power()
+            second = meter.read_current_power()
+            third = meter.read_current_power()
+        self.assertEqual((first.value, second.value, third.value), (60, 60, 60))
+        self.assertEqual((first.range_steps, second.range_steps, third.range_steps), (0, 1, 0))
+        self.assertEqual((first.range_changes, second.range_changes, third.range_changes), (0, 1, 1))
+
+    def test_flagged_optical_jump_without_decade_ratio_does_not_rescale(self):
+        meter = ArduinoPowerMeter(self.path)
+        meter.serial = object()
+        meter.settings["range_tracking"] = "range_up_falls"
+        meter.settings["jump_guard_ms"] = 0
+        with patch.object(meter, "read_timed_samples", side_effect=[
+                ([(60, False), (20, True), (12, False)], {"sample_period_s": 0.001}),
+                ([(12, False), (30, True), (40, False)], {"sample_period_s": 0.001})]), \
+                patch.object(meter, "stop_stream"):
+            down = meter.read_current_power()
+            up = meter.read_current_power()
+        self.assertEqual(down.value, 36)
+        self.assertEqual((down.range_steps, down.range_changes), (0, 0))
+        self.assertEqual(up.value, 26)
+        self.assertEqual((up.range_steps, up.range_changes), (0, 0))
+
+    def test_unflagged_decade_change_between_voltage_points_is_not_rescaled(self):
+        meter = ArduinoPowerMeter(self.path)
+        meter.serial = object()
+        meter.settings["range_tracking"] = "range_up_falls"
+        with patch.object(meter, "read_timed_samples", side_effect=[
+                ([(60, False)], {"sample_period_s": 0.001}),
+                ([(6, False)], {"sample_period_s": 0.001})]), \
+                patch.object(meter, "stop_stream"):
+            first = meter.read_current_power()
+            second = meter.read_current_power()
+        self.assertEqual((first.value, second.value), (60, 6))
+        self.assertEqual(second.range_changes, 0)
+
+    def test_calibration_capture_tracks_settling_jump_without_averaging_settling_samples(self):
+        meter = ArduinoPowerMeter(self.path)
+        meter.serial = object()
+        meter.settings.update(duration=0.002, jump_guard_ms=0, range_tracking="range_up_falls")
+        with patch.object(meter, "start_stream"), patch.object(meter, "stop_stream"), \
+                patch.object(meter, "read_timed_samples", side_effect=[
+                    ([(60, False)] * 4, {"sample_period_s": 0.001}),
+                    ([(60, False), (6, True), (6, False), (6, False)],
+                     {"sample_period_s": 0.001})]) as read:
+            meter.begin_calibration_curve()
+            first = meter.read_current_power()
+            second = meter.read_current_power()
+            meter.end_calibration_curve()
+        self.assertEqual((first.value, second.value), (60, 60))
+        self.assertEqual(second.range_changes, 1)
+        self.assertEqual(second.jump_count, 1)
+        self.assertEqual(second.sample_count, 2)
+        self.assertTrue(all(call.kwargs["reset_buffer"] is False for call in read.call_args_list))
 
     def test_all_flagged_samples_are_rejected(self):
         meter = ArduinoPowerMeter(self.path)

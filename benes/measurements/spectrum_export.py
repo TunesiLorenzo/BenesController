@@ -41,7 +41,7 @@ def write_crosstalk_csv(path, data, source, description="", response_unit=""):
         file.write(f"# Crosstalk {source} scan exported {datetime.now().isoformat()}\n")
         reference = next((point for points in data.values() for point in points
                           if isinstance(point, SpectrumScanPoint) and point.reference_wavelength_nm is not None), None)
-        file.write(f"# Response power: {'OSA reference line peak and window mean [dBm]' if reference is not None else 'OSA spectrum peak and linear-bin mean [dBm]' if source == 'OSA' else 'Arduino calibrated power'}\n")
+        file.write(f"# Response power: {'OSA reference line peak and window mean [dBm]' if reference is not None else 'OSA spectrum peak and linear-bin mean [dBm]' if source == 'OSA' else f'{source} power meter reading'}\n")
         file.write(f"# Response unit: {response_unit or ('dBm' if source == 'OSA' else 'unspecified')}\n")
         if source == "OSA":
             file.write(f"# Final OSA bins discarded per trace: {SPURIOUS_TAIL_POINTS}\n")

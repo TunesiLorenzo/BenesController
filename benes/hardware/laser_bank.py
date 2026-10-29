@@ -95,16 +95,21 @@ class LaserBank:
                 self.controller.set_output(slot, "laser", False)
         self.lit = None
 
-    def light_only(self, source: int) -> None:
+    def light_only(self, source: int, *, minimum_settle_s: float = 0.0) -> None:
         """Light one 0-based input; the previous one goes off first so they never mix."""
+        settle_s = max(self.settings["settle_s"], minimum_settle_s)
         if self.lit == source:
+            # Confirm the output for every probe, including consecutive probes
+            # on the same input. The Newport controller checks its readback.
+            self.controller.set_output(self.slot_for(source), "laser", True)
+            self._sleep(settle_s)
             return
         if self.lit is not None:
             self.controller.set_output(self.slot_for(self.lit), "laser", False)
             self.lit = None
         self.controller.set_output(self.slot_for(source), "laser", True)
         self.lit = source
-        self._sleep(self.settings["settle_s"])
+        self._sleep(settle_s)
 
     def finish(self) -> None:
         """Return every mapped laser to the state it had before ``begin``."""

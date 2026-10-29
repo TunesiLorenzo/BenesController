@@ -1,6 +1,7 @@
 """Dataset coverage tab: linked dataset, batch acquisition and coverage reports."""
 
 import csv
+import json
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -19,6 +20,10 @@ from benes.measurements.wdm_comb import (INPUTS, create_wdm_folder, evaluate_con
                                          power_ratio_db, routed_wavelengths, save_wdm_scan, scan_outputs,
                                          simulated_comb_spectrum)
 from benes.paths import app_dir
+
+
+# Remembers the last dataset folder, so the next session links it again.
+DATASET_CONFIG = "benes_dataset_config.json"
 
 
 class DatasetMixin:
@@ -43,7 +48,9 @@ class DatasetMixin:
         summary = ttk.Frame(summary_scroll.content, padding=(8, 18, 18, 18))
         summary.pack(fill="both", expand=True)
 
-        self.dataset_folder_var = tk.StringVar()
+        self.dataset_folder_var = tk.StringVar(value=self.last_dataset_folder())
+        # Any existing folder put in the field, typed or chosen, becomes next start's default.
+        self.dataset_folder_var.trace_add("write", lambda *_: self.dataset_folder_changed())
         self.dataset_mode_var = tk.StringVar(value="Routed pairs")
         self.dataset_comment_var = tk.StringVar()
         self.dataset_status_var = tk.StringVar(value="Choose or initialize a dataset folder.")
@@ -190,7 +197,6 @@ class DatasetMixin:
         self.wdm_dataset_var = tk.BooleanVar(value=True)
         self.wdm_plot_var = tk.BooleanVar(value=False)
         self.wdm_status_var = tk.StringVar(value="Configure the six laser wavelengths, then evaluate from Routing.")
-        self.wdm_wavelength_boxes = []
 
         scan = ttk.LabelFrame(controls, text="Six-laser OSA scan configuration", padding=10)
         scan.pack(fill="x", pady=(12, 0))
@@ -220,11 +226,44 @@ class DatasetMixin:
                   wraplength=280).grid(row=11, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Label(scan, textvariable=self.wdm_status_var, foreground="#9baec6", wraplength=280).grid(
             row=12, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        comb.bind("<FocusOut>", lambda _event: self.update_wdm_comb_choices())
         self.update_wdm_routing()
 
+    @staticmethod
+    def last_dataset_folder():
+        try:
+            return json.loads((app_dir() / DATASET_CONFIG).read_text(encoding="utf-8")).get("folder") or ""
+        except (OSError, ValueError, AttributeError):
+            return ""
+
+    @staticmethod
+    def remember_dataset_folder(folder):
+        try:
+            (app_dir() / DATASET_CONFIG).write_text(json.dumps({"folder": str(folder)}, indent=2) + "\n",
+                                                    encoding="utf-8")
+        except OSError:
+            pass  # Only a convenience: the dataset itself is unaffected.
+
+    def dataset_folder_changed(self):
+        value = self.dataset_folder_var.get().strip()
+        if value and Path(value).is_dir():
+            self.remember_dataset_folder(value)
+
+    def restore_dataset_folder(self):
+        """At startup, link the dataset used last time unless it is gone."""
+        value = self.dataset_folder_var.get().strip()
+        if not value:
+            return
+        if not Path(value).is_dir():
+            self.dataset_status_var.set(f"Last dataset folder {value} was not found; choose a folder.")
+        elif (Path(value) / "benes_dataset.json").exists():
+            self.dataset_status_var.set(f"Linked the dataset from last time: {value}")
+            self.analyze_linked_dataset()
+        else:
+            self.dataset_status_var.set("Folder from last time selected. Initialize the full set or the active permutation.")
+
     def choose_dataset_folder(self):
-        folder = filedialog.askdirectory(parent=self, title="Choose Benes measurement dataset")
+        folder = filedialog.askdirectory(parent=self, title="Choose Benes measurement dataset",
+                                         initialdir=self.dataset_folder_var.get().strip() or None)
         if not folder:
             return
         self.dataset_folder_var.set(folder)
@@ -309,7 +348,7 @@ class DatasetMixin:
         self.dataset_batch_stop_button.configure(state="normal")
         self.evaluate_button.configure(state="disabled")
         self.set_osa_reading(True)
-        for tab in (self.route_tab, self.hardware_tab, self.calibration_tab, self.crosstalk_tab, self.impulse_tab):
+        for tab in (self.route_tab, self.hardware_tab, self.calibration_tab, self.crosstalk_tab):
             self.set_tab_state(tab, "disabled")
         self.dataset_metrics_table.delete(*self.dataset_metrics_table.get_children())
         self.dataset_status_var.set(f"Preparing {len(configurations)} configuration(s) for acquisition...")
@@ -426,7 +465,7 @@ class DatasetMixin:
         self.dataset_batch_stop_button.configure(state="disabled")
         self.evaluate_button.configure(state="normal")
         self.set_osa_reading(False)
-        for tab in (self.route_tab, self.hardware_tab, self.calibration_tab, self.crosstalk_tab, self.impulse_tab):
+        for tab in (self.route_tab, self.hardware_tab, self.calibration_tab, self.crosstalk_tab):
             self.set_tab_state(tab, "normal")
         self.refresh(keep_selection=True)
         if error:

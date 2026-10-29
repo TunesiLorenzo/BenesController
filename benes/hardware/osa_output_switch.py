@@ -10,6 +10,7 @@ reports that the mechanism has settled and ``CLOSE?`` confirms the channel.
 from __future__ import annotations
 
 import json
+import statistics
 import threading
 import time
 from pathlib import Path
@@ -37,7 +38,7 @@ class OSAOutputSwitch:
         self._resource_manager_factory = resource_manager_factory
         self._sleep = sleep
         self._clock = clock
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.manager = None
         self.instrument = None
         self._dry_run_connected = False
@@ -211,10 +212,13 @@ class OSAOutputSwitch:
         if actual != channel:
             raise RuntimeError(f"Requested JDSU channel {channel}, but the switch reports {actual}")
 
-    def select_output(self, output: object) -> int:
-        """Route the selected 1-based output to the OSA and wait for settling."""
+    def select_output(self, output: object, *, extra_settle_s: float | None = None) -> int:
+        """Route one output, confirm settled readback, then apply any extra wait."""
         output = int(output)
         channel = self.channel_for(output)
+        settle_s = self.settings["settle_s"] if extra_settle_s is None else float(extra_settle_s)
+        if not 0 <= settle_s <= 60:
+            raise ValueError("Extra JDSU settling time must be between 0 and 60 seconds")
         with self._lock:
             if not self.connected:
                 raise RuntimeError("Connect the OSA output switch first")
@@ -223,6 +227,42 @@ class OSAOutputSwitch:
             self.routed_output = output
             self.settings["selected_output"] = output
             self.save()
-            if self.settings["settle_s"]:
-                self._sleep(self.settings["settle_s"])
+            if settle_s:
+                self._sleep(settle_s)
         return output
+
+    def sweep_timing(self, outputs=OUTPUTS, repeats=2):
+        """Time real channel selections through settled status and readback."""
+        outputs = tuple(int(output) for output in outputs)
+        if not outputs or not 1 <= repeats <= 10:
+            raise ValueError("Choose at least one output and 1 to 10 timing sweeps")
+        for output in outputs:
+            self.channel_for(output)
+        with self._lock:
+            if not self.connected or self.settings["dry_run"]:
+                raise RuntimeError("Connect the physical JDSU switch to time its output sweep")
+            previous = self.routed_output
+            previous_channel = int(self.instrument.query("CLOSE?").strip()) if previous is None else None
+            times = []
+            try:
+                for _ in range(repeats):
+                    for output in outputs:
+                        start = self._clock()
+                        self.select_output(output, extra_settle_s=0)
+                        times.append({"output": output, "elapsed_s": self._clock() - start})
+            finally:
+                if previous is not None:
+                    self.select_output(previous, extra_settle_s=0)
+                elif previous_channel in JDSU_CHANNELS:
+                    self._close_channel(previous_channel)
+                    self.routed_output = None
+                    self.settings["selected_output"] = None
+                    self.save()
+        durations = [item["elapsed_s"] for item in times]
+        per_output = {str(output): statistics.median(
+            item["elapsed_s"] for item in times if item["output"] == output)
+            for output in dict.fromkeys(outputs)}
+        return {"samples": times, "count": len(times),
+                "total_s": sum(durations), "minimum_s": min(durations),
+                "median_s": statistics.median(durations), "maximum_s": max(durations),
+                "per_output_median_s": per_output}

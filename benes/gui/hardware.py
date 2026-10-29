@@ -2,6 +2,7 @@
 
 from collections import deque
 import math
+import socket
 from queue import Empty, Full, Queue
 import threading
 import time
@@ -12,24 +13,47 @@ from benes.core.heater_setup import BREAK_CURRENT_DENSITY, SAFE_CURRENT_DENSITY
 from benes.gui.theme import ACCENT, BG
 from benes.hardware.hp8152a import RANGES_DBM, validate_stream_rate
 from benes.hardware.osa_output_switch import JDSU_CHANNELS, OUTPUTS, fiber_number
-from benes.hardware.power_meter import RANGE_TRACKING_LABELS
+from benes.hardware.power_meter import RANGE_TRACKING_LABELS, RANGE_TRACKING_OFF
+
+
+# (key, label) of every instrument tried by "Connect all", in connection order.
+DEVICES = (("board", "Voltage board"), ("arduino", "Arduino meter"), ("hp", "HP 8152A"),
+           ("jdsu", "JDSU output switch"), ("newport", "Newport 9016"), ("osa", "OSA"))
+DEVICE_OK_COLOR = "#53dfbb"
+DEVICE_FAIL_COLOR = "#ff6b6b"
 
 
 class HardwareMixin:
     """Mixed into ``BenesApp``; relies on the state it sets up."""
 
     def build_hardware_tab(self):
-        """Voltage board, OSA/output switch, and both power meter pages."""
+        """Device overview, then one page per instrument: voltage board, OSA/JDSU, meters and Newport lasers."""
+        devices = ttk.LabelFrame(self.hardware_tab, text="Devices", padding=(18, 8))
+        devices.pack(fill="x", padx=18, pady=(16, 0))
+        self.device_status_labels = {}
+        for row, (key, label) in enumerate(DEVICES):
+            ttk.Label(devices, text=label, font=("Segoe UI", 10, "bold")).grid(row=row, column=0, sticky="w", pady=1)
+            status = ttk.Label(devices, text="not tried yet", foreground="#9baec6")
+            status.grid(row=row, column=1, sticky="w", padx=(14, 0), pady=1)
+            self.device_status_labels[key] = status
+        self.connect_all_button = ttk.Button(devices, text="Connect all", command=self.auto_connect_devices)
+        self.connect_all_button.grid(row=0, column=2, rowspan=2, sticky="ne", padx=(24, 0))
+        ttk.Label(devices, text="Tried at startup; a device that does not answer is skipped with a warning.",
+                  foreground="#9baec6").grid(row=2, column=2, rowspan=3, sticky="nw", padx=(24, 0))
+        devices.columnconfigure(1, weight=1)
+
         hardware_tabs = ttk.Notebook(self.hardware_tab)
         hardware_tabs.pack(fill="both", expand=True, padx=18, pady=16)
         voltage_page = ttk.Frame(hardware_tabs)
         osa_page = ttk.Frame(hardware_tabs)
         meter_page = ttk.Frame(hardware_tabs)
         hp_page = ttk.Frame(hardware_tabs)
+        self.newport_tab = ttk.Frame(hardware_tabs)
         hardware_tabs.add(voltage_page, text="Voltage board")
         hardware_tabs.add(osa_page, text="OSA & output switch")
         hardware_tabs.add(meter_page, text="Arduino meter")
         hardware_tabs.add(hp_page, text="HP 8152A meter")
+        hardware_tabs.add(self.newport_tab, text="Newport lasers")
 
         hardware = ttk.LabelFrame(voltage_page, text="Voltage controller", padding=(18, 12))
         hardware.pack(fill="x")
@@ -109,9 +133,9 @@ class HardwareMixin:
         ttk.Combobox(arduino, textvariable=self.arduino_range_tracking_var,
                      values=tuple(RANGE_TRACKING_LABELS.values()), state="readonly", width=28).grid(
             row=3, column=3, columnspan=2, sticky="w", padx=(4, 12), pady=(8, 0))
-        ttk.Label(arduino, text="For a 10 dB step, choose whether A0 falls or rises as the meter moves to a higher range.",
+        ttk.Label(arduino, text="HP 8152A BNC: use a fixed meter range if possible. With autorange, a confirmed 10 dB step is scaled to the starting range.",
                   wraplength=520).grid(row=3, column=5, columnspan=3, sticky="w", pady=(8, 0))
-        ttk.Label(arduino, text="Raw stream rejects flagged jumps and the guard window; correction accepts only decade-sized jumps.",
+        ttk.Label(arduino, text="The Arduino jump flag is a hint; only a matching decade-sized change in stable samples is corrected.",
                   wraplength=520).grid(row=4, column=0, columnspan=8, sticky="w", pady=(8, 0))
         ttk.Label(arduino, textvariable=self.power_reading_var, font=("Segoe UI", 10, "bold")).grid(
             row=5, column=0, columnspan=8, sticky="w", pady=(12, 0))
@@ -146,10 +170,26 @@ class HardwareMixin:
         self.hp_stream_stop_button.grid(row=2, column=1, sticky="w", pady=(10, 0))
         ttk.Button(controls, text="Apply read rate", command=self.apply_hp_stream_rate).grid(
             row=2, column=2, columnspan=2, sticky="w", pady=(10, 0))
+        self.hp_connect_button = ttk.Button(controls, text="Connect", command=self.connect_hp_meter)
+        self.hp_connect_button.grid(row=2, column=4, sticky="w", pady=(10, 0))
+        self.hp_disconnect_button = ttk.Button(controls, text="Disconnect", command=self.disconnect_hp_meter,
+                                               state="disabled")
+        self.hp_disconnect_button.grid(row=2, column=5, sticky="w", pady=(10, 0))
+        self.hp_range_test_button = ttk.Button(controls, text="Test -60 dBm range",
+                                               command=self.test_hp_low_range)
+        self.hp_range_test_button.grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Button(controls, text="Copy result", command=self.copy_hp_range_test_result).grid(
+            row=3, column=2, sticky="w", pady=(10, 0))
+        ttk.Label(controls, text="For a clear test, turn the lasers off first. The HP settings are restored.",
+                  wraplength=440).grid(row=3, column=3, columnspan=3, sticky="w", pady=(10, 0))
         ttk.Label(controls, text="Rate sets the requested GPIB read cadence. The meter's 2/8 Hz filter limits "
                   "optical response; the achieved read rate appears below.", wraplength=660).grid(
-            row=3, column=0, columnspan=6, sticky="w", pady=(10, 0))
+            row=4, column=0, columnspan=6, sticky="w", pady=(10, 0))
 
+        self.hp_connection_status_var = tk.StringVar(value="HP 8152A disconnected")
+        ttk.Label(page, textvariable=self.hp_connection_status_var).pack(anchor="w", pady=(10, 0))
+        self.hp_range_test_var = tk.StringVar(value="")
+        ttk.Label(page, textvariable=self.hp_range_test_var, wraplength=800).pack(anchor="w", pady=(0, 4))
         self.hp_stream_status_var = tk.StringVar(value="Stopped. Set the meter input and start the stream.")
         ttk.Label(page, textvariable=self.hp_stream_status_var, wraplength=800).pack(anchor="w", pady=(10, 4))
         self.hp_stream_power_var = tk.StringVar(value="— dBm")
@@ -183,6 +223,136 @@ class HardwareMixin:
         self.hp_stream_count = 0
         self.hp_stream_rate_hz = 5.0
         self.hp_stream_poll_id = None
+
+    def refresh_hp_connection_buttons(self):
+        busy = self.hp_meter_busy is not None
+        self.hp_connect_button.configure(state="disabled" if busy or self.hp_meter_session is not None else "normal")
+        self.hp_disconnect_button.configure(state="normal" if not busy and self.hp_meter_session is not None
+                                            else "disabled")
+
+    def connect_hp_meter(self):
+        if self.hp_meter_busy or self.hp_meter_session is not None:
+            return
+        try:
+            options = self.hp_meter_options()
+        except (OSError, ValueError) as error:
+            messagebox.showerror("HP meter settings", str(error), parent=self)
+            return
+        self.hp_meter_busy = "connect"
+        self.refresh_hp_connection_buttons()
+        self.hp_connection_status_var.set(f"Connecting HP 8152A on {options['resource']}...")
+
+        def worker():
+            try:
+                meter = self.open_hp_meter(options)
+            except Exception as error:
+                self.after(0, lambda message=str(error): self.finish_hp_connect(None, None, message))
+            else:
+                self.after(0, lambda: self.finish_hp_connect(meter, options, None))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_hp_connect(self, meter, options, error):
+        self.hp_meter_busy = None
+        self.hp_meter_session = meter
+        self.hp_meter_session_options = options
+        self.bnc_reference = None
+        self.refresh_hp_connection_buttons()
+        if error:
+            self.hp_connection_status_var.set(f"HP 8152A connection failed: {error}")
+            messagebox.showerror("HP 8152A connection failed", error, parent=self)
+        else:
+            self.hp_connection_status_var.set(f"HP 8152A connected on {options['resource']}")
+
+    def disconnect_hp_meter(self):
+        if self.hp_meter_busy or self.hp_meter_session is None:
+            return
+        meter = self.hp_meter_session
+        self.hp_meter_busy = "disconnect"
+        self.refresh_hp_connection_buttons()
+        self.hp_connection_status_var.set("Disconnecting HP 8152A...")
+
+        def worker():
+            try:
+                meter.disconnect()
+            except Exception as error:
+                message = str(error)
+            else:
+                message = None
+            self.after(0, lambda: self.finish_hp_disconnect(message))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_hp_disconnect(self, error):
+        self.hp_meter_session = None
+        self.hp_meter_session_options = None
+        self.bnc_reference = None
+        self.hp_meter_busy = None
+        self.refresh_hp_connection_buttons()
+        self.hp_connection_status_var.set("HP 8152A disconnected" if error is None else
+                                          f"HP 8152A disconnect failed: {error}")
+        if error:
+            messagebox.showerror("HP 8152A disconnect failed", error, parent=self)
+
+    def test_hp_low_range(self):
+        """Diagnose the HP fixed range remotely with the selected meter channel."""
+        if self.hp_meter_busy or self.measurement_busy():
+            self.hp_range_test_var.set("Wait for the current HP measurement or scan to finish.")
+            return
+        try:
+            options = self.hp_meter_session_options if self.hp_meter_session is not None else self.hp_meter_options()
+            channel = 1 if options["channel"] == "A" else 2
+        except (OSError, ValueError) as error:
+            messagebox.showerror("HP range test", str(error), parent=self)
+            return
+        self.hp_meter_busy = "range_test"
+        self.refresh_hp_connection_buttons()
+        self.hp_range_test_button.configure(state="disabled")
+        self.hp_range_test_var.set("Testing -60 dBm over GPIB and recording the HP readback...")
+        self.begin_activity("hp_range_test", "Testing the HP -60 dBm range...")
+
+        def worker():
+            meter = release = result = error = None
+            try:
+                if self.hp_meter_session is not None:
+                    meter = self.hp_meter_session
+                else:
+                    meter, release = self.acquire_hp_meter(options, configure=False)
+                result = meter.diagnose_fixed_range(channel, -60)
+            except Exception as failure:
+                error = str(failure)
+            finally:
+                if release is not None:
+                    try:
+                        release()
+                    except Exception as failure:
+                        error = error or f"Could not restore HP settings: {failure}"
+            self.after(0, lambda: self.finish_hp_low_range_test(result, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_hp_low_range_test(self, result, error):
+        self.hp_meter_busy = None
+        self.refresh_hp_connection_buttons()
+        self.hp_range_test_button.configure(state="normal")
+        self.finish_activity("hp_range_test", "HP range test complete" if error is None else "HP range test failed")
+        if error is not None:
+            self.hp_range_test_var.set(f"HP range test failed: {error}")
+            return
+        accepted = result["actual_dbm"] == result["requested_dbm"]
+        steps = ", ".join(f"{step['requested_dbm']} -> {step['actual_dbm']} "
+                          f"(ERR {step['error']})" for step in result["steps"])
+        self.hp_range_test_var.set(
+            f"Head: {result['head_id']}; selected CH{result['selected_before']}; "
+            f"range {result['range_before_dbm']} -> requested {result['requested_dbm']} -> "
+            f"reported {result['actual_dbm']} dBm ({'accepted' if accepted else 'refused'}). "
+            f"Separate steps: {steps}. "
+            f"Auto: {result['autorange_before']} -> {result['autorange_after']}; "
+            f"HP error: {result['error_before']} -> {result['error_after']}. Previous settings restored.")
+
+    def copy_hp_range_test_result(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.hp_range_test_var.get())
 
     def apply_hp_stream_rate(self):
         try:
@@ -218,6 +388,7 @@ class HardwareMixin:
         self.hp_stream_power_var.set("— dBm")
         self.hp_stream_stop = threading.Event()
         self.hp_meter_busy = "stream"
+        self.refresh_hp_connection_buttons()
         self.hp_stream_start_button.configure(state="disabled")
         self.hp_stream_stop_button.configure(state="normal")
         self.hp_stream_status_var.set(f"Connecting to {options['resource']}...")
@@ -227,9 +398,10 @@ class HardwareMixin:
 
     def _hp_stream_worker(self, options, stop):
         meter = None
+        release = None
         error = None
         try:
-            meter = self.open_hp_meter(options)
+            meter, release = self.acquire_hp_meter(options)
             started = time.monotonic()
             next_due = started
             while not stop.is_set():
@@ -245,9 +417,9 @@ class HardwareMixin:
         except Exception as failure:
             error = str(failure)
         finally:
-            if meter is not None:
+            if release is not None:
                 try:
-                    meter.disconnect()
+                    release()
                 except Exception as restore_error:
                     error = error or f"Could not restore HP meter settings: {restore_error}"
         self.after(0, lambda message=error: self.finish_hp_stream(message))
@@ -302,6 +474,7 @@ class HardwareMixin:
             self.hp_stream_poll_id = None
         self._poll_hp_stream(schedule=False)
         self.hp_meter_busy = None
+        self.refresh_hp_connection_buttons()
         self.hp_stream_stop = None
         self.hp_stream_start_button.configure(state="normal")
         self.hp_stream_stop_button.configure(state="disabled")
@@ -412,6 +585,7 @@ class HardwareMixin:
                      if label == self.arduino_range_tracking_var.get()),
             )
             self.power_meter.connect()
+            self.bnc_reference = None
             self._approved_unsafe_voltages.clear()
         except (OSError, RuntimeError, ValueError) as error:
             messagebox.showerror("Arduino connection failed", str(error), parent=self)
@@ -420,6 +594,7 @@ class HardwareMixin:
 
     def disconnect_power_meter(self):
         self.power_meter.disconnect()
+        self.bnc_reference = None
         self._approved_unsafe_voltages.clear()
         self.power_reading_var.set("Arduino disconnected")
 
@@ -438,21 +613,195 @@ class HardwareMixin:
             return False
         return True
 
-    def auto_connect_osa_output_switch(self):
-        """Connect the JDSU in the background at startup; a missing switch only updates the status."""
-        switch = self.osa_output_switch
-        self.osa_switch_status_var.set(f"Connecting OSA output switch on {switch.settings['resource']}...")
+    def set_device_status(self, key, text, ok=None):
+        self.device_status_labels[key].configure(
+            text=text, foreground="#9baec6" if ok is None else DEVICE_OK_COLOR if ok else DEVICE_FAIL_COLOR)
+
+    def prepare_board(self):
+        if self.controller.connected:
+            return None
+        self.controller.configure_connection(self.port_var.get(), self.baud_var.get(), self.dry_run_var.get())
 
         def connect():
-            try:
-                switch.connect()
-            except Exception as error:
-                message = f"OSA output switch not connected: {error}"
-            else:
-                message = f"OSA output switch connected: {switch.settings['resource']}"
-            self.after(0, lambda: self.osa_switch_status_var.set(message))
+            # As the Connect button: the saved voltages, then the calibrated states.
+            self.controller.connect()
+            self.controller.apply_calibrated_states(self.network.states)
+            return "dry run" if self.controller.settings["dry_run"] else self.controller.settings["port"]
 
-        threading.Thread(target=connect, daemon=True).start()
+        def done():
+            self.zero_volt_switches.clear()
+            self.show_calibrated_voltages()
+            self.update_hardware_status("Connected")
+
+        return connect, done
+
+    def prepare_arduino(self):
+        if self.power_meter.connected:
+            return None
+        self.power_meter.configure(
+            self.arduino_port_var.get(), self.arduino_baud_var.get(), self.arduino_duration_var.get(),
+            self.arduino_scale_var.get(), self.arduino_offset_var.get(), self.arduino_unit_var.get(),
+            self.arduino_stream_var.get(), self.arduino_ceiling_var.get(),
+            self.arduino_jump_guard_var.get(),
+            next(mode for mode, label in RANGE_TRACKING_LABELS.items()
+                 if label == self.arduino_range_tracking_var.get()))
+
+        def connect():
+            self.power_meter.connect()
+            return self.power_meter.settings["port"]
+
+        def done():
+            self.bnc_reference = None
+            self.power_reading_var.set(f"Arduino connected on {self.power_meter.settings['port']}")
+
+        return connect, done
+
+    def prepare_hp(self):
+        if self.hp_meter_session is not None or self.hp_meter_busy:
+            return None
+        options = self.hp_meter_options()
+        opened = []
+
+        def connect():
+            opened.append(self.open_hp_meter(options))
+            return options["resource"]
+
+        return connect, lambda: self.finish_hp_connect(opened[0], options, None)
+
+    def prepare_jdsu(self):
+        switch = self.osa_output_switch
+        if switch.connected:
+            return None
+
+        def connect():
+            switch.connect()
+            return switch.settings["resource"]
+
+        def done():
+            self.osa_switch_status_var.set(f"OSA output switch connected: {switch.settings['resource']}")
+
+        return connect, done
+
+    def prepare_newport(self):
+        if self.newport_controller.connected or self.newport_panel.busy:
+            return None
+        resource = self.newport_panel.resource_var.get().strip()
+
+        def connect():
+            identity = self.newport_controller.connect(resource)
+            self.newport_controller.read_states()
+            return f"{identity} · {resource}"
+
+        def done():
+            self.newport_panel.refresh_view(f"Connected · {self.newport_controller.resource}")
+            self.draw()
+
+        return connect, done
+
+    def prepare_osa(self):
+        if self.osa_dry_run_var.get():
+            return None
+        host, port = self.osa_host_var.get().strip(), int(self.osa_port_var.get())
+
+        def connect():
+            # The OSA is queried per trace; this only checks that it answers.
+            socket.create_connection((host, port), timeout=3).close()
+            return f"{host}:{port} answers"
+
+        return connect, lambda: None
+
+    def refresh_device_overview(self):
+        """Follow connections made or dropped with each page's own buttons."""
+        self.after(1000, self.refresh_device_overview)
+        if getattr(self, "_connecting_devices", False):
+            return
+        for key, _ in DEVICES:
+            if key == "osa":
+                continue
+            text = self.device_status_labels[key].cget("text")
+            connected = self.device_connected_now(key)
+            if connected and not text.startswith("connected"):
+                self.set_device_status(key, "connected", True)
+            elif not connected and text.startswith("connected"):
+                self.set_device_status(key, "disconnected")
+
+    def device_connected_now(self, key):
+        return {"board": self.controller.connected, "arduino": self.power_meter.connected,
+                "hp": self.hp_meter_session is not None, "jdsu": self.osa_output_switch.connected,
+                "newport": self.newport_controller.connected}.get(key, False)
+
+    def auto_connect_devices(self):
+        """Connect every instrument in one background thread; one that fails is skipped and reported."""
+        if self.measurement_busy() or getattr(self, "_connecting_devices", False):
+            return
+        jobs, failures = [], []
+        for key, label in DEVICES:
+            # Settings are read on the Tk thread; a bad one only skips its own device.
+            try:
+                job = getattr(self, f"prepare_{key}")()
+            except Exception as error:
+                self.set_device_status(key, f"not connected: {error}", False)
+                failures.append((label, str(error)))
+                continue
+            if job is not None:
+                self.set_device_status(key, "connecting…")
+                jobs.append((key, *job))
+            elif self.device_connected_now(key):
+                self.set_device_status(key, "connected", True)
+            elif key == "osa":
+                self.set_device_status(key, "simulated (Simulate is ticked)")
+        if not jobs:
+            self.report_device_failures(failures)
+            return
+        self._connecting_devices = True
+        self.connect_all_button.configure(state="disabled")
+        self.begin_activity("devices", "Connecting devices…", len(jobs))
+
+        def worker():
+            # One at a time: several of them share the GPIB bus.
+            for index, (key, connect, done) in enumerate(jobs):
+                self.after(0, lambda label=dict(DEVICES)[key], index=index: self.update_activity(
+                    "devices", index, detail=f"Connecting {label}…"))
+                try:
+                    detail, error = connect(), None
+                except Exception as failure:
+                    detail, error = None, str(failure) or type(failure).__name__
+                self.after(0, lambda key=key, done=done, detail=detail, error=error:
+                           self.device_connected(key, done, detail, error, failures))
+            self.after(0, lambda: self.finish_device_connections(failures))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def device_connected(self, key, done, detail, error, failures):
+        label = dict(DEVICES)[key]
+        if error is None:
+            try:
+                done()
+            except Exception as failure:
+                error = str(failure)
+        if error is None:
+            self.set_device_status(key, f"connected · {detail}", True)
+        else:
+            self.set_device_status(key, f"not connected: {error}", False)
+            failures.append((label, error))
+
+    def finish_device_connections(self, failures):
+        self._connecting_devices = False
+        self.connect_all_button.configure(state="normal")
+        self.finish_activity("devices", "Devices connected" if not failures else
+                             f"{len(failures)} device(s) not connected: "
+                             + ", ".join(label for label, _ in failures))
+        self.auto_bnc_reference()
+        self.report_device_failures(failures)
+
+    def report_device_failures(self, failures):
+        if failures:
+            messagebox.showwarning(
+                "Some devices are not connected",
+                "These devices did not connect and were skipped:\n\n"
+                + "\n".join(f"• {label}: {error}" for label, error in failures)
+                + "\n\nEverything else works without them. Check them in Hardware, then press Connect all.",
+                parent=self)
 
     def connect_osa_output_switch(self):
         if not self.save_osa_output_switch_settings():
@@ -558,6 +907,52 @@ class HardwareMixin:
                   foreground="#9baec6", wraplength=440).grid(row=len(OUTPUTS), column=0, columnspan=2,
                                                               sticky="w", pady=(8, 0))
 
+        timing_status = tk.StringVar(value="Times CLOSE, settled status, and channel readback across all six outputs.")
+        ttk.Label(body, textvariable=timing_status, wraplength=480, foreground="#9baec6").grid(
+            row=6, column=0, columnspan=3, sticky="w", pady=(12, 0))
+
+        def time_sweep():
+            if self.measurement_busy():
+                timing_status.set("Wait for the current measurement to finish.")
+                return
+            if not self.save_osa_output_switch_settings():
+                return
+            switch = self.osa_output_switch
+            if not switch.connected or switch.settings["dry_run"]:
+                timing_status.set("Connect the physical JDSU switch first.")
+                return
+            timing_button.configure(state="disabled")
+            for button in action_buttons:
+                button.configure(state="disabled")
+            timing_status.set("Timing two complete sweeps (12 channel changes)...")
+
+            def measure():
+                try:
+                    timing = switch.sweep_timing(repeats=2)
+                except Exception as error:
+                    message = f"JDSU sweep timing failed: {error}"
+                else:
+                    by_port = ", ".join(f"{port}: {seconds:.3f} s"
+                                        for port, seconds in timing["per_output_median_s"].items())
+                    message = (f"12 changes: min {timing['minimum_s']:.3f} s, "
+                               f"median {timing['median_s']:.3f} s, max {timing['maximum_s']:.3f} s; "
+                               f"total {timing['total_s']:.2f} s. Per-output median: {by_port}. "
+                               "Optical settling is not measured.")
+
+                def show_result():
+                    if dialog.winfo_exists():
+                        timing_status.set(message)
+                        timing_button.configure(state="normal")
+                        for button in action_buttons:
+                            button.configure(state="normal")
+
+                self.after(0, show_result)
+
+            threading.Thread(target=measure, daemon=True).start()
+
+        timing_button = ttk.Button(body, text="Time JDSU output sweep", command=time_sweep)
+        timing_button.grid(row=7, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
         def save_and_close():
             if self.save_osa_output_switch_settings():
                 dialog.destroy()
@@ -568,23 +963,44 @@ class HardwareMixin:
                 dialog.destroy()
 
         buttons = ttk.Frame(body)
-        buttons.grid(row=6, column=0, columnspan=3, sticky="e", pady=(18, 0))
-        ttk.Button(buttons, text="Disconnect", command=self.disconnect_osa_output_switch).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="Save", command=save_and_close).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="Connect", style="Accent.TButton", command=connect_and_close).pack(side="left")
+        buttons.grid(row=8, column=0, columnspan=3, sticky="e", pady=(18, 0))
+        action_buttons = []
+        for label, command in (("Disconnect", self.disconnect_osa_output_switch),
+                               ("Cancel", dialog.destroy), ("Save", save_and_close),
+                               ("Connect", connect_and_close)):
+            button = ttk.Button(buttons, text=label, command=command,
+                                **({"style": "Accent.TButton"} if label == "Connect" else {}))
+            button.pack(side="left", padx=(0, 8) if label != "Connect" else 0)
+            action_buttons.append(button)
 
     def read_current_power(self):
+        if self.bnc_reference is None or self.hp_meter_session is None:
+            self.power_reading_var.set("Current power: — dBm (connect HP and set BNC reference in Routing)")
+            return
+        if self.hp_meter_busy:
+            self.power_reading_var.set("Current power: — dBm (wait for the HP measurement to finish)")
+            return
+        reference = self.bnc_reference
+        hp = self.hp_meter_session
         self.begin_activity("power_read", "Reading Arduino power...")
         self.read_power_button.configure(state="disabled")
 
         def acquire():
             try:
-                reading = self.power_meter.read_current_power()
+                for _ in range(3):
+                    range_before = hp.read_range_dbm(reference.channel)
+                    reading = self.power_meter.read_current_power(
+                        ceiling_override=self.power_meter.full_scale + 1,
+                        range_tracking_mode=RANGE_TRACKING_OFF, ignore_jumps=True)
+                    range_after = hp.read_range_dbm(reference.channel)
+                    if range_before == range_after:
+                        break
+                else:
+                    raise RuntimeError("HP range changed during every Arduino sample")
             except Exception as error:
                 self.after(0, lambda error=error: self.power_read_failed(str(error)))
             else:
-                self.after(0, lambda: self.show_current_power(reading))
+                self.after(0, lambda: self.show_current_power(reading, range_before))
 
         threading.Thread(target=acquire, daemon=True).start()
 
@@ -593,12 +1009,14 @@ class HardwareMixin:
         self.read_power_button.configure(state="normal")
         messagebox.showerror("Arduino power read failed", error, parent=self)
 
-    def show_current_power(self, reading):
+    def show_current_power(self, reading, range_dbm):
         self.finish_activity("power_read", "Arduino power reading complete")
         self.read_power_button.configure(state="normal")
+        dbm = self.bnc_reference.dbm_at(reading.raw_mean, range_dbm)
         self.power_reading_var.set(
-            f"Current power: {reading.value:.4g} {reading.unit} "
-            f"(ADC mean {reading.raw_mean:.2f}, {reading.sample_count} clean samples"
+            f"Current power: {'below ADC floor' if dbm is None else f'{dbm:.2f} dBm'} "
+            f"(ADC mean {reading.raw_mean:.2f}, HP range {range_dbm:+d} dBm, "
+            f"{reading.sample_count} clean samples"
             + (f", {reading.rejected_count} rejected, {reading.jump_count} jumps" if reading.rejected_count else "")
             + (f", {reading.range_changes} range change(s), offset {reading.range_steps:+d} decade(s)"
                if reading.range_changes else "")

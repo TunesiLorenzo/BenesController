@@ -18,13 +18,13 @@ benes/
   paths.py            app_dir() for configs and Results/, sibling-project lookup
   core/               network topology/solver, heater current limits
   hardware/           voltage board, Arduino meter, OSA, JDSU output switch, Newport lasers
-  measurements/       scans, calibration, WDM comb, impulse test, datasets, CSV export
+  measurements/       scans, calibration, WDM comb, datasets, CSV export
   gui/
     app.py            main window: shared state, notebook, lifecycle
     theme.py          colours and ttk style
     widgets.py        scrollable containers
     routing.py, hardware.py, spectra.py, mapping.py, crosstalk.py,
-    calibration.py, wdm.py, dataset.py, impulse.py
+    calibration.py, wdm.py, dataset.py
                       one mixin per tab or dialog, combined into BenesApp
 tests/                unittest suite
 ```
@@ -34,7 +34,7 @@ the exe when frozen.
 
 The status strip below the window title stays visible across tabs during OSA
 reads, configuration evaluation, calibration, dataset acquisition, crosstalk
-and voltage scans, and impulse capture. It names the current step and shows a
+voltage scans, and device connection. It names the current step and shows a
 counted progress bar when the work has a known number of measurements; other
 operations show an animated bar.
 
@@ -54,17 +54,25 @@ recorded, toggling a switch or applying a route sends the voltage for its logica
 state. Mapping, connection settings, voltages, and calibration points are kept in
 `benes_voltage_config.json` beside the application. It is created on first change.
 The route diagram starts with every MZI crossed, matching the 0 V physical state.
-New configurations leave board pin 8 free for the optional legacy dual-channel
-impulse monitor. Existing pin mappings are preserved.
 The default scan limits are 0–5 V. A voltage outside this range requires a
 confirmation before the board sends it; the prompt reminds you to disconnect
 the Arduino sampler from the voltage-board signal and check the heater current
 limit.
 
-The UI is organized by workflow: **Routing**, **Hardware & OSA**, **MZI
-calibration**, **Thermal crosstalk**, and **Impulse test**. Hardware & OSA separates the voltage board, OSA
-and its output selector, Arduino meter, and HP 8152A meter into sub-tabs so every control remains
-visible on a laptop display.
+The UI is organized by workflow: **Routing**, **Hardware**, **MZI
+calibration**, **Thermal crosstalk**, and **Dataset coverage**. Hardware separates the voltage board, OSA
+and its output selector, Arduino meter, HP 8152A meter and Newport lasers into sub-tabs so every control
+remains visible on a laptop display.
+
+At startup the app tries to connect every instrument in the background, one at
+a time: voltage board, Arduino meter, HP 8152A, JDSU output switch and Newport
+9016, with their saved settings, and it checks that the OSA answers on its host
+and port (skipped when **Simulate** is ticked). The voltage board connects as
+its **Connect** button does: it sends the saved voltages, then the calibrated
+state of each MZI. A device that is missing or does not answer is skipped; the
+**Devices** list at the top of Hardware shows why in red, and one warning lists
+every device that did not connect. Fix it on its page and press **Connect all**
+to retry the ones still missing.
 
 The **HP 8152A meter** hardware page streams triggered GPIB readings into a
 rolling plot and recent-samples table. Set the resource, channel, wavelength,
@@ -76,6 +84,12 @@ settings. Invalid or out-of-range readings appear as such in the table and as
 gaps in the plot. The meter settings are shared with Thermal crosstalk, and the
 stream must stop before a crosstalk meter test or scan can start. The GPIB read
 cadence does not change the meter's 2/8 Hz optical low-pass filter.
+For remote range diagnosis, turn the lasers off in Newport controls and press
+**Test -60 dBm range** on the HP page. The app tries each 10 dB step toward
+-60 dBm with separate GPIB writes and reports the optical head ID, selected
+channel, autorange state, range readback, and HP error response for each step,
+then restores the prior meter settings. The test can reuse the connected HP
+session or open one temporarily.
 
 Every tab and dialog stretches to fill its window and scrolls when the window
 is smaller than its content. Vertical and horizontal scrollbars appear only
@@ -87,7 +101,7 @@ below its scrolling table. Plots rescale with the window down to about
 
 ## Newport 9016 laser modules
 
-The **Newport lasers** tab connects to the 9016 at `GPIB0::19::INSTR` by
+The **Newport lasers** page of Hardware connects to the 9016 at `GPIB0::19::INSTR` by
 default. It reads the installed modules and shows separate **Laser current**
 and **TEC temperature** output states and setpoints for each of the 16 slots.
 Enter a laser current in mA or TEC temperature in °C and press its **Set**
@@ -157,7 +171,7 @@ keeps the plan in `benes_wdm_plan_config.json`; **Saved wavelength plans** store
 named plans to load later.
 
 **Evaluate Configuration** routes the JDSU to all six outputs, waits the saved
-**Settling delay**, reads the OSA (Hardware & OSA settings; **Simulate** gives a synthetic
+**Settling delay**, reads the OSA (Hardware settings; **Simulate** gives a synthetic
 comb) and measures every assigned comb line within **Line window ±** of its
 wavelength. The delay should cover the switch settling and at least one complete
 OSA sweep, so a trace holds no light from the previous output; the JDSU's own
@@ -249,44 +263,7 @@ its two-byte A0/A1 format is not accepted by the new raw optical decoder.
 **Stream: dual** remains available for an older *six-byte framed* A0/A1 sketch,
 and **Stream: legacy** for one-byte A0 firmware.
 
-## Impulse test
-
-The **Impulse test** tab can capture the same optical-only raw stream. The
-second plot line shows the voltage commanded by the PC, not a measured
-electrical waveform. The jump flags are retained in CSV and are not removed
-from impulse traces, since real optical pulse edges can set the bit. The older
-dual A0/A1 sketch can still capture a measured electrical trace when selected
-as **Stream: dual**; only that mode needs the A1 voltage confirmation and free
-voltage-board pin 8.
-
-Set low and high voltages, then either play a square wave with **Period** and
-**High time**, or take a **Single pulse** with pulse and total measurement
-durations. **Lead-in** records the baseline before the first high level. Click
-**Stop** to end a square wave; the selected MZI returns to the low voltage.
-Impulse voltages remain limited to 0–5 V.
-Time fields accept scientific notation in seconds: `1e-3` is 1 ms, `5e-2` is
-50 ms, and `2e0` is 2 s. The display-average field uses milliseconds.
-Fields start blank. Timing has no limits beyond being positive (and high time
-shorter than the period). Edges are scheduled on absolute PC deadlines with a
-spin-wait for the last 20 ms, so millisecond pulses and square waves work.
-Pulses shorter than the board's command latency can stretch, and Windows/Python
-scheduling can add jitter. Without A1, commanded times are host estimates.
-The live plot shows the latest 10 seconds while
-recording. It retains brief peaks when reducing points for display and shows
-the full recording after Stop. Time ticks use seconds, ms, or µs as appropriate,
-with contrasting labels. Use the plot toolbar to zoom into an edge or pan;
-incoming data preserves the selected view. Optical display averaging is blank
-or 0 for raw; enter a larger value to reduce displayed noise. CSV exports always
-retain raw A0 samples and jump flags, independent of display averaging.
-Both **Single pulse** and **Play square wave** use the same continuous stream.
-**Export trace CSV** saves optical samples and commanded voltages. The sketch
-has no sample clock, so the frame period is measured as host recording time
-divided by frames received. After a run, every sample is placed at frame index
-× that final period; USB delivery times do not determine the
-spacing. Alignment to PC command times is approximate because the stream
-contains no timestamps, and samples lost at a resync shift later times
-slightly. A stalled stream raises an error in the reader. The trace limit is
-2,000,000 optical samples.
+## Mapping scan and heater current limits
 
 To calibrate a switch from measured power, connect both the voltage board and
 Arduino power meter, then open **MZI / pin mapping / calibration** and click
@@ -318,12 +295,12 @@ limit and red when one reaches the break limit. The power-scan window also
 shows the limits.
 
 The limits are enforced on every voltage sent to the board: manual entry,
-switch toggles and routes, scans, path calibration, impulse tests, and the
+switch toggles and routes, scans, path calibration, and the
 saved voltages sent on connect. Sign is ignored, since current flows either
 way. A voltage at or above the break limit is always refused, with no
 override. A voltage above the safe limit asks for confirmation first; each
 approval covers that switch and voltage until the mapping is saved or the
-application restarts. Scans, path calibration and impulse tests check their
+application restarts. Scans and path calibration check their
 whole voltage list before starting: one break-limit voltage stops the run, and
 all over-safe voltages are approved in a single prompt. Switches without a
 J peak/V value only have the 0–5 V confirmation.
@@ -336,9 +313,13 @@ used for each scanned switch. Runs saved before R total was recorded plot as
 V²/R. The voltage board has no readback, so power is computed from the
 commanded voltage, not measured.
 
-The **Thermal crosstalk** tab can scan several switches in sequence. Select switches
-with Ctrl or Shift, choose **HP 8152A** or **OSA**, enter the lower and upper
-voltage limits, step, and settling time, then start the scan. The HP power meter
+The **Thermal crosstalk** tab can scan several switches in sequence along the
+input and output selected in Routing. It reads them with the detection chosen in
+the MZI calibration tab, as the κ matrix does: the OSA, or the **HP 8152A**,
+**Arduino** or **Arduino + HP BNC** power meter with only the selected input's
+laser lit and the JDSU routed to the selected output. Select switches with Ctrl
+or Shift, enter the lower and upper voltage limits, step, and settling time,
+then start the scan. The HP power meter
 defaults to `GPIB0::23::INSTR`, channel A, 1550 nm and autoranging. Select a
 fixed dBm range if the meter's automatic range changes are unsuitable. **Test
 reading and GPIB read rate** measures 12 triggered readings and reports the
@@ -384,9 +365,9 @@ predates them. **Export CSV with comment** re-exports the loaded dataset.
 Every MZI is calibrated with a *probe*: one lit input, one read output, and
 fixed states for the other MZIs, chosen so that the probed input's light
 reaches that output in only one of the MZI's states (bright) and leaves
-elsewhere in the other (dark). The other MZIs are cross at 0 V while
-uncalibrated. Once an MZI is calibrated, the plan may hold it at its bar
-voltage so that the detector can see more MZIs.
+elsewhere in the other (dark). All other MZIs remain at 0 V (the default cross
+state), unless the probe explicitly needs an already calibrated MZI at bar to
+reach the detector. Saved cross voltages are not applied as background biases.
 
 Choose the detection method under **Detection** in the MZI calibration tab:
 
@@ -396,15 +377,64 @@ Choose the detection method under **Detection** in the MZI calibration tab:
   reference. Every output is reachable through the JDSU.
 - **Power meter · one laser at a time**: the Newport 9016 lights one input at a
   time, so the meter reading comes only from the probed input. This is much
-  faster than the OSA. Choose **HP 8152A** (settings in Thermal crosstalk) or
-  **Arduino** (settings in Hardware & OSA). Choose where the meter is connected:
+  faster than the OSA. Choose **HP 8152A** (GPIB optical readings), **Arduino**
+  (Arduino optical readings), or **Arduino + HP BNC** (Arduino readings with
+  GPIB range control). HP settings are in Thermal crosstalk; Arduino settings
+  are in Hardware. The **HP 8152A meter** hardware page has **Connect**
+  and **Disconnect** controls; a connected meter is shared with HP streams,
+  tests, crosstalk scans, and MZI calibration. Choose where the meter is connected:
   **JDSU common (any output)**, or a fixed **Output n**. Each input has its own
   Newport slot. The bays are reversed by default (slot 1 feeds input 6, slot 6
-  feeds input 1). **Laser settle** is the wait after a laser turns on. The
-  previous laser is always switched off before the next one turns on. All
+  feeds input 1). **Laser settle** is the wait after confirming the active laser
+  for each MZI, including consecutive MZIs using the same input. When a
+  background MZI changes voltage between probes, calibration also waits at
+  least the longer of the laser and JDSU settling times before the next sweep.
+  The previous laser is always switched off before the next one turns on. All
   mapped TECs must be on. When the run ends, the lasers return to the on/off
   states they had before it started. The slot map and the settle time are
   stored in `benes_laser_bank_config.json`.
+
+For **Arduino + HP BNC**, connect the raw Arduino optical stream and the HP
+8152A GPIB interface. The reference is taken automatically after the devices
+connect at launch, and again whenever you click **Set BNC dBm reference** in
+Routing. With the Newport controller connected, only the chosen input is lit
+(input 1 by default); with the JDSU connected, it is routed to the chosen output
+(output 5 by default). Both choices sit beside the button and are kept in
+`benes_bnc_reference_config.json`. The routine waits until the HP reads a steady
+level above −55 dBm (up to 30 s), fixes the HP range so the BNC is between 7
+and 75 counts, then pairs two Arduino samples with one HP GPIB power reading.
+Afterwards the lasers and the HP settings return to how they were; the JDSU
+stays on the reference output. The chip route is not changed, so the present
+switch states must carry light from that input to that output. The reference
+lasts until either device disconnects. The HP is set to a fixed range, beginning
+with the range chosen in Thermal crosstalk (or the currently reported range if
+set to Auto). Each MZI gets one forward Arduino voltage sweep. At any point
+below the low ADC limit (default 7) or at/above the high limit (default 75),
+the heater is held while GPIB changes the HP fixed range by 10 dB. After a
+0.3 s settle, Arduino A0 measures the same voltage again. The scan advances
+only when that point is inside the ADC window or the optical head cannot accept
+another range. The HP BNC output clips near 86 counts, so the high limit must
+stay below 86; otherwise a saturated plateau never triggers a range change. A
+point still above the window is clipped and excluded from the fit. A point
+still below it on the lowest range the head accepts is kept but flagged
+`low` (or dropped below 1 count, which is noise around zero); at least two
+points inside the window are required. Every accepted point comes from Arduino A0 and is
+converted to mW with the BNC reference, then plotted in dBm.
+`mzi_hp_bnc_points.csv` records the first and final ADC readings, their HP
+ranges, and the number of range steps at each voltage; the calibration JSON
+also notes any range the HP refused.
+Individual ADC samples are integers, but their average over the configured
+sample duration can be decimal. The previous HP settings are restored at the end.
+Zero ADC readings appear below the plotted dBm floor. Saved CSV files retain
+linear mW, dBm, raw ADC, and range information.
+
+The HP 8152A **XDCR OUT** BNC is linear within one range; adjacent 10 dB
+ranges differ by a factor of ten in analog scale. **Arduino + HP BNC** uses
+the known GPIB range for this conversion and ignores the Arduino jump flag,
+which a real square-wave optical signal can also set. The plain **Arduino**
+option now reads the HP range before and after each Arduino sample and retries
+if it changes; it also requires the BNC dBm reference. Use **Arduino + HP BNC**
+for adaptive fixed-range Arduino sampling within a single voltage sweep.
 
 The **Calibrate** box and the **Probe** column of the MZIs table update whenever
 these settings change. They show which MZIs are visible and how each one is
@@ -417,10 +447,32 @@ the read output.
 
 **Sweep selected MZI** sweeps one MZI; **Save the voltages found** stores the
 result. **Calibrate all visible MZIs** works in rounds. Each round sweeps every
-MZI that is visible with the MZIs calibrated so far. Probes are grouped by
-input and output, so lasers and the JDSU change as little as possible.
+MZI that is visible with the MZIs calibrated so far. Each MZI gets the same
+input/output choice it would receive in a single-MZI calibration. Probes are
+grouped by laser input, with output-side MZIs first; the JDSU moves to the
+output each MZI needs and confirms that channel before every sweep, even when
+the previous probe used the same output.
 With the OSA method, **Then check all-cross and all-bar** finishes with both
 calibrated state checks.
+
+For a power-meter check after saving all cross and bar voltages, select
+**Power meter** on **JDSU common** in Detection and click **Check all routes with
+power meter**. The check lights one Newport input at a time, applies one saved
+cross/bar path to each of the six target outputs, leaves unused MZIs at 0 V,
+and reads all six outputs. It covers 36 paths and 216 output readings. Before
+the check, the JDSU times two six-output sweeps and records the measured channel
+change times. For each reading, it waits for the JDSU settled status and channel
+readback, then reads the power meter without the additional **Extra settle** pause.
+The at-least-five-second laser wait when the input changes and the **Settle [ms]** thermal
+wait after each electrical path change still apply. **Selector setup… → Time JDSU
+output sweep** runs the same timing test on demand. This times command completion;
+it does not establish the optical power settling time. The **Power routes**
+tab shows each output's dBm value, the target's margin over the strongest
+other output, and failed paths. Selecting a failed row highlights switches
+whose single reversed state could explain the observed output; when no such
+switch matches, the whole path is highlighted for inspection. The lasers return to
+their previous states and all MZIs return to 0 V. Results are saved as
+`power_route_check.json` and `power_route_check.csv` in a calibration folder.
 
 Each sweep is fitted with T = offset + A·(1 + cos(π·x/x_π + φ₀))/2. Here x is
 the heater power (V² when the heater resistance is unknown). Power changes
@@ -457,7 +509,7 @@ crosstalk between neighbouring heaters.
 
 **Crosstalk matrix (automatic)** in the Thermal crosstalk tab uses the detection
 method chosen in the MZI calibration tab. It also uses the voltage limits, step
-and settle time of the manual scan above it. Select aggressors and victims, then
+and settle time under **Sweep**, shared with the single-switch scan. Select aggressors and victims, then
 press **Plan** to see which pairs can be measured. A pair cannot be measured when
 every probe of the victim passes through the aggressor, because the aggressor
 would then switch the light itself. For each victim the app:
@@ -467,15 +519,20 @@ would then switch the light itself. For each victim the app:
 2. sweeps the victim, fits its cos² response, and biases it at the swept point
    nearest quadrature;
 3. sweeps each aggressor. **Path reference sweep** (on by default) first repeats
-   that aggressor sweep with the victim at its bright extreme, where the victim
-   is insensitive to phase. Dividing by this reference removes the aggressor's
-   heating of the other MZIs on the path, and doubles the aggressor sweeps.
+   that aggressor sweep with the victim at its bright extreme. Both sweeps share
+   the path factor from the aggressor heating the other MZIs on the path. The
+   victim's fit gives its own response at both biases, so the path factor
+   cancels even when the bright point is not exactly at the maximum. This
+   doubles the aggressor sweeps.
 
 The fit turns the victim's power into a phase shift. κ is the slope of that
 phase shift against aggressor heater power, divided by the victim's own phase
 per heater power. It is the share of the aggressor's heater power that the
-victim effectively feels. The tab shows a live κ heatmap and one tab per victim
-with its fit, bias and phase-shift curves. Results go to
+victim effectively feels. A victim that changes the reading by less than 3 dB,
+or cannot be fitted, is skipped and its pairs are marked `!`. The **κ matrix**
+tab shows the live heatmap, which also marks pairs that were not measured and
+why. The **Victims** tab shows each victim's sweeps, fit, bias and phase-shift
+curves. Results go to
 `Results/Crosstalk_matrix/<time>_matrix/`: `crosstalk_matrix.json`,
 `crosstalk_matrix.csv` (κ, aggressor rows × victim columns),
 `crosstalk_sweeps.csv`, the heatmap, and one plot per victim. κ is reported
@@ -484,14 +541,16 @@ drives are in the same unit.
 
 ### Route explorer
 
-- Click an **input** to highlight its actual path and current output.
+- Click an **input** to highlight its actual path and current output. The selected channel is drawn bold in its comb-line colour while the other comb lines fade.
+- With the Newport controller connected, clicking an input also toggles the laser of the slot feeding it and selects or clears the input to match; a red **LASER ON** ring marks lit inputs. A laser whose TEC is off is not turned on. With the JDSU connected, clicking an output also routes the JDSU to it.
 - Thin dashed lines in the input's colour show where possible crosstalk leaves the unused port of each switch and travels through downstream switches. These paths are illustrative; their optical power is not measured by the diagram.
 - Click an **output**, or choose an output above the diagram, to enumerate every physical path between the selected ports.
+- With the Arduino and HP meters connected, set a BNC dBm reference at a steady optical level. The top of the Routing tab then refreshes optical power in dBm alongside the A0 ADC mean and current HP range. A reading is retried if the HP range changes during its sample window. The actual refresh rate depends on the HP GPIB range-query time.
 - The route list gives the required switch states: **=** means straight; **X** means cross. Switches absent from a route may have either state.
 - Select a path to highlight it in green. The overlay checkbox shows all alternatives with dashed lines. Click **Apply path (drive bar/cross)** to send that path's required MZIs to their calibrated bar or cross voltages.
-- Use **Keep complete output permutation** to choose how an alternative path is applied: off changes only MZIs on that path; on finds the compatible full configuration with the fewest state changes while preserving every current input→output connection. The latter reports an error when no such configuration exists.
+- Use **Keep complete output permutation** to choose how an alternative path is applied: off drives its MZIs and sets every other MZI to 0 V; on finds the compatible full configuration with the fewest state changes while preserving every current input→output connection. The latter reports an error when no such configuration exists.
 - After routing a complete permutation, **Equivalent full-network routings** lists every switch configuration that realizes it. Select one to preview all six color-coded routes without changing the hardware.
-- Use the **X**, **=**, and **0** controls beside any switch to set cross, bar, or 0 V directly. Clicking a switch still cycles it: cross (`X`) → straight (`=`) → 0 V (`0V`) → cross. Cross and bar send the calibrated voltages; 0 V sends 0 V and is drawn with an amber outline and dashed lines. It routes as cross, the chip's unbiased state. Typing a voltage, applying a path or calibration, reset, and randomize clear the 0 V mark; path calibration ends with every switch marked 0 V. Reset and randomize controls update the complete circuit.
+- Use the **X**, **=**, and **0** controls beside any switch to set cross, bar, or 0 V directly. Clicking a switch still cycles it: cross (`X`) → straight (`=`) → 0 V (`0V`) → cross. Cross and bar send the calibrated voltages; 0 V sends 0 V and is drawn with an amber outline and dashed lines. It routes as cross, the chip's assumed unbiased state. Applying a path marks unused MZIs at 0 V. A path's uncalibrated cross also uses 0 V; an uncalibrated bar requires calibration. Reset and randomize controls update the complete circuit.
 - Enter six desired output numbers (one for each input, using every output once) and click **Route permutation** to configure simultaneous connections. **Shuffle** generates and routes a random permutation.
 
 The diagram is a generalized six-port Beneš network with five stages and twelve 2×2 switches. Each of the two three-port subnetworks uses three switches on local row pairs (2,3), (1,2), (2,3). The straight bypass is at the top in the first and last subnetwork stages, and at the bottom in the middle stage. Wires between these three stages are straight. The outer stages split into and recombine the two subnetworks. A conventional binary Beneš network has a power-of-two port count; this generalized layout supports all 720 six-port permutations without adding unused external ports.

@@ -1,7 +1,8 @@
 import unittest
 
 from benes.core.network import BenesNetwork
-from benes.measurements.mzi_probing import plan_calibration, plan_crosstalk, probe_candidates, stage_distance
+from benes.measurements.mzi_probing import (CrosstalkProbe, Probe, leak_order, plan_calibration, plan_crosstalk,
+                                            probe_candidates, stage_distance)
 
 
 class ProbeTests(unittest.TestCase):
@@ -37,10 +38,22 @@ class CalibrationPlanTests(unittest.TestCase):
         self.assertEqual(sorted(probe.name for probe in plan.steps), sorted(self.network.switches))
         self.assertEqual(plan.unreachable, {})
         self.assertTrue(all(not probe.biased for probe in plan.steps))
-        # Grouped by laser and output, so neither moves back to an earlier one.
-        pairs = [(probe.input, probe.output) for probe in plan.steps]
-        changes = [pair for index, pair in enumerate(pairs) if index == 0 or pairs[index - 1] != pair]
-        self.assertEqual(len(changes), len(set(changes)))
+        # Keep one laser on for its input group while using each MZI's own output.
+        inputs = [probe.input for probe in plan.steps]
+        self.assertEqual(inputs, sorted(inputs))
+
+    def test_complete_uses_the_same_s4_2_probe_as_single_calibration(self):
+        for known in ((), tuple(self.network.switches)):
+            with self.subTest(known=bool(known)):
+                complete = plan_calibration(self.network, known=known)
+                single = plan_calibration(self.network, ["S4.2"], known=known)
+                probe = complete.probe_for("S4.2")
+                self.assertEqual((probe.input, probe.output, probe.bright_crossed),
+                                 (single.steps[0].input, single.steps[0].output,
+                                  single.steps[0].bright_crossed))
+                self.assertEqual((probe.input, probe.output), (0, 2))
+        self.assertEqual([(probe.name, probe.output) for probe in plan_calibration(self.network).steps[:2]],
+                         [("S5.3", 4), ("S4.2", 2)])
 
     def test_a_fixed_detector_bootstraps_through_calibrated_bars(self):
         plan = plan_calibration(self.network, outputs=[2])
@@ -65,7 +78,8 @@ class CrosstalkPlanTests(unittest.TestCase):
         self.network = BenesNetwork()
 
     def test_aggressors_are_never_on_the_lit_path(self):
-        plan = plan_crosstalk(self.network, list(self.network.switches), known=self.network.switches)
+        plan = plan_crosstalk(self.network, list(self.network.switches), known=self.network.switches,
+                              min_leak_order=1)
         self.assertEqual(plan.uncovered, {})
         self.assertEqual(plan.pair_count, 12 * 11)
         measured = set()
@@ -75,9 +89,42 @@ class CrosstalkPlanTests(unittest.TestCase):
             measured |= {(aggressor, group.probe.name) for aggressor in group.aggressors}
         self.assertEqual(len(measured), 12 * 11)
 
+    def test_leak_order_counts_the_held_mzis_light_must_leak_through(self):
+        background = {name: True for name in self.network.switches if name != "S5.3"}
+        probe = Probe("S5.3", 5, 5, True, tuple({**background, "S3.1": False}.items()), 0)
+        # The stage-5 neighbours never carry light that reaches this output.
+        self.assertIsNone(leak_order(self.network, probe, "S5.1"))
+        self.assertEqual(leak_order(self.network, probe, "S3.2"), 1)
+        self.assertEqual(leak_order(self.network, probe, "S4.2"), 2)
+        for name in probe.bright_path(self.network):
+            if name != "S5.3":
+                self.assertEqual(leak_order(self.network, probe, name), 0)
+
+    def test_each_aggressor_gets_the_best_isolated_probe(self):
+        names = list(self.network.switches)
+        plan = plan_crosstalk(self.network, ["S5.3"], ["S3.2", "S4.2", "S5.1", "S5.2"], known=names)
+        self.assertEqual(plan.uncovered, {})
+        orders = {aggressor: group.leak_order(aggressor) for group in plan.groups for aggressor in group.aggressors}
+        # S3.2 reaches three leaks only with S4.1 and S4.2 at bar; S4.2 at most two.
+        self.assertEqual(orders, {"S3.2": 3, "S4.2": 2, "S5.1": None, "S5.2": None})
+        for group in plan.groups:
+            for aggressor in group.aggressors:
+                self.assertEqual(group.leak_order(aggressor), leak_order(self.network, group.probe, aggressor))
+
+    def test_pairs_one_leak_from_every_probe_are_not_measurable(self):
+        names = list(self.network.switches)
+        plan = plan_crosstalk(self.network, names, known=names)
+        self.assertEqual(set(plan.uncovered),
+                         {("S3.1", "S2.1"), ("S3.1", "S4.1"), ("S3.2", "S2.2"), ("S3.2", "S4.2")})
+        self.assertIn("after 1 leak(s); 2 needed", plan.uncovered["S3.2", "S4.2"])
+        self.assertEqual(plan.pair_count, 12 * 11 - 4)
+        for group in plan.groups:
+            self.assertTrue(all(order is None or order >= 2 for order in group.leak_orders))
+        self.assertIsNone(CrosstalkProbe(plan.groups[0].probe, ("S1.1",)).leak_order("S1.1"))
+
     def test_adjacent_stages_only_leaves_distant_pairs_out(self):
         names = list(self.network.switches)
-        plan = plan_crosstalk(self.network, names, known=names, max_stage_distance=1)
+        plan = plan_crosstalk(self.network, names, known=names, max_stage_distance=1, min_leak_order=1)
         self.assertEqual(plan.uncovered, {})
         # Same stage: 3·2 + 2·1 + 2·1 + 2·1 + 3·2; next stage: 2·(3·2 + 2·2 + 2·2 + 2·3).
         self.assertEqual(plan.pair_count, 18 + 40)

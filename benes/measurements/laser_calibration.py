@@ -157,8 +157,9 @@ def _wait(seconds, stop_event, sleep) -> None:
 
 
 def _select(switch, output) -> None:
-    if switch.routed_output != output + 1:
-        switch.select_output(output + 1)
+    # A cached output number cannot establish where the physical JDSU is now.
+    # The selector confirms its channel readback after every command.
+    switch.select_output(output + 1)
 
 
 def _read(read_spectrum, output) -> tuple[list, list]:

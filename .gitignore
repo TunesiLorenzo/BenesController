@@ -21,6 +21,8 @@ Thumbs.db
 # Local runtime settings and logs
 /benes_power_meter_config.json
 /benes_voltage_config.json
+/benes_dataset_config.json
+/benes_bnc_reference_config.json
 *.log
 
 

@@ -285,9 +285,11 @@ class NewportLaserController:
 class NewportPanel(ttk.Frame):
     """A view that can be rebuilt inside the notebook or a separate window."""
 
-    def __init__(self, parent, controller, detach=None, attach=None):
+    def __init__(self, parent, controller, detach=None, attach=None, on_change=None):
         super().__init__(parent, padding=16)
         self.controller = controller
+        # Called after every finished operation, so other views can show the new output states.
+        self.on_change = on_change
         self.detach = detach
         self.attach = attach
         self.resource_var = tk.StringVar(value=controller.resource)
@@ -419,6 +421,8 @@ class NewportPanel(ttk.Frame):
             def finish():
                 self.busy = False
                 self.render()
+                if self.on_change is not None:
+                    self.on_change()
                 if error is not None:
                     self.status_var.set(str(error))
                     messagebox.showerror("Newport 9016", str(error), parent=self.winfo_toplevel())
@@ -431,6 +435,12 @@ class NewportPanel(ttk.Frame):
                 pass
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def refresh_view(self, status):
+        """Show the controller's state after it was changed from outside this panel."""
+        self._show_setpoints()
+        self.status_var.set(status)
+        self.render()
 
     def connect_controller(self):
         resource = self.resource_var.get().strip()

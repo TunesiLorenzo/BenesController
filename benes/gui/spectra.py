@@ -23,7 +23,7 @@ class SpectraMixin:
         except ValueError as error:
             raise ValueError("Enter an OSA port from 1 to 65535") from error
         if not simulate and (not host or not 1 <= port <= 65535):
-            raise ValueError("Enter a valid OSA host and port in Hardware & OSA")
+            raise ValueError("Enter a valid OSA host and port in Hardware")
         return host, port, simulate
 
     def set_osa_reading(self, reading: bool):

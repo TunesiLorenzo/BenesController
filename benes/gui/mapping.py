@@ -4,12 +4,15 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from types import SimpleNamespace
 
 from benes.core.heater_setup import (BREAK_CURRENT_DENSITY, SAFE_CURRENT_DENSITY, load_heater_csv,
                                      voltage_limit)
 from benes.gui.theme import BG, TEXT, ZERO_VOLT_COLOR
 from benes.gui.widgets import ScrollableFrame, fit_to_screen
+from benes.hardware.power_meter import RANGE_TRACKING_OFF
 from benes.measurements.calibration_scan import scan_switch, scan_voltages
+from benes.measurements.mzi_characterization import mw_to_dbm
 from benes.paths import app_dir
 
 
@@ -302,6 +305,11 @@ class MappingMixin:
             if not self.controller.connected or self.controller.settings["dry_run"] or not self.power_meter.connected:
                 messagebox.showerror("Hardware not connected", "Connect the physical voltage board and Arduino power meter before scanning.", parent=window)
                 return
+            if self.bnc_reference is None or self.hp_meter_session is None or self.hp_meter_busy:
+                messagebox.showerror("dBm reference unavailable",
+                                     "Connect the HP meter and set the BNC dBm reference in Routing first.",
+                                     parent=window)
+                return
             try:
                 self.confirm_voltage_sweep(voltages, parent=window, names=[name])
             except ValueError as error:
@@ -309,6 +317,8 @@ class MappingMixin:
                 return
             self.scan_settings[name] = {key: value.get() for key, value in fields.items()}
             running["value"] = True
+            self.hp_meter_busy = "mapping_scan"
+            self.refresh_hp_connection_buttons()
             self.begin_activity("mapping_scan", f"Scanning {name} voltage response...", len(voltages) + 1)
             progress_bar.configure(maximum=len(voltages) + 1, value=0)
             result.update(maximum=None, minimum=None)
@@ -320,14 +330,33 @@ class MappingMixin:
             progress.set(f"Scanning {len(voltages)} voltages...")
 
             def on_point(index, total, point):
-                self.after(0, lambda: progress.set(f"{index}/{total}: {point.voltage:.2f} V, {point.power:.4g} {self.power_meter.settings['unit']}"))
+                dbm = mw_to_dbm(point.power)
+                text = "below ADC floor" if dbm is None else f"{dbm:.2f} dBm"
+                self.after(0, lambda: progress.set(f"{index}/{total}: {point.voltage:.2f} V, {text}"))
                 self.after(0, lambda i=index: progress_bar.configure(value=i))
                 self.after(0, lambda i=index, t=total, v=point.voltage: self.update_activity(
                     "mapping_scan", i, detail=f"{name}: voltage {i}/{t} ({v:.2f} V)"))
 
             def worker():
                 try:
-                    points = scan_switch(self.controller, self.power_meter, name, voltages, settle_ms / 1000, on_point)
+                    hp = self.hp_meter_session
+                    reference = self.bnc_reference
+
+                    def read_mw():
+                        for _ in range(3):
+                            before = hp.read_range_dbm(reference.channel)
+                            reading = self.power_meter.read_current_power(
+                                ceiling_override=self.power_meter.full_scale + 1,
+                                range_tracking_mode=RANGE_TRACKING_OFF, ignore_jumps=True)
+                            if before == hp.read_range_dbm(reference.channel):
+                                if reading.raw_mean >= self.power_meter.ceiling:
+                                    raise ValueError("Arduino BNC reading is above its configured ceiling")
+                                return SimpleNamespace(value=reference.mw(reading.raw_mean, before))
+                        raise RuntimeError("HP range changed during every Arduino sample")
+
+                    optical_meter = SimpleNamespace(connected=True, read_current_power=read_mw)
+                    points = scan_switch(self.controller, optical_meter, name, voltages,
+                                         settle_ms / 1000, on_point)
                 except Exception as error:
                     self.after(0, lambda message=str(error): finish_error(message))
                 else:
@@ -337,6 +366,8 @@ class MappingMixin:
 
         def finish_error(message):
             running["value"] = False
+            self.hp_meter_busy = None
+            self.refresh_hp_connection_buttons()
             progress_bar.configure(value=0)
             self.finish_activity("mapping_scan", f"{name} voltage scan failed")
             scan_button.configure(state="normal")
@@ -344,14 +375,20 @@ class MappingMixin:
 
         def finish_scan(points):
             running["value"] = False
+            self.hp_meter_busy = None
+            self.refresh_hp_connection_buttons()
             progress_bar.configure(value=len(points) + 1)
             self.finish_activity("mapping_scan", f"{name} voltage scan complete")
             scan_button.configure(state="normal")
             save_button.configure(state="normal")
             result["maximum"] = max(points, key=lambda point: point.power)
             result["minimum"] = min(points, key=lambda point: point.power)
-            unit = self.power_meter.settings["unit"]
-            extrema.set(f"Maximum: {result['maximum'].power:.4g} {unit} at {result['maximum'].voltage:.2f} V\nMinimum: {result['minimum'].power:.4g} {unit} at {result['minimum'].voltage:.2f} V")
+            def label(point):
+                dbm = mw_to_dbm(point.power)
+                return "below ADC floor" if dbm is None else f"{dbm:.2f} dBm"
+
+            extrema.set(f"Maximum: {label(result['maximum'])} at {result['maximum'].voltage:.2f} V\n"
+                        f"Minimum: {label(result['minimum'])} at {result['minimum'].voltage:.2f} V")
             progress.set(f"Scan complete: {len(points)} points. Choose the state for each extreme.")
 
         scan_button = ttk.Button(frame, text="Start scan", command=start_scan)

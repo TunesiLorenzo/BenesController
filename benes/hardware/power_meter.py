@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import importlib.util
 import json
 import math
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -32,8 +33,9 @@ RANGE_TRACKING_LABELS = {
     RANGE_TRACKING_UP_FALLS: "Higher range: A0 falls",
     RANGE_TRACKING_UP_RISES: "Higher range: A0 rises",
 }
-# The analogue signal should move by one decade when the meter steps range.
-# Keep this deliberately tighter than the Arduino's general-purpose jump flag.
+# The 8152A XDCR OUT BNC is linear within a range, and adjacent ranges are
+# 10 dB apart. The Arduino's jump flag is only a sudden-ADC-change heuristic,
+# so a near-decade change in stable BNC levels is needed as well.
 RANGE_STEP_TOLERANCE_DECADES = 0.20
 
 
@@ -73,6 +75,11 @@ class ArduinoPowerMeter:
         # state carries later decade changes relative to that starting range.
         self._range_steps = 0
         self._range_previous_optical = None
+        self._range_pending_optical = None
+        self._range_guard_remaining = 0
+        self._calibration_capture = False
+        # Routing's live read and measurement workers share one serial stream.
+        self._read_lock = threading.RLock()
 
     def _defaults(self) -> dict:
         return {
@@ -175,8 +182,15 @@ class ArduinoPowerMeter:
         self._raw_running = False
         self._range_steps = 0
         self._range_previous_optical = None
+        self._range_pending_optical = None
+        self._range_guard_remaining = 0
+        self._calibration_capture = False
 
     def disconnect(self) -> None:
+        with self._read_lock:
+            self._disconnect_unlocked()
+
+    def _disconnect_unlocked(self) -> None:
         if self.serial is not None:
             try:
                 if self._raw_running:
@@ -184,24 +198,67 @@ class ArduinoPowerMeter:
             finally:
                 self.sampler.close_arduino(self.serial)
                 self.serial = None
+                self._calibration_capture = False
 
-    def read_current_power(self) -> PowerReading:
+    def begin_calibration_curve(self) -> None:
+        """Retain range flags during voltage settling for one MZI sweep."""
+        with self._read_lock:
+            if self.settings["stream_format"] != "raw":
+                return
+            self._range_steps = 0
+            self._range_previous_optical = None
+            self._range_pending_optical = None
+            self._range_guard_remaining = 0
+            self.start_stream()
+            self._calibration_capture = True
+
+    def end_calibration_curve(self) -> None:
+        with self._read_lock:
+            if self._calibration_capture:
+                self.stop_stream()
+                self._calibration_capture = False
+
+    def read_current_power(self, ceiling_override: float | None = None,
+                           range_tracking_mode: str | None = None,
+                           ignore_jumps: bool = False) -> PowerReading:
+        with self._read_lock:
+            return self._read_current_power_unlocked(ceiling_override, range_tracking_mode, ignore_jumps)
+
+    def _read_current_power_unlocked(self, ceiling_override: float | None = None,
+                                     range_tracking_mode: str | None = None,
+                                     ignore_jumps: bool = False) -> PowerReading:
         if self.serial is None:
             raise RuntimeError("Connect the Arduino power meter first")
+        ceiling = self.ceiling if ceiling_override is None else float(ceiling_override)
+        if not math.isfinite(ceiling) or ceiling <= 0:
+            raise ValueError("Arduino sample ceiling must be positive and finite")
         if self.settings["stream_format"] in ("dual", "raw"):
             try:
-                samples, timing = self.read_timed_samples(self.settings["duration"])
+                samples, timing = self.read_timed_samples(
+                    self.settings["duration"], reset_buffer=not self._calibration_capture)
             finally:
-                if self.settings["stream_format"] == "raw":
+                if self.settings["stream_format"] == "raw" and not self._calibration_capture:
                     self.stop_stream()
             if self.settings["stream_format"] == "raw":
                 period = timing.get("sample_period_s")
                 guard_samples = (math.ceil(self.settings["jump_guard_ms"] / 1000 / period)
                                  if period and period > 0 else 0)
                 raw_count = len(samples)
+                history_rejected = history_jumps = history_changes = 0
+                if self._calibration_capture and period and period > 0:
+                    recent_count = max(1, math.ceil(self.settings["duration"] / period))
+                    history, samples = samples[:-recent_count], samples[-recent_count:]
+                    _, _, history_rejected, history_jumps, history_changes = self._process_raw_samples(
+                        history, guard_samples, ceiling, mode=range_tracking_mode,
+                        ignore_jumps=ignore_jumps)
+                measurement_raw_count = len(samples)
                 samples, corrected_samples, rejected, jumps, range_changes = self._process_raw_samples(
-                    samples, guard_samples, self.ceiling)
-                sample_rate = (raw_count / self.settings["duration"] if raw_count else None)
+                    samples, guard_samples, ceiling, mode=range_tracking_mode,
+                    ignore_jumps=ignore_jumps)
+                rejected += history_rejected
+                jumps += history_jumps
+                range_changes += history_changes
+                sample_rate = (measurement_raw_count / self.settings["duration"] if raw_count else None)
             else:
                 samples = [optical for optical, _electrical in samples]
                 corrected_samples = samples
@@ -274,58 +331,56 @@ class ArduinoPowerMeter:
             tail = b""
         return frames, bytes(tail), skipped
 
-    @staticmethod
-    def _filter_optical_jumps(frames, guard_samples: int, ceiling: float):
-        """Discard flagged jumps and their settling window from power averages."""
-        clean = []
-        remaining = 0
-        rejected = jumps = 0
-        for optical, jump in frames:
-            if jump:
-                jumps += 1
-                remaining = max(remaining, guard_samples + 1)
-            if jump or remaining > 0 or optical >= ceiling:
-                rejected += 1
-            else:
-                clean.append(optical)
-            if remaining > 0:
-                remaining -= 1
-        return clean, rejected, jumps
+    def _process_raw_samples(self, frames, guard_samples: int, ceiling: float, on_sample=None, mode=None,
+                             ignore_jumps=False):
+        """Reject transitions and put each stable sample on the starting range's scale.
 
-    def _process_raw_samples(self, frames, guard_samples: int, ceiling: float):
-        """Reject raw-stream transitions and correct configured decade range steps.
-
-        The firmware only supplies a generic jump bit. A step is accepted as a
-        range transition only when its raw ratio is close to a decade; other
-        jumps retain the original rejection-only behavior.
+        A jump-flagged sample is transitional, so compare the stable readings
+        before and after its guard window, even when it crosses captures.
+        A BNC-only reading cannot distinguish an unflagged range change from
+        a real optical change between two voltage points, so do not rescale
+        on that evidence alone.
         """
         clean = []
         corrected = []
-        remaining = rejected = jumps = range_changes = 0
+        rejected = jumps = range_changes = 0
         previous = self._range_previous_optical
-        mode = self.settings.get("range_tracking", RANGE_TRACKING_OFF)
+        pending = None if ignore_jumps else self._range_pending_optical
+        remaining = 0 if ignore_jumps else self._range_guard_remaining
+        mode = self.settings.get("range_tracking", RANGE_TRACKING_OFF) if mode is None else mode
         for optical, jump in frames:
+            change = 0
+            corrected_value = None
             if jump:
                 jumps += 1
-                change = self._range_change(previous, optical, mode)
+                if not ignore_jumps:
+                    if pending is None:
+                        pending = previous
+                    remaining = max(remaining, guard_samples + 1)
+            if remaining > 0 or optical >= ceiling:
+                rejected += 1
+            else:
+                change = self._range_change(pending, optical, mode)
                 if change:
                     self._range_steps += change
                     range_changes += 1
-                remaining = max(remaining, guard_samples + 1)
-            if jump or remaining > 0 or optical >= ceiling:
-                rejected += 1
-            else:
+                pending = None
+                previous = optical
                 clean.append(optical)
-                corrected.append(optical * 10 ** self._range_steps)
+                corrected_value = optical * 10 ** (0 if mode == RANGE_TRACKING_OFF else self._range_steps)
+                corrected.append(corrected_value)
             if remaining > 0:
                 remaining -= 1
-            previous = optical
+            if on_sample is not None:
+                on_sample(optical, corrected_value, jump, change, self._range_steps)
         self._range_previous_optical = previous
+        self._range_pending_optical = pending
+        self._range_guard_remaining = remaining
         return clean, corrected, rejected, jumps, range_changes
 
     @staticmethod
     def _range_change(previous, optical, mode: str) -> int:
-        """Return the signed range-step implied by a decade-sized raw jump."""
+        """Return one signed 10 dB range step from stable BNC samples."""
         if mode == RANGE_TRACKING_OFF or previous is None or previous <= 0 or optical <= 0:
             return 0
         decades = math.log10(optical / previous)
@@ -336,6 +391,10 @@ class ArduinoPowerMeter:
         return 1 if range_up else -1
 
     def read_timed_samples(self, duration: float, reset_buffer: bool = True):
+        with self._read_lock:
+            return self._read_timed_samples_unlocked(duration, reset_buffer)
+
+    def _read_timed_samples_unlocked(self, duration: float, reset_buffer: bool = True):
         """Return optical/status frames (raw) or optical/electrical pairs (dual)."""
         if self.serial is None:
             raise RuntimeError("Connect the Arduino power meter first")
@@ -352,11 +411,19 @@ class ArduinoPowerMeter:
         return self._decode_dual_frames(self._dual_buffer), timing
 
     def stop_stream(self) -> None:
+        with self._read_lock:
+            self._stop_stream_unlocked()
+
+    def _stop_stream_unlocked(self) -> None:
         """Stop collecting; the Arduino keeps streaming and the PC discards it."""
         self._raw_running = False
         self._raw_tail = b""
 
     def start_stream(self) -> None:
+        with self._read_lock:
+            self._start_stream_unlocked()
+
+    def _start_stream_unlocked(self) -> None:
         """Begin a capture at the newest bytes; status markers restore pairing."""
         if self.serial is None or self.settings["stream_format"] != "raw":
             raise RuntimeError("Connect the raw optical Arduino stream first")
@@ -398,12 +465,6 @@ class ArduinoPowerMeter:
             "sample_period_s": elapsed / self._raw_index if self._raw_index and elapsed > 0 else None,
             "skipped_bytes": self._raw_skipped,
         }
-
-    def calibration_input(self) -> PowerReading:
-        """Return the latest scalar reading for a future MZI calibration loop."""
-        if self.last_reading is None:
-            raise RuntimeError("Read the Arduino power meter before starting calibration")
-        return self.last_reading
 
     @staticmethod
     def _load_sampler() -> object:

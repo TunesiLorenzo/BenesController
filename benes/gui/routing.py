@@ -1,11 +1,29 @@
 """Routing tab: input/output selection, switch states, permutations and the network diagram."""
 
+import json
 import random
+import threading
+import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 from benes.gui.theme import (ACCENT, BG, COLORS, OSA_COLOR, PANEL, POWER_METER_COLOR, TEXT, WDM_COLORS, WIRE,
-                             ZERO_VOLT_COLOR)
+                             ZERO_VOLT_COLOR, blend)
+from benes.gui.calibration import METER_VIA_JDSU
+from benes.hardware.power_meter import RANGE_TRACKING_OFF
+from benes.measurements.arduino_hp_range import (DEFAULT_HIGH_ADC, DEFAULT_LOW_ADC, ArduinoHPRangeSweep,
+                                                 measure_bnc_reference)
+from benes.measurements.laser_calibration import CalibrationStopped
+from benes.measurements.mzi_characterization import mw_to_dbm
+from benes.measurements.voltage_optimizer import (OBJECTIVE_LEAK, OBJECTIVE_THROUGH, optimization_plan,
+                                                  optimize_paths)
+from benes.paths import app_dir
+
+# Ring around an input whose Newport laser is on.
+LASER_ON_COLOR = "#ff4d4d"
+# Input lit and output read for the BNC dBm reference, kept between sessions.
+BNC_REFERENCE_CONFIG = "benes_bnc_reference_config.json"
+BNC_REFERENCE_DEFAULT = {"input": 1, "output": 5}
 
 
 class RoutingMixin:
@@ -33,8 +51,33 @@ class RoutingMixin:
         self.evaluate_button = ttk.Button(controls, text="Evaluate Configuration", style="Accent.TButton",
                                           command=self.start_configuration_evaluation)
         self.evaluate_button.pack(side="left", padx=(0, 12))
+        self.optimize_button = ttk.Button(controls, text="Optimize voltages",
+                                          command=self.toggle_voltage_optimizer)
+        self.optimize_button.pack(side="left", padx=(0, 12))
+        self.route_optimizer_running = False
+        self.route_optimizer_stop = None
         ttk.Button(controls, text="Reset switches", command=self.reset).pack(side="right")
         ttk.Button(controls, text="Random switches", command=self.randomize).pack(side="right", padx=8)
+
+        self.route_arduino_var = tk.StringVar(value="Arduino: — dBm (connect Arduino and HP)")
+        arduino_readout = ttk.Frame(self.route_tab, padding=(24, 0, 24, 6))
+        arduino_readout.pack(fill="x")
+        ttk.Label(arduino_readout, textvariable=self.route_arduino_var, foreground=POWER_METER_COLOR,
+                  font=("Segoe UI", 11, "bold")).pack(side="left")
+        self.bnc_reference_button = ttk.Button(arduino_readout, text="Set BNC dBm reference",
+                                                command=self.start_bnc_reference)
+        self.bnc_reference_button.pack(side="left", padx=(14, 0))
+        pair = self.saved_bnc_reference_ports()
+        self.bnc_input_var = tk.StringVar(value=str(pair["input"]))
+        self.bnc_output_var = tk.StringVar(value=str(pair["output"]))
+        ttk.Label(arduino_readout, text="from input").pack(side="left", padx=(10, 4))
+        ttk.Combobox(arduino_readout, textvariable=self.bnc_input_var, values=tuple("123456"),
+                     state="readonly", width=3).pack(side="left")
+        ttk.Label(arduino_readout, text="at output").pack(side="left", padx=(8, 4))
+        ttk.Combobox(arduino_readout, textvariable=self.bnc_output_var, values=tuple("123456"),
+                     state="readonly", width=3).pack(side="left")
+        for variable in (self.bnc_input_var, self.bnc_output_var):
+            variable.trace_add("write", lambda *_: self.remember_bnc_reference_ports())
 
         detector_controls = ttk.Frame(self.route_tab, padding=(24, 0, 24, 8))
         detector_controls.pack(fill="x")
@@ -44,11 +87,16 @@ class RoutingMixin:
         ttk.Label(detector_controls, text="OSA output", foreground=OSA_COLOR).pack(side="left")
         ttk.Combobox(detector_controls, textvariable=self.osa_output_var,
                      values=("None", "1", "2", "3", "4", "5", "6"), state="readonly", width=6).pack(side="left", padx=(7, 18))
-        ttk.Label(detector_controls, text="Colored rings mark detector ports; the selected route output remains green.").pack(side="left")
+        ttk.Label(detector_controls, text="Colored rings mark detector ports. Once connected, clicking an input "
+                  "also toggles its Newport laser (red ring when on), and clicking an output routes the JDSU to it.",
+                  wraplength=620).pack(side="left")
         self.power_meter_output_var.trace_add("write", lambda *_: self.draw())
         self.osa_output_var.trace_add("write", lambda *_: self.draw())
         # Choosing an OSA output on either page routes the JDSU switch to it.
         self.osa_output_var.trace_add("write", lambda *_: self.osa_output_chosen(self.osa_output_var))
+        self._route_arduino_busy = False
+        self._route_arduino_last_time = None
+        self.after(300, self.poll_route_arduino)
 
 
         # Keep every routing action beside the diagram.  The old stacked layout
@@ -82,7 +130,7 @@ class RoutingMixin:
         ttk.Button(route_sidebar, text="Apply path (drive bar/cross)", command=self.apply_route).pack(anchor="w", fill="x")
         ttk.Checkbutton(route_sidebar, text="Keep complete output permutation",
                         variable=self.keep_permutation_var).pack(anchor="w", pady=(6, 0))
-        ttk.Label(route_sidebar, text="Off: drive only the selected path's MZIs. On: adjust other MZIs as needed while retaining every current input → output connection.",
+        ttk.Label(route_sidebar, text="Off: drive the selected path and set every other MZI to 0 V. On: adjust other MZIs as needed while retaining every current input → output connection.",
                   wraplength=255, foreground="#9baec6").pack(anchor="w", fill="x", pady=(2, 0))
 
         ttk.Separator(route_sidebar, orient="horizontal").pack(fill="x", pady=10)
@@ -110,6 +158,452 @@ class RoutingMixin:
         self.canvas.bind("<Configure>", lambda event: self.draw())
         ttk.Label(diagram, text="Green switches have saved bar and cross voltages. Use the X, =, and 0 controls beside each MZI to set cross, bar, or 0 V; clicking an MZI still cycles the states. Type a voltage and press Enter to send it.", padding=(4, 5), wraplength=680).pack(anchor="w", fill="x")
 
+    def route_arduino_available(self):
+        """Read only while routing is visible and no job owns the Arduino."""
+        page = self.tab_page(self.route_tab)
+        blocked = {"calibration", "crosstalk", "dataset", "mapping_scan", "power_read", "route_optimize"}
+        return (self.power_meter.connected and self.hp_meter_session is not None
+                and self.bnc_reference is not None and not self.hp_meter_busy
+                and not self._bnc_reference_busy and self.notebook.select() == str(page)
+                and not blocked.intersection(self.activities)
+                and not self.power_meter._calibration_capture)
+
+    def poll_route_arduino(self):
+        self.after(300, self.poll_route_arduino)
+        if self._bnc_reference_busy:
+            self.route_arduino_var.set("Arduino: measuring dBm reference...")
+            return
+        if not self.power_meter.connected:
+            self._route_arduino_last_time = None
+            self.route_arduino_var.set("Arduino: — dBm (connect Arduino)")
+            return
+        if self.hp_meter_session is None:
+            self._route_arduino_last_time = None
+            self.route_arduino_var.set("Arduino: — dBm (connect HP 8152A)")
+            return
+        if self.bnc_reference is None:
+            self._route_arduino_last_time = None
+            self.route_arduino_var.set("Arduino: — dBm (set BNC reference)")
+            return
+        if not self.route_arduino_available():
+            self._route_arduino_last_time = None
+            if self.notebook.select() == str(self.tab_page(self.route_tab)):
+                self.route_arduino_var.set("Arduino: paused during measurement")
+            return
+        if self._route_arduino_busy:
+            return
+        self._route_arduino_busy = True
+
+        def acquire():
+            try:
+                meter = self.hp_meter_session
+                reference = self.bnc_reference
+                range_before = meter.read_range_dbm(reference.channel)
+                reading = self.power_meter.read_current_power(
+                    ceiling_override=self.power_meter.full_scale + 1,
+                    range_tracking_mode=RANGE_TRACKING_OFF, ignore_jumps=True)
+                range_after = meter.read_range_dbm(reference.channel)
+                if range_before != range_after:
+                    raise RuntimeError("HP range changed during sample; retrying")
+                error = None
+            except Exception as failure:
+                reading, range_before, error = None, None, str(failure)
+            try:
+                self.after(0, self.finish_route_arduino, reading, range_before, error)
+            except (RuntimeError, tk.TclError):
+                pass  # The window closed while the read was finishing.
+
+        threading.Thread(target=acquire, daemon=True).start()
+
+    def finish_route_arduino(self, reading, range_dbm, error):
+        self._route_arduino_busy = False
+        if not self.route_arduino_available():
+            return
+        if error:
+            self.route_arduino_var.set(f"Arduino: {error}")
+        else:
+            dbm = self.bnc_reference.dbm_at(reading.raw_mean, range_dbm)
+            saturation = " · above ceiling" if reading.raw_mean >= self.power_meter.ceiling else ""
+            power = "below ADC floor" if dbm is None else f"{dbm:.2f} dBm"
+            now = time.monotonic()
+            last = self._route_arduino_last_time
+            self._route_arduino_last_time = now
+            cadence = f" · {1 / (now - last):.1f} updates/s" if last is not None and now > last else ""
+            self.route_arduino_var.set(
+                f"Arduino: {power} · A0 {reading.raw_mean:.2f} ADC · "
+                f"HP range {range_dbm:+d} dBm{cadence}{saturation}")
+
+    @staticmethod
+    def saved_bnc_reference_ports():
+        try:
+            stored = json.loads((app_dir() / BNC_REFERENCE_CONFIG).read_text(encoding="utf-8"))
+            pair = {key: int(stored[key]) for key in BNC_REFERENCE_DEFAULT}
+            if all(1 <= value <= 6 for value in pair.values()):
+                return pair
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return dict(BNC_REFERENCE_DEFAULT)
+
+    def remember_bnc_reference_ports(self):
+        try:
+            pair = {"input": int(self.bnc_input_var.get()), "output": int(self.bnc_output_var.get())}
+            (app_dir() / BNC_REFERENCE_CONFIG).write_text(json.dumps(pair, indent=2) + "\n", encoding="utf-8")
+        except (OSError, ValueError):
+            pass
+
+    def auto_bnc_reference(self):
+        """After connecting at launch, take the reference if every instrument it needs is there."""
+        if (self.bnc_reference is None and self.power_meter.connected and self.hp_meter_session is not None
+                and not self.hp_meter_busy and not self.measurement_busy()):
+            self.start_bnc_reference(automatic=True)
+
+    def start_bnc_reference(self, automatic=False):
+        """Pair one steady HP GPIB power reading with Arduino BNC counts.
+
+        With the Newport controller connected, only the chosen input is lit;
+        with the JDSU connected, it is routed to the chosen output. Both return
+        to their earlier state afterwards (the JDSU stays on that output).
+        """
+        if self._bnc_reference_busy:
+            return
+        if not self.power_meter.connected or self.hp_meter_session is None or self.hp_meter_busy:
+            if not automatic:
+                messagebox.showerror("BNC reference unavailable", "Connect both Arduino and HP 8152A first.",
+                                     parent=self)
+            return
+        source, output = int(self.bnc_input_var.get()), int(self.bnc_output_var.get())
+        use_lasers = self.newport_controller.connected and not self.newport_panel.busy
+        if automatic and not use_lasers:
+            # Without the Newport nothing is lit at launch, so the light check would only time out.
+            self.route_arduino_var.set("Arduino: — dBm (Newport not connected; press Set BNC dBm reference "
+                                       "once the reference light is on)")
+            return
+        if use_lasers:
+            try:
+                self.laser_bank.configure({port: variable.get() for port, variable in self.laser_slot_vars.items()},
+                                          self.laser_settle_var.get())
+            except ValueError as error:
+                self.route_arduino_var.set(f"Arduino: — dBm (laser settings: {error})")
+                return
+            self.newport_panel.busy = True
+            self.newport_panel.render()
+        switch = self.osa_output_switch if self.osa_output_switch.connected else None
+        options = self.hp_meter_session_options
+        channel = 1 if options["channel"] == "A" else 2
+        self.bnc_reference = None
+        self._bnc_reference_busy = True
+        self.hp_meter_busy = "bnc_reference"
+        self.refresh_hp_connection_buttons()
+        self.bnc_reference_button.configure(state="disabled")
+        where = (f"input {source}" if use_lasers else "the present light (Newport not connected)") + (
+            f" → output {output}" if switch else "")
+        self.route_arduino_var.set(f"Arduino: measuring dBm reference from {where}...")
+
+        def acquire():
+            hp = self.hp_meter_session
+            result = error = None
+            try:
+                if switch is not None:
+                    switch.select_output(output)
+                if use_lasers:
+                    self.laser_bank.begin()
+                    self.laser_bank.light_only(source - 1)
+                    self.after(0, self.show_reference_laser)
+                result = measure_bnc_reference(self.power_meter, hp, channel, options["resource"])
+            except Exception as failure:
+                error = str(failure) or type(failure).__name__
+            finally:
+                cleanup = []
+                if use_lasers:
+                    try:
+                        self.laser_bank.finish()
+                    except Exception as failure:
+                        cleanup.append(str(failure))
+                try:
+                    # The reference fixed the HP range; return to the connection settings.
+                    self.configure_hp_meter(hp, options)
+                except Exception as failure:
+                    cleanup.append(f"HP settings: {failure}")
+                if cleanup and error is None:
+                    error = "; ".join(cleanup)
+            try:
+                self.after(0, self.finish_bnc_reference, result, error, use_lasers, switch is not None)
+            except (RuntimeError, tk.TclError):
+                pass
+
+        threading.Thread(target=acquire, daemon=True).start()
+
+    def show_reference_laser(self):
+        """Draw the ring of the laser lit for the reference while it is measured."""
+        try:
+            self.newport_panel.render()
+            self.draw()
+        except tk.TclError:
+            pass  # The window closed while the reference was running.
+
+    def finish_bnc_reference(self, reference, error, used_lasers=False, used_switch=False):
+        self._bnc_reference_busy = False
+        self.hp_meter_busy = None
+        if used_lasers:
+            self.newport_panel.busy = False
+            try:
+                self.newport_controller.read_states()
+            except Exception:
+                pass  # The panel shows the last known states; Refresh reads them again.
+            self.newport_panel.render()
+            self.draw()
+        if used_switch:
+            self.osa_output_var.set(str(self.osa_output_switch.routed_output))
+        self.refresh_hp_connection_buttons()
+        self.bnc_reference_button.configure(state="normal")
+        if error:
+            self.route_arduino_var.set(f"Arduino: — dBm ({error})")
+        else:
+            self.bnc_reference = reference
+            self.route_arduino_var.set(
+                f"Arduino: reference {reference.dbm:.2f} dBm at {reference.adc:.2f} ADC "
+                f"(HP range {reference.range_dbm:+d} dBm)")
+
+    def toggle_voltage_optimizer(self):
+        if self.route_optimizer_running:
+            self.route_optimizer_stop.set()
+            self.optimize_button.configure(state="disabled")
+        else:
+            self.start_voltage_optimizer()
+
+    def start_voltage_optimizer(self):
+        """Nudge the MZIs on the lit paths for the most Arduino power at their routed outputs.
+
+        With an input selected only its path is tuned; otherwise every input is lit in
+        turn through the Newport. Through the JDSU each MZI is tuned for the least light
+        at its leak output; a meter fixed on one output can only maximize the routed power.
+        """
+        try:
+            if self.measurement_busy() or self._bnc_reference_busy:
+                raise RuntimeError("Wait for the current measurement to finish")
+            if not self.controller.connected:
+                raise RuntimeError("Connect the voltage board first (Hardware)")
+            if not self.power_meter.connected or self.hp_meter_session is None:
+                raise RuntimeError("Connect both the Arduino and the HP 8152A first")
+            if self.hp_meter_busy:
+                raise RuntimeError("Stop the HP meter stream or test first")
+            if self.bnc_reference is None:
+                raise ValueError("Set the BNC dBm reference first")
+            options = self.hp_meter_session_options
+            channel = 1 if options["channel"] == "A" else 2
+            reference = self.bnc_reference
+            if (reference.resource, reference.channel) != (options["resource"], channel):
+                raise ValueError("Set a new BNC dBm reference for this HP channel")
+            try:
+                low_adc, high_adc = float(self.hp_bnc_low_adc_var.get()), float(self.hp_bnc_high_adc_var.get())
+            except ValueError:
+                low_adc, high_adc = DEFAULT_LOW_ADC, DEFAULT_HIGH_ADC
+            use_lasers = self.newport_controller.connected and not self.newport_panel.busy
+            sources = [self.source] if self.source is not None else list(range(self.network.size))
+            if len(sources) > 1 and not use_lasers:
+                raise ValueError("Select one input to tune with the light that is on now, or connect the "
+                                 "Newport controller to light the inputs one at a time")
+            if use_lasers:
+                self.laser_bank.configure({port: variable.get() for port, variable in self.laser_slot_vars.items()},
+                                          self.laser_settle_var.get())
+            switch = None
+            plan = optimization_plan(self.network, sources)
+            if self.detection_position_var.get() == METER_VIA_JDSU:
+                if not self.osa_output_switch.connected:
+                    raise RuntimeError("Connect the JDSU switch, or set where the meter sits in "
+                                       "MZI calibration → Detection")
+                switch = self.osa_output_switch
+            else:
+                fixed = int(self.detection_position_var.get().split()[-1]) - 1
+                plan = tuple(item for item in plan if item[1] == fixed)
+                if not plan:
+                    raise ValueError(f"The meter sits on output {fixed + 1}, which "
+                                     + (f"input {sources[0] + 1} does not reach now" if len(sources) == 1
+                                        else "no input reaches now"))
+            objective = OBJECTIVE_LEAK if switch is not None else OBJECTIVE_THROUGH
+            mapped = self.controller.settings["mapping"]
+            plan = tuple((source, output, tuple((name, leak) for name, leak in names
+                                                if mapped.get(name) is not None
+                                                and name in self.controller.applied_voltages))
+                         for source, output, names in plan)
+            total = sum(len(names) for _, _, names in plan)
+            if not total:
+                raise ValueError("No MZI on the chosen path has a board pin and a known voltage")
+        except (OSError, RuntimeError, ValueError) as error:
+            messagebox.showerror("Voltage optimizer unavailable", str(error), parent=self)
+            return
+
+        self.route_optimizer_running = True
+        self.route_optimizer_stop = stop_event = threading.Event()
+        self.optimize_button.configure(text="Stop optimizer")
+        self.evaluate_button.configure(state="disabled")
+        self.hp_meter_busy = "optimizer"
+        self.refresh_hp_connection_buttons()
+        if use_lasers:
+            self.newport_panel.busy = True
+            self.newport_panel.render()
+        zero_before = set(self.zero_volt_switches)
+        states_before = dict(self.network.states)
+        which = f"input {sources[0] + 1}" if len(sources) == 1 else f"{len(plan)} inputs, one at a time"
+        goal = ("least light at each MZI's leak output" if objective == OBJECTIVE_LEAK
+                else "most light at the routed output")
+        self.begin_activity("route_optimize", f"Optimizing MZI voltages for {which}...", total)
+        self.status.configure(text=f"Optimizing {total} MZI voltage(s) for {which}: {goal}...")
+        previous_output = switch.routed_output if switch is not None else None
+        done = []
+        paths = []
+
+        def on_read(source, output, name, voltage, power):
+            dbm = mw_to_dbm(power) if power > 0 else None
+            text = "below floor" if dbm is None else f"{dbm:.2f} dBm"
+            self.after(0, lambda: self.route_arduino_var.set(
+                f"Optimizer: input {source + 1}, {name} at {voltage:.2f} V → output {output + 1}: {text}"))
+
+        def on_switch(item):
+            self.after(0, self.voltage_optimizer_switch_done, item, len(done), total)
+
+        def light(source):
+            self.laser_bank.light_only(source)
+            self.after(0, self.show_reference_laser)
+
+        def worker():
+            hp = self.hp_meter_session
+            error = None
+            stopped = False
+            try:
+                if use_lasers:
+                    self.laser_bank.begin()
+                reader = ArduinoHPRangeSweep(self.power_meter, hp, channel, low_adc=low_adc, high_adc=high_adc,
+                                             bnc_reference=reference)
+                paths.extend(optimize_paths(
+                    self.controller, plan, reader.read, objective=objective,
+                    light=light if use_lasers else None,
+                    select_output=None if switch is None else (
+                        lambda output: switch.select_output(output + 1)),
+                    allowed=self.optimizer_voltage_allowed, on_switch=on_switch, on_read=on_read,
+                    stop_event=stop_event, results=done))
+            except CalibrationStopped:
+                stopped = True
+            except Exception as failure:
+                error = str(failure) or type(failure).__name__
+            finally:
+                cleanup = []
+                if use_lasers:
+                    try:
+                        self.laser_bank.finish()
+                    except Exception as failure:
+                        cleanup.append(str(failure))
+                try:
+                    self.configure_hp_meter(hp, options)
+                except Exception as failure:
+                    cleanup.append(f"HP settings: {failure}")
+                if previous_output is not None:
+                    try:
+                        switch.select_output(previous_output)
+                    except Exception as failure:
+                        cleanup.append(f"JDSU restore: {failure}")
+                if cleanup and error is None:
+                    error = "; ".join(cleanup)
+            try:
+                self.after(0, self.finish_voltage_optimizer, list(done), paths, error, stopped, use_lasers,
+                           switch is not None, zero_before, states_before)
+            except (RuntimeError, tk.TclError):
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def optimizer_voltage_allowed(self, name, voltage):
+        """Only voltages the board sends without asking; a search must not stop for a dialog."""
+        try:
+            return self.controller.check_current_density(name, voltage) is None
+        except ValueError:
+            return False
+
+    def voltage_optimizer_switch_done(self, item, done, total):
+        self.voltage_vars[item.name].set(f"{item.best_v:.2f}")
+        if item.moved:
+            self.zero_volt_switches.discard(item.name)
+        gain = item.gain_db
+        self.update_activity("route_optimize", done, detail=(
+            f"Input {item.source + 1}: {item.name} {item.start_v:.2f} → {item.best_v:.2f} V"
+            + ("" if gain is None else f" ({gain:+.2f} dB)")))
+        self.draw()
+
+    def finish_voltage_optimizer(self, switches, paths, error, stopped, used_lasers, used_switch,
+                                 zero_before, states_before):
+        self.route_optimizer_running = False
+        self.route_optimizer_stop = None
+        self.optimize_button.configure(text="Optimize voltages", state="normal")
+        self.evaluate_button.configure(state="normal")
+        self.hp_meter_busy = None
+        self.refresh_hp_connection_buttons()
+        if used_lasers:
+            self.newport_panel.busy = False
+            try:
+                self.newport_controller.read_states()
+            except Exception:
+                pass  # The panel shows the last known states; Refresh reads them again.
+            self.newport_panel.render()
+        if used_switch and self.osa_output_switch.routed_output is not None:
+            self.osa_output_var.set(str(self.osa_output_switch.routed_output))
+        for item in switches:
+            self.voltage_vars[item.name].set(f"{item.best_v:.2f}")
+            if item.moved:
+                self.zero_volt_switches.discard(item.name)
+        summary = "; ".join(self.describe_optimized_path(path) for path in paths) or (
+            f"{len(switches)} MZI(s) finished" if switches else "no MZI finished")
+        outcome = "stopped" if stopped else "failed" if error else "done"
+        self.finish_activity("route_optimize", f"Voltage optimizer {outcome}: {summary}")
+        self.status.configure(text=f"Voltage optimizer {outcome}: {summary}"
+                              + (f" · {error}" if error else ""))
+        self.update_hardware_status(f"Optimizer moved {sum(item.moved for item in switches)} MZI(s)")
+        self.draw()
+        if error:
+            messagebox.showerror("Voltage optimizer", error, parent=self)
+        self.offer_optimized_calibration(switches, zero_before, states_before)
+
+    @staticmethod
+    def describe_optimized_path(path):
+        """'In 1 → Out 3 +0.12 dB (leaks −4.1 dB)': routed gain, then the mean leak drop."""
+        gain = path.gain_db
+        text = f"In {path.source + 1} → Out {path.output + 1} " + (
+            "no reading" if gain is None else f"{gain:+.2f} dB")
+        leaks = [item.gain_db for item in path.switches
+                 if item.objective == OBJECTIVE_LEAK and item.gain_db is not None]
+        if leaks:
+            text += f" (leaks {-sum(leaks) / len(leaks):+.1f} dB)"
+        return text
+
+    def offer_optimized_calibration(self, switches, zero_before, states_before):
+        """Ask whether the optimized voltages replace the saved cross/bar voltages they started from."""
+        calibration = self.controller.settings["calibration"]
+        changes = []
+        for item in switches:
+            if not item.moved or item.name in zero_before:
+                continue
+            state = "cross" if states_before[item.name] else "straight"
+            if calibration[item.name][state] is None:
+                continue
+            changes.append((item, state))
+        if not changes:
+            return
+        lines = "\n".join(f"{item.name} {'cross' if state == 'cross' else 'bar'}: "
+                          f"{calibration[item.name][state]:.2f} → {item.best_v:.2f} V" for item, state in changes)
+        if not messagebox.askyesno("Save optimized voltages",
+                                   "The optimized voltages are applied now. Also save them as the calibrated "
+                                   f"voltages?\n\n{lines}", parent=self):
+            return
+        try:
+            for item, state in changes:
+                saved = dict(calibration[item.name])
+                saved[state] = item.best_v
+                self.controller.set_calibration(item.name, saved["straight"], saved["cross"])
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Calibration not saved", str(error), parent=self)
+            return
+        self.update_hardware_status(f"Saved {len(changes)} optimized calibration voltage(s)")
+        self.draw()
+
 
     def choose_input(self, event=None):
         self.clear_permutation_preview()
@@ -132,12 +626,48 @@ class RoutingMixin:
         return None if value == "None" else int(value) - 1
 
     def click_input(self, row):
-        self.input_var.set("None" if self.source == row else str(row + 1))
+        """Select the input; with the Newport connected, also toggle its laser and follow it."""
+        lit = self.toggle_input_laser(row)
+        if lit is None:
+            self.input_var.set("None" if self.source == row else str(row + 1))
+        elif lit:
+            self.input_var.set(str(row + 1))
+        elif self.source == row:
+            self.input_var.set("None")
         self.choose_input()
 
+    def toggle_input_laser(self, row):
+        """Switch the laser feeding a 0-based input; returns its new state, or None when not possible."""
+        controller = self.newport_controller
+        if not controller.connected or self.newport_panel.busy or self.measurement_busy():
+            return None
+        slot = self.laser_bank.slot_for(row)
+        module = controller.modules[slot - 1]
+        if module.laser is None:
+            self.status.configure(text=f"Input {row + 1}: Newport slot {slot} has no laser output")
+            return None
+        desired = not module.laser
+        if desired and module.tec is False:
+            messagebox.showerror("Newport laser", f"Turn on the TEC of Newport slot {slot} (input {row + 1}) "
+                                 "before its laser.", parent=self)
+            return None
+        self.newport_panel.toggle(slot, "laser")
+        return desired
+
+    def input_laser_on(self, row):
+        controller = self.newport_controller
+        if not controller.connected:
+            return False
+        slot = self.laser_bank.slot_for(row)
+        return controller.modules[slot - 1].laser is True
+
     def click_output(self, row):
+        """Select the output; with the JDSU connected, also route it to that output."""
         self.output_var.set("None" if self.destination == row else str(row + 1))
         self.choose_output()
+        if self.osa_output_switch.connected and not self.measurement_busy():
+            # The OSA output picker routes the JDSU when it changes.
+            self.osa_output_var.set(str(row + 1))
 
     def toggle(self, name):
         """Cycle a switch: cross -> straight -> 0 V -> cross."""
@@ -224,26 +754,39 @@ class RoutingMixin:
                 return
             names = [name for name in self.network.switches
                      if target_states[name] != self.network.states[name] or name in self.zero_volt_switches]
+            zero_others = ()
         else:
-            target_states = {**self.network.states, **route_states}
-            # Only the MZIs used by this physical route are commanded.
+            target_states = {**dict.fromkeys(self.network.switches, True), **route_states}
             names = list(route_states)
-        if self.drive_route_states(target_states, names):
+            zero_others = [name for name in self.network.switches if name not in route_states]
+        if self.drive_route_states(target_states, names, zero_others):
             self.refresh(keep_selection=True)
 
-    def drive_route_states(self, states, names):
-        """Drive only ``names`` to their requested calibrated bar/cross states."""
+    def drive_route_states(self, states, names, zero_others=()):
+        """Drive the selected route and clear unused heaters to 0 V."""
         try:
+            for name in zero_others:
+                self.controller.drive_voltage(name, 0.0)
+                self.network.states[name] = True
+                self.zero_volt_switches.add(name)
+                self.voltage_vars[name].set("0.00")
             for name in names:
                 voltage = self.controller.apply_calibrated_state(name, states[name])
+                if voltage is None:
+                    if not states[name]:
+                        raise ValueError(f"{name}: calibrate its bar voltage before applying this path")
+                    voltage = self.controller.drive_voltage(name, 0.0)
+                    self.zero_volt_switches.add(name)
+                else:
+                    self.zero_volt_switches.discard(name)
                 self.network.states[name] = states[name]
-                self.zero_volt_switches.discard(name)
                 if voltage is not None:
                     self.voltage_vars[name].set(f"{voltage:.2f}")
         except (OSError, RuntimeError, ValueError) as error:
             messagebox.showerror("Path command failed", str(error), parent=self)
             return False
-        mode = "while retaining the complete permutation" if self.keep_permutation_var.get() else "on the selected path only"
+        mode = ("while retaining the complete permutation" if self.keep_permutation_var.get()
+                else "on the selected path, with other MZIs at 0 V")
         self.update_hardware_status(f"Applied {len(names)} MZI state(s) {mode}")
         return True
 
@@ -435,8 +978,16 @@ class RoutingMixin:
         wdm_ends = {}
         for row, wavelength, color in wdm:
             wdm_ends[row, "in"] = wdm_ends[self.network.trace(row, display_states).rows[-1], "out"] = (wavelength, color)
+        # With an input selected, its channel is the main one: the other comb lines fade
+        # back and only the main channel's crosstalk is drawn.
+        main = self.source if not previewing_permutation else None
+        main_color = next((color for row, _, color in wdm if row == main), ACCENT)
+        if main is not None:
+            wdm = [(row, wavelength, color if row == main else blend(color, BG, 0.6)) for row, wavelength, color in wdm]
         if not previewing_permutation:
             for row, _, color in wdm:
+                if main is not None and row != main:
+                    continue
                 for points in self.crosstalk_points(self.network.trace(row), self.right_x - 18,
                                                     self.xs, self.ys, self.switch_half):
                     c.create_line(*points, fill=color, width=1.5, dash=(3, 4),
@@ -455,19 +1006,24 @@ class RoutingMixin:
                               joinstyle="round", capstyle="round", state="disabled")
         if self.routes and not previewing_permutation:
             for row, _, color in wdm:
-                self.draw_route(self.network.trace(row), color, 3)
+                if row != main:
+                    self.draw_route(self.network.trace(row), color, 2)
             if self.all_paths.get():
                 for index, route in enumerate(self.routes):
                     self.draw_route(route, COLORS[index % len(COLORS)], 2, dashed=True)
+            self.draw_main_route(current, main_color)
             self.draw_route(self.routes[self.selected_route], ACCENT, 4)
-            c.create_text(width / 2, height - 12, text=f"Preview: path {self.selected_route + 1} in green · broad dashes show alternatives · thin dashes show crosstalk", fill=ACCENT, font=("Segoe UI", 10))
+            c.create_text(width / 2, height - 12, text=f"Bold: input {main + 1} as routed now · path {self.selected_route + 1} preview in green · broad dashes show alternatives · thin dashes show crosstalk", fill=ACCENT, font=("Segoe UI", 10))
         elif not previewing_permutation and current is not None:
-            # A wide green halo keeps the selected input visible beneath its comb-line colour.
-            self.draw_route(current, ACCENT, 9 if (self.source, "in") in wdm_ends else 4)
+            for row, _, color in wdm:
+                if row != main:
+                    self.draw_route(self.network.trace(row), color, 2)
+            self.draw_main_route(current, main_color)
+            c.create_text(width / 2, height - 12, text=f"Bold: input {main + 1} as routed now · faded: other comb lines · thin dashes: its possible crosstalk",
+                          fill="#9baec6", font=font_normal)
+        elif not previewing_permutation:
             for row, _, color in wdm:
                 self.draw_route(self.network.trace(row), color, 3)
-            c.create_text(width / 2, height - 12, text="Solid: routed light · thin dashes: possible crosstalk in the same input colour",
-                          fill="#9baec6", font=font_normal)
         for row, y in enumerate(self.ys):
             for side, x, selected, callback in (
                 ("in", self.left_x, row == self.source, self.click_input),
@@ -476,6 +1032,10 @@ class RoutingMixin:
                 tag = f"{side}:{row}"
                 wavelength, wdm_color = wdm_ends.get((row, side), (None, None))
                 outline = ACCENT if selected else wdm_color or WIRE
+                if side == "in" and self.input_laser_on(row):
+                    c.create_oval(x - 24, y - 24, x + 24, y + 24, outline=LASER_ON_COLOR, width=3, tags=tag)
+                    c.create_text(x, y - 31, text="LASER ON", fill=LASER_ON_COLOR,
+                                  font=("Segoe UI", max(7, round(7 * scale)), "bold"), tags=tag)
                 c.create_oval(x - 18, y - 18, x + 18, y + 18, fill=ACCENT if selected else PANEL, outline=outline,
                               width=3 if wdm_color and not selected else 2, tags=tag)
                 c.create_text(x, y, text=str(row + 1), fill=BG if selected else TEXT, font=("Segoe UI", max(10, round(12 * scale)), "bold"), tags=tag)
@@ -534,6 +1094,11 @@ class RoutingMixin:
                 next_row = self.network.links[next_stage][exit_row]
             points.extend((end_x, ys[next_row]))
             yield points
+
+    def draw_main_route(self, route, color):
+        """The selected input's light: thick, in its comb-line colour, over a dark gap that sets it apart."""
+        self.draw_route(route, BG, 12)
+        self.draw_route(route, color, 6)
 
     def draw_route(self, route, color, line_width, dashed=False):
         points = self.route_points(route, self.left_x + 18, self.right_x - 18, self.xs, self.ys, self.switch_half)

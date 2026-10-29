@@ -41,6 +41,13 @@ CHECK_SHORT = {"Alignment (all 0 V)": "0 V", "All cross (calibrated)": "all X",
                "All bar (calibrated)": "all =", "Routed states": "routed"}
 
 
+def blend(color, other, amount):
+    """``color`` moved ``amount`` (0–1) of the way to ``other``; both "#rrggbb"."""
+    channels = [round(int(color[i:i + 2], 16) * (1 - amount) + int(other[i:i + 2], 16) * amount)
+                for i in (1, 3, 5)]
+    return "#" + "".join(f"{channel:02x}" for channel in channels)
+
+
 def apply_theme(root):
     """Configure the dark ttk theme used by every window."""
     style = ttk.Style(root)

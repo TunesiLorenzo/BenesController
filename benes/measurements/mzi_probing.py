@@ -3,8 +3,8 @@
 A probe lights one input and reads one output. The probed MZI decides
 whether that input's light reaches the output: in one state it arrives
 (bright), in the other it leaves elsewhere (dark). Every other MZI holds a
-known background state: cross at 0 V (the unbiased state) while it is
-uncalibrated, or its calibrated cross or bar voltage once known.
+known background state: cross at 0 V (the assumed unbiased state), or its
+calibrated bar voltage when a fixed detector needs that route.
 
 Calibrated MZIs set to bar let a fixed detector see further, so calibration
 bootstraps: it calibrates what is visible, then uses those MZIs to reach the
@@ -15,8 +15,17 @@ All ports are 0-based here.
 
 from __future__ import annotations
 
+import heapq
 from dataclasses import dataclass
 from itertools import combinations
+
+# Held MZIs that must leak before light through an aggressor can reach the detector.
+# Each leak costs the MZI's extinction (about 20 dB in power, 10 % in field) on the
+# field that interferes with the probed light; one leak still moves a quadrature
+# reading by tenths of a radian.
+DEFAULT_MIN_LEAK_ORDER = 2
+# Past three leaks the interfering field is below 0.1 %; more isolation gains nothing.
+ENOUGH_LEAK_ORDER = 3
 
 
 @dataclass(frozen=True)
@@ -42,7 +51,6 @@ class Probe:
     def bright_path(self, network) -> tuple[str, ...]:
         """MZIs the probed light passes through when it reaches the output."""
         return tuple(name for name, _ in network.trace(self.input, self.states(self.bright_crossed)).states)
-
     def describe(self) -> str:
         text = (f"In {self.input + 1} → Out {self.output + 1}, bright when "
                 f"{'cross' if self.bright_crossed else 'bar'}")
@@ -68,6 +76,11 @@ class CrosstalkProbe:
 
     probe: Probe
     aggressors: tuple[str, ...]
+    # ``leak_order`` of each aggressor, in the same order; empty when not computed.
+    leak_orders: tuple[int | None, ...] = ()
+
+    def leak_order(self, aggressor: str) -> int | None:
+        return dict(zip(self.aggressors, self.leak_orders)).get(aggressor)
 
 
 @dataclass(frozen=True)
@@ -86,6 +99,47 @@ class CrosstalkPlan:
 def stage_distance(network, first, second) -> int:
     """Stages between two MZIs; 0 in the same stage, 1 for neighbouring stages."""
     return abs(network.switches[first][0] - network.switches[second][0])
+
+
+def leak_order(network, probe: Probe, aggressor: str) -> int | None:
+    """Fewest held MZIs that must leak for lit light through ``aggressor`` to reach the probe's output.
+
+    The victim at quadrature splits its light and the swept aggressor takes
+    every state, so both route freely; any other MZI leaks only against its
+    held state. 0 means the aggressor steers the detected light itself; None
+    means no light that reaches the output ever passes through it.
+    """
+    states = probe.states(probe.bright_crossed)
+    stages = len(network.pairs)
+    start = (0, probe.input, False)
+    best = {start: 0}
+    queue = [(0, start)]
+    while queue:
+        leaks, (stage, row, through) = heapq.heappop(queue)
+        if leaks > best[stage, row, through]:
+            continue
+        if stage == stages:
+            if through and row == probe.output:
+                return leaks
+            continue
+        name = network.at.get((stage, row))
+        if name is None:
+            choices = ((False, 0),)
+        elif name in (probe.name, aggressor):
+            choices = ((False, 0), (True, 0))
+        else:
+            choices = ((states[name], 0), (not states[name], 1))
+        for crossed, cost in choices:
+            following = (stage + 1, network.step(stage, row, crossed), through or name == aggressor)
+            if leaks + cost < best.get(following, leaks + cost + 1):
+                best[following] = leaks + cost
+                heapq.heappush(queue, (leaks + cost, following))
+    return None
+
+
+def _isolation(order: int | None) -> int:
+    """Leak order for ranking probes: unreachable and anything past ``ENOUGH_LEAK_ORDER`` rank alike."""
+    return ENOUGH_LEAK_ORDER if order is None else min(order, ENOUGH_LEAK_ORDER)
 
 
 def _probes_with(network, name, background, inputs, outputs) -> list[Probe]:
@@ -137,8 +191,10 @@ def plan_calibration(network, names=None, inputs=None, outputs=None, known=()) -
 
     Rounds calibrate every MZI visible with the MZIs known so far; each round
     makes more MZIs available as bar backgrounds for the next. Within a round
-    probes are grouped by input and output, so lasers and the JDSU move as
-    little as possible, with output-side MZIs first.
+    each MZI uses the same lowest-numbered input/output probe that a single
+    calibration would choose. Within each input, output-side MZIs run first;
+    this keeps earlier calibration biases comparable while allowing the JDSU
+    to move to the output each MZI actually needs.
     """
     names = list(network.switches if names is None else names)
     inputs = tuple(range(network.size) if inputs is None else inputs)
@@ -153,23 +209,12 @@ def plan_calibration(network, names=None, inputs=None, outputs=None, known=()) -
                 found[name] = candidates
         if not found:
             break
-        # Prefer the (input, output) pair that serves the most MZIs this round.
-        chosen = {}
-        while len(chosen) < len(found):
-            counts = {}
-            for name, candidates in found.items():
-                if name not in chosen:
-                    for probe in candidates:
-                        key = (probe.input, probe.output)
-                        counts[key] = counts.get(key, 0) + 1
-            key = min(counts, key=lambda pair: (-counts[pair], pair))
-            for name, candidates in found.items():
-                if name not in chosen:
-                    match = next((probe for probe in candidates if (probe.input, probe.output) == key), None)
-                    if match is not None:
-                        chosen[name] = match
+        # Reuse each switch's single-calibration choice. Sharing a convenient
+        # route with another MZI can pick a weak physical output branch.
+        chosen = {name: min(candidates, key=lambda probe: (probe.input, probe.output))
+                  for name, candidates in found.items()}
         steps.extend(sorted(chosen.values(), key=lambda probe: (
-            probe.input, probe.output, -network.switches[probe.name][0], probe.name)))
+            probe.input, -network.switches[probe.name][0], probe.output, probe.name)))
         known |= set(chosen)
         remaining = [name for name in remaining if name not in chosen]
     unreachable = {name: _visibility_hint(network, name, inputs) for name in remaining}
@@ -177,12 +222,15 @@ def plan_calibration(network, names=None, inputs=None, outputs=None, known=()) -
 
 
 def plan_crosstalk(network, victims, aggressors=None, inputs=None, outputs=None, known=(),
-                   max_biased=2, max_stage_distance=None) -> CrosstalkPlan:
-    """Choose victim probes whose lit path avoids each aggressor.
+                   max_biased=2, max_stage_distance=None,
+                   min_leak_order=DEFAULT_MIN_LEAK_ORDER) -> CrosstalkPlan:
+    """Choose victim probes that keep each aggressor's light away from the detector.
 
-    An aggressor on the lit path would switch the light itself, so it must be
-    measured with another probe. Each victim takes the probe that leaves the
-    most aggressors measurable, then more probes for the rest. At most
+    An aggressor on the lit path would switch the light itself; one a single
+    leak away still adds light that interferes with the probe as it switches.
+    Each aggressor is measured with a probe of the highest ``leak_order`` any
+    probe of its victim reaches, and the fewest such probes are used. A pair
+    whose best probe stays below ``min_leak_order`` is not measurable. At most
     ``max_biased`` background MZIs are heated to bar: more seldom helps and
     adds background heat. With ``max_stage_distance`` only aggressors that
     many stages or fewer from the victim are measured; heat from further
@@ -203,15 +251,20 @@ def plan_crosstalk(network, victims, aggressors=None, inputs=None, outputs=None,
             for aggressor in wanted:
                 uncovered[aggressor, victim] = f"{victim} is not visible: {_visibility_hint(network, victim, inputs)}"
             continue
-        paths = [(probe, set(probe.bright_path(network))) for probe in candidates]
+        orders = [(probe, {name: leak_order(network, probe, name) for name in wanted}) for probe in candidates]
+        best = {name: max(_isolation(found[name]) for _, found in orders) for name in wanted}
+        for aggressor in wanted:
+            if best[aggressor] == 0:
+                uncovered[aggressor, victim] = f"every probe of {victim} passes through {aggressor}"
+            elif best[aggressor] < min_leak_order:
+                uncovered[aggressor, victim] = (
+                    f"light through {aggressor} reaches every {victim} probe after {best[aggressor]} leak(s); "
+                    f"{min_leak_order} needed")
+        wanted = [name for name in wanted if best[name] >= min_leak_order]
         while wanted:
-            probe, path = min(paths, key=lambda item: (sum(name in item[1] for name in wanted),
-                                                       len(item[0].biased)))
-            covered = tuple(name for name in wanted if name not in path)
-            if not covered:
-                for aggressor in wanted:
-                    uncovered[aggressor, victim] = (f"every probe of {victim} passes through {aggressor}")
-                break
-            groups.append(CrosstalkProbe(probe, covered))
+            probe, found = max(orders, key=lambda item: (
+                sum(_isolation(item[1][name]) >= best[name] for name in wanted), -len(item[0].biased)))
+            covered = tuple(name for name in wanted if _isolation(found[name]) >= best[name])
+            groups.append(CrosstalkProbe(probe, covered, tuple(found[name] for name in covered)))
             wanted = [name for name in wanted if name not in covered]
     return CrosstalkPlan(tuple(groups), uncovered, tuple(distant))

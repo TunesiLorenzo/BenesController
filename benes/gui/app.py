@@ -14,12 +14,12 @@ from benes.hardware.hp8152a import DEFAULT_RESOURCE
 from benes.hardware.osa_output_switch import OUTPUTS, OSAOutputSwitch
 from benes.hardware.power_meter import ArduinoPowerMeter, RANGE_TRACKING_LABELS
 from benes.hardware.voltage_controller import BenesVoltageController
+from benes.measurements.arduino_hp_range import DEFAULT_HIGH_ADC, DEFAULT_LOW_ADC
 from benes.measurements.wdm_comb import WDMPlan
 from benes.gui.calibration import DETECT_OSA, METER_HP, METER_VIA_JDSU, CalibrationMixin
 from benes.gui.crosstalk import CrosstalkMixin
 from benes.gui.dataset import DatasetMixin
 from benes.gui.hardware import HardwareMixin
-from benes.gui.impulse import ImpulseMixin
 from benes.gui.mapping import MappingMixin
 from benes.gui.routing import RoutingMixin
 from benes.gui.spectra import SpectraMixin
@@ -28,7 +28,7 @@ from benes.paths import app_dir
 
 
 class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, CrosstalkMixin,
-               CalibrationMixin, WDMMixin, DatasetMixin, ImpulseMixin, tk.Tk):
+               CalibrationMixin, WDMMixin, DatasetMixin, tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Beneš • 6 × 6 route explorer")
@@ -47,6 +47,8 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
         self.controller.unsafe_voltage_authorizer = self.confirm_unsafe_voltage
         self.controller.current_density_authorizer = self.confirm_over_safe_current
         self.power_meter = ArduinoPowerMeter()
+        self.bnc_reference = None
+        self._bnc_reference_busy = False
         self.osa_output_switch = OSAOutputSwitch()
         self.newport_controller = NewportLaserController()
         self.newport_window = None
@@ -63,6 +65,8 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
         self.scan_settings = {}
         self.crosstalk_running = False
         self.hp_meter_busy = None
+        self.hp_meter_session = None
+        self.hp_meter_session_options = None
         self.hp_stream_stop = None
         self.crosstalk_data = {}
         self.crosstalk_data_source = None
@@ -73,9 +77,6 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
         self.zero_volt_switches = set()
         self.mzi_calibration_running = False
         self.calibration_stop_event = None
-        self.impulse_running = False
-        self.impulse_stop_event = None
-        self.impulse_trace = None
         self.source = None
         self.destination = None
         self.routes = []
@@ -139,6 +140,8 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
         # How MZI calibration and the crosstalk matrix read a probe (set in the MZI calibration tab).
         self.detection_method_var = tk.StringVar(value=DETECT_OSA)
         self.detection_meter_var = tk.StringVar(value=METER_HP)
+        self.hp_bnc_low_adc_var = tk.StringVar(value=f"{DEFAULT_LOW_ADC:g}")
+        self.hp_bnc_high_adc_var = tk.StringVar(value=f"{DEFAULT_HIGH_ADC:g}")
         self.detection_position_var = tk.StringVar(value=METER_VIA_JDSU)
         self.laser_slot_vars = {port: tk.StringVar(value=str(slot))
                                 for port, slot in self.laser_bank.settings["slots"].items()}
@@ -164,26 +167,27 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
         self.notebook.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         # Each tab fills the window when it fits and scrolls when the window is smaller.
         tabs = []
-        for text in ("Routing", "Hardware & OSA", "MZI calibration", "Thermal crosstalk",
-                     "Dataset coverage", "Impulse test", "Newport lasers"):
+        for text in ("Routing", "Hardware", "MZI calibration", "Thermal crosstalk", "Dataset coverage"):
             scroller = ScrollableFrame(self.notebook, background=BG)
             self.notebook.add(scroller, text=text)
             tabs.append(scroller.inner)
-        (self.route_tab, self.hardware_tab, self.calibration_tab, self.crosstalk_tab,
-         self.dataset_tab, self.impulse_tab, self.newport_tab) = tabs
-        self.newport_panel = NewportPanel(self.newport_tab, self.newport_controller,
-                                          detach=self.detach_newport)
-        self.newport_panel.pack(fill="both", expand=True)
+        (self.route_tab, self.hardware_tab, self.calibration_tab, self.crosstalk_tab, self.dataset_tab) = tabs
 
         self.build_routing_tab()
+        # The Newport panel is a page of the hardware tab, which sets ``newport_tab``.
         self.build_hardware_tab()
+        self.newport_panel = NewportPanel(self.newport_tab, self.newport_controller,
+                                          detach=self.detach_newport,
+                                          on_change=lambda: self.draw())
+        self.newport_panel.pack(fill="both", expand=True)
         self.build_crosstalk_tab()
         self.build_calibration_tab()
         self.build_dataset_tab()
-        self.build_impulse_tab()
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.refresh()
-        self.after(200, self.auto_connect_osa_output_switch)
+        self.after(200, self.auto_connect_devices)
+        self.after(100, self.restore_dataset_folder)
+        self.after(1000, self.refresh_device_overview)
 
     @staticmethod
     def tab_page(tab):
@@ -264,14 +268,11 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
             self.stop_hp_stream()
             messagebox.showinfo("HP meter stream", "Stopping the HP meter stream. Close again when it has stopped.", parent=self)
             return
-        if self.hp_meter_busy == "test":
-            messagebox.showinfo("HP meter test", "Wait for the HP meter test to finish.", parent=self)
+        if self.hp_meter_busy in ("test", "connect", "disconnect"):
+            messagebox.showinfo("HP meter", "Wait for the HP meter operation to finish.", parent=self)
             return
         if self.newport_panel.busy:
             messagebox.showinfo("Newport operation", "Wait for the Newport command to finish.", parent=self)
-            return
-        if self.impulse_running:
-            self.stop_impulse()
             return
         if self.crosstalk_running:
             messagebox.showinfo("Scan in progress", "Wait for the crosstalk scan to finish and reset the switches to 0 V.", parent=self)
@@ -286,11 +287,42 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
             messagebox.showinfo("Calibration in progress",
                                 "Stop the MZI calibration and wait for every MZI to return to 0 V first.", parent=self)
             return
-        self.controller.disconnect()
-        self.power_meter.disconnect()
-        self.osa_output_switch.disconnect()
-        self.newport_controller.disconnect()
+        if getattr(self, "_connecting_devices", False):
+            messagebox.showinfo("Connecting devices", "Wait for the device connections to finish.", parent=self)
+            return
+        self.activity_text.set("Closing: turning the lasers off and releasing the instruments…")
+        self.update_idletasks()
+        errors = self.shutdown_instruments()
+        if errors:
+            messagebox.showwarning("Closing", "Some instruments did not shut down cleanly:\n\n"
+                                   + "\n".join(f"• {error}" for error in errors)
+                                   + "\n\nCheck them before leaving the bench.", parent=self)
         self.destroy()
+
+    def shutdown_instruments(self):
+        """Lasers off, then every instrument released; a failure never stops the steps after it."""
+        errors = []
+        if self.newport_controller.connected:
+            try:
+                errors += [f"Newport {error}: not confirmed off" for error in self.newport_controller.all_off()]
+            except Exception as error:
+                errors.append(f"Newport lasers could not be turned off: {error}")
+
+        def disconnect_hp():
+            session, self.hp_meter_session = self.hp_meter_session, None
+            if session is not None:
+                session.disconnect()
+
+        for label, disconnect in (("Voltage board", self.controller.disconnect),
+                                  ("Arduino meter", self.power_meter.disconnect),
+                                  ("HP 8152A", disconnect_hp),
+                                  ("JDSU output switch", self.osa_output_switch.disconnect),
+                                  ("Newport 9016", self.newport_controller.disconnect)):
+            try:
+                disconnect()
+            except Exception as error:
+                errors.append(f"{label} did not disconnect: {error}")
+        return errors
 
     def detach_newport(self):
         if self.newport_panel.busy or self.newport_window is not None:
@@ -304,7 +336,8 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
         scroller.pack(fill="both", expand=True)
         self.newport_window = window
         self.newport_panel = NewportPanel(scroller.inner, self.newport_controller,
-                                          attach=self.attach_newport)
+                                          attach=self.attach_newport,
+                                          on_change=lambda: self.draw())
         self.newport_panel.pack(fill="both", expand=True)
         window.protocol("WM_DELETE_WINDOW", self.attach_newport)
 
@@ -315,5 +348,6 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
         self.newport_window.destroy()
         self.newport_window = None
         self.newport_panel = NewportPanel(self.newport_tab, self.newport_controller,
-                                          detach=self.detach_newport)
+                                          detach=self.detach_newport,
+                                          on_change=lambda: self.draw())
         self.newport_panel.pack(fill="both", expand=True)

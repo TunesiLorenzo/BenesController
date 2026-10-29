@@ -111,6 +111,48 @@ class OSAOutputSwitchTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "did not settle"):
                 selector.select_output(1)
 
+    def test_fast_selection_keeps_settled_status_and_readback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            jdsu = FakeJDSU(settle_polls=1)
+            waits = []
+            manager = FakeManager(jdsu)
+            selector = OSAOutputSwitch(Path(directory) / "selector.json",
+                                       resource_manager_factory=lambda: manager, sleep=waits.append)
+            selector.configure("GPIB0::7::INSTR", False, 3, {str(n): n for n in range(1, 7)})
+            selector.connect()
+            selector.select_output(2, extra_settle_s=0)
+            self.assertEqual(jdsu.commands, ["CLOSE 2", "CNB?", "CNB?", "CLOSE?"])
+            self.assertEqual(waits, [0.1])
+            selector.select_output(3)
+            self.assertEqual(waits[-1], 3)
+
+    def test_sweep_timing_restores_output_without_extra_wait(self):
+        with tempfile.TemporaryDirectory() as directory:
+            jdsu = FakeJDSU()
+            selector, _ = physical_switch(directory, jdsu)
+            selector.configure("GPIB0::7::INSTR", False, 3, {str(n): n for n in range(1, 7)})
+            selector.select_output(4, extra_settle_s=0)
+            jdsu.commands.clear()
+            timing = selector.sweep_timing(repeats=2)
+            self.assertEqual(timing["count"], 12)
+            self.assertEqual([sample["output"] for sample in timing["samples"]], list(range(1, 7)) * 2)
+            self.assertEqual(set(timing["per_output_median_s"]), set(map(str, range(1, 7))))
+            self.assertGreaterEqual(timing["maximum_s"], timing["median_s"])
+            self.assertEqual(selector.routed_output, 4)
+            self.assertEqual([command for command in jdsu.commands if command.startswith("CLOSE ")],
+                             [f"CLOSE {n}" for n in list(range(1, 7)) * 2 + [4]])
+
+    def test_sweep_timing_restores_unmapped_physical_channel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            jdsu = FakeJDSU()
+            jdsu.channel = 10
+            selector, _ = physical_switch(directory, jdsu)
+            self.assertIsNone(selector.routed_output)
+            selector.sweep_timing(repeats=1)
+            self.assertEqual(jdsu.channel, 10)
+            self.assertIsNone(selector.routed_output)
+            self.assertIsNone(selector.settings["selected_output"])
+
     def test_rejects_duplicate_and_out_of_range_channels(self):
         with tempfile.TemporaryDirectory() as directory:
             selector = OSAOutputSwitch(Path(directory) / "selector.json")
