@@ -78,8 +78,8 @@ class LaserBank:
         """Newport slot of a 0-based input."""
         return self.settings["slots"][source + 1]
 
-    def begin(self) -> None:
-        """Check every mapped module, remember its laser state and turn them all off."""
+    def _checked_modules(self) -> list:
+        """Read the rack and confirm every mapped slot has a laser with its TEC on."""
         if not self.controller.connected:
             raise RuntimeError("Connect the Newport laser controller first")
         modules = self.controller.read_states()
@@ -89,6 +89,21 @@ class LaserBank:
                 raise ValueError(f"Newport slot {slot} (input {port}) has no laser output")
             if module.tec is False:
                 raise RuntimeError(f"Turn on the TEC of Newport slot {slot} (input {port}) first")
+        return modules
+
+    def light_all(self) -> list[int]:
+        """Light all six inputs together, as a WDM scan needs; return the 1-based inputs switched on."""
+        modules = self._checked_modules()
+        switched = [port for port, slot in sorted(self.settings["slots"].items()) if not modules[slot - 1].laser]
+        for port in switched:
+            self.controller.set_output(self.settings["slots"][port], "laser", True)
+        if switched:
+            self._sleep(self.settings["settle_s"])
+        return switched
+
+    def begin(self) -> None:
+        """Check every mapped module, remember its laser state and turn them all off."""
+        modules = self._checked_modules()
         self._initial = {slot: modules[slot - 1].laser for slot in self.settings["slots"].values()}
         for slot in self.settings["slots"].values():
             if modules[slot - 1].laser:

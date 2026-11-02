@@ -90,7 +90,7 @@ class WDMPlan:
             "active_preset": None,
             "comb_lines": [],
             "half_window_nm": 0.2,
-            "settle_s": 2.0,
+            "settle_s": 0.0,
             "evaluation_sweeps": 10,
         }
 

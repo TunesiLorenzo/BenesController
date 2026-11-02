@@ -767,7 +767,7 @@ class CrosstalkMixin:
             error = None
             try:
                 if setup is not None:
-                    scan_with_detector(self.controller, setup, names, self.source, self.destination, voltages,
+                    scan_with_detector(self.controller, setup["open"], names, self.source, self.destination, voltages,
                                        settle_ms / 1000,
                                        lambda name, index, total, point: on_point(name, index, total,
                                                                                   to_response(point)),

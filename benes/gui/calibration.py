@@ -21,7 +21,7 @@ from benes.hardware.osa_output_switch import OUTPUTS, fiber_number
 from benes.hardware.power_meter import RANGE_TRACKING_OFF
 from benes.measurements.calibration_scan import scan_voltages
 from benes.measurements.crosstalk_results import PLOT_X_POWER, PLOT_X_VOLTAGE, plot_x_values
-from benes.measurements.arduino_hp_range import (ArduinoHPRangeSweep, BNC_CLIP_ADC,
+from benes.measurements.arduino_hp_range import (ArduinoHPRangeSweep, BNC_CLIP_ADC, FLOOR_MIN_ADC,
                                                  DEFAULT_RANGE_SETTLE_S)
 from benes.measurements.laser_calibration import (DEFAULT_PASS_DB, CalibrationStopped, SimulatedChip,
                                                   check_alignment, check_calibrated_states,
@@ -1052,6 +1052,7 @@ class CalibrationMixin:
         self.cal_reference_lines = setup["osa"] is not None
         self.cal_hp_bnc_overlay = ("hp_bnc" in setup["context"] and
                                    (setup["context"].get("hp_bnc") or {}).get("recovery_method") != "adaptive_fixed_range")
+        self.cal_hp_bnc_context = setup["context"].get("hp_bnc")
         self.begin_activity("calibration", f"Calibrating {len(plan.steps)} MZI(s)...",
                             len(plan.steps) * len(voltages) + 1)
         self.cal_mzi_progress.configure(maximum=len(plan.steps), value=0)
@@ -1404,8 +1405,11 @@ class CalibrationMixin:
         phase = "rescan" if rescan else "sweep"
         self.cal_sweep_progress_var.set(f"{name} {phase} point {index}/{total}")
         unit = "dBm" if self.cal_unit == "mW" and not self.cal_arduino_log else self.cal_unit
+        power_text = ("outside Arduino measuring window" if point.power is None and
+                      getattr(self, "cal_hp_bnc_context", None) is not None else
+                      f"{self.plotted_power(point.power):.4g} {unit}")
         self.cal_status_var.set(f"{name}: {'rescan ' if rescan else ''}{index}/{total} at {point.voltage:.2f} V · "
-                                f"{self.plotted_power(point.power):.4g} {unit}")
+                                + power_text)
         if plot is None:
             return
         if rescan and plot["reconstructed_line"] is not None:
@@ -1457,6 +1461,19 @@ class CalibrationMixin:
         points = plot["points"]
         xs, label = self.calibration_x(name, [item.voltage for item in points])
         plot["power_line"].set_data(xs, [self.plotted_power(item.power) for item in points])
+        floor_line = plot.get("floor_line")
+        if floor_line is not None:
+            hp_bnc = self.cal_hp_bnc_context or {}
+            records = (hp_bnc.get("point_ranges") or {}).get(name, [])
+            reference = hp_bnc.get("bnc_reference") or {}
+            floor_x, floor_y = [], []
+            if len(records) == len(points) and reference.get("adc", 0) > 0:
+                for x, point, record in zip(xs, points, records):
+                    if point.power is None and record.get("range_limit") == "low":
+                        floor_x.append(x)
+                        floor_y.append(reference["dbm"] + 10 * math.log10(FLOOR_MIN_ADC / reference["adc"])
+                                       + record["range_dbm"] - reference["range_dbm"])
+            floor_line.set_data(floor_x, floor_y)
         if plot["reference_line"] is not None:
             plot["reference_line"].set_data(xs, [self.plotted_power(item.reference) for item in points])
             plot["contrast_line"].set_data(xs, [float("nan") if item.contrast_db is None else item.contrast_db
@@ -1511,6 +1528,10 @@ class CalibrationMixin:
         power_line, = lines_axis.plot([], [], marker=".", linewidth=1.4, color=WDM_COLORS[probe.input],
                                       label=("Initial HP range" if self.cal_hp_bnc_overlay else
                                              f"In {probe.input + 1} (arrives if {state})"))
+        floor_line = None
+        if self.cal_hp_bnc_context is not None:
+            floor_line, = lines_axis.plot([], [], marker="v", linestyle="None", color="#d97706",
+                                          label="Below Arduino ADC floor (limit shown)")
         reconstructed_line = None
         if self.cal_hp_bnc_overlay:
             reconstructed_line, = lines_axis.plot([], [], marker=".", linewidth=1.4,
@@ -1540,6 +1561,7 @@ class CalibrationMixin:
         canvas.get_tk_widget().configure(**PLOT_MIN_SIZE)
         canvas.get_tk_widget().pack(fill="both", expand=True)
         self.cal_plot_items[probe.name] = {"tab": tab, "canvas": canvas, "axes": axes, "power_line": power_line,
+                                           "floor_line": floor_line,
                                            "reconstructed_line": reconstructed_line, "reconstructed_points": [],
                                            "reference_line": reference_line, "contrast_line": contrast_line,
                                            "points": [], "result": None, "markers": []}

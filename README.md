@@ -151,8 +151,10 @@ Physical mode needs NI-VISA and `python -m pip install pyvisa`.
 
 ### Six-laser configuration evaluation
 
-**Dataset coverage** holds the saved six-laser wavelengths, line window and
-OSA/JDSU settling delay. **Evaluate Configuration** on the **Routing** tab
+**Dataset coverage** holds the saved six-laser wavelengths, line window, extra
+JDSU settle delay (default 0.25 s), and extra OSA settle delay (default 0 s).
+Both delays can be selected and saved with **Save six-laser configuration**.
+**Evaluate Configuration** on the **Routing** tab
 always scans all six output ports using that persisted configuration. Its result
 window overlays the six spectra and includes a table for every wavelength:
 linear-sum power across all outputs in dBm, expected routed output, transmission
@@ -171,11 +173,10 @@ keeps the plan in `benes_wdm_plan_config.json`; **Saved wavelength plans** store
 named plans to load later.
 
 **Evaluate Configuration** routes the JDSU to all six outputs, waits the saved
-**Settling delay**, reads the OSA (Hardware settings; **Simulate** gives a synthetic
+extra delays, reads the OSA (Hardware settings; **Simulate** gives a synthetic
 comb) and measures every assigned comb line within **Line window ±** of its
-wavelength. The delay should cover the switch settling and at least one complete
-OSA sweep, so a trace holds no light from the previous output; the JDSU's own
-settle check and its extra delay from **Selector setup…** still run first.
+wavelength. The JDSU settled-status check runs before the extra delays, and the
+OSA read waits for two fresh sweeps after routing to avoid the previous output.
 The separate Dataset Coverage batch controls can be stopped after the current
 output and still save completed configurations.
 
@@ -203,7 +204,16 @@ the linked dataset and restores the original control state when it finishes.
 bar/cross configurations, including configurations that realize the same output
 permutation. The live metrics table has one row per state and input wavelength:
 total line power over the six outputs in dBm, and expected-port transmission
-and crosstalk at the other outputs in dB relative to that total.
+and crosstalk at the other outputs in dB relative to that total. The live
+permutation tracker shows transmission as dB and percent in the same cell.
+**Live optical viewer…** shows six output traces for a completed configuration,
+selected from a dropdown while the batch runs or from earlier runs in the linked
+dataset. Entries use the lexicographic permutation number (1–720), a stable
+path alternative number when switch states were saved, and the run timestamp.
+Each plot marks the expected input wavelength for its output. The **Permutation summary** tab lists the
+input-to-output mapping, the target line's share of its wavelength's total
+measured power as dB and percent, and target peak and window-mean power at
+each output, without crosstalk columns.
 
 ## Permutation measurement datasets
 

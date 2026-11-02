@@ -1090,6 +1090,13 @@ def save_calibration(folder: Path, context: dict, results: dict[str, MZISweep]) 
                       else "After range adjustment")
         else:
             axis.plot([point.voltage for point in item.points], values, ".-", label=f"In {item.probe.input + 1}")
+        if bnc_reference and point_ranges and len(point_ranges) == len(item.points):
+            floor_points = [(point.voltage, mw_to_dbm(initial_power(1.0, record["range_dbm"])))
+                            for point, record in zip(item.points, point_ranges)
+                            if point.power is None and record.get("range_limit") == "low"]
+            if floor_points:
+                axis.plot(*zip(*floor_points), marker="v", linestyle="None", color="tab:orange",
+                          label="Below Arduino ADC floor (limit shown)")
         axis.axvline(item.cross.voltage, color="tab:blue", linestyle="--", label=f"Cross {item.cross.voltage:g} V")
         axis.axvline(item.bar.voltage, color="tab:orange", linestyle="--", label=f"Bar {item.bar.voltage:g} V")
         axis.set(xlabel="Voltage [V]", ylabel=f"Power [{label}]",

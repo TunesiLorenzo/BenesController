@@ -260,7 +260,7 @@ Two workflows use a routed chip: WDM configuration evaluation (does each wavelen
 
 Every input carries its own comb line, so one OSA trace per output shows the routed signal and the leakage of all other inputs at once.
 
-1. In **Dataset coverage → Six-laser OSA scan configuration**, set **Comb lines [nm]** (or use **Detect six lasers**), **Line window ± [nm]**, **OSA/JDSU settling [s]** and **Evaluate sweeps per output** (1–16, default 10). Press **Save six-laser configuration**.
+1. In **Dataset coverage → Six-laser OSA scan configuration**, set **Comb lines [nm]** (or use **Detect six lasers**), **Line window ± [nm]**, **Extra JDSU settle [s]** (default 0.25), **Extra OSA settle [s]** (default 0), and **Evaluate sweeps per output** (1–16, default 10). Press **Save six-laser configuration** to save both delays.
 2. Route a permutation on the Routing tab.
 3. Press **Evaluate Configuration**. The JDSU steps through all six outputs; each output waits the settling delay and averages the sweeps in linear power.
 
@@ -290,7 +290,7 @@ A dataset folder records which routed input→output pairs have been measured fo
 3. Select the **Inputs** and **Outputs** the reading represents, add a comment, and press **Save latest acquisition**. Each record gets its own folder under `Measurements/` with the raw CSV and a `measurement.json` sidecar.
 4. Press **Analyse** to list missing pairs; the full list goes to `coverage_report.csv`.
 
-For batch runs use **Scan active control state**, **Run all 720 output permutations**, or **Run all 4096 switch states** (every bar/cross combination of the 12 MZIs, $2^{12}$). **Stop after current output** keeps completed configurations, and the original control state is restored at the end.
+For batch runs use **Scan active control state**, **Run all 720 output permutations**, or **Run all 4096 switch states** (every bar/cross combination of the 12 MZIs, $2^{12}$). The live optical power tracker shows routed transmission as dB and percent of that wavelength's measured power across all six outputs in one column. **Live optical viewer…** opens six output plots for a completed configuration. Its dropdown includes earlier runs in the linked dataset and uses the permutation's lexicographic number (1–720), a stable path alternative number when switch states were saved, and the run timestamp. It follows the latest until an earlier scan is selected. The orange marker on each plot shows that output's expected input wavelength. The **Permutation summary** tab lists the input-to-output mapping, target transmission as dB and percent, and target peak and window-mean power at each output, without crosstalk. **Stop after current output** keeps completed configurations, and the original control state is restored at the end.
 
 ## Typical session, files and troubleshooting
 
@@ -328,7 +328,7 @@ To rehearse without hardware, use a dry-run voltage board, OSA **Simulate** and 
 | Calibration will not start | No initialized dataset, or (meter method) a mapped TEC is off | Initialize a dataset; turn on every mapped TEC |
 | A voltage is refused | It reaches the 70 mA/µm² break limit | Lower the scan limit; check **J peak/V** for that pin |
 | A confirmation prompt appears | Above the 50 mA/µm² safe limit, or outside 0–5 V | Confirm once, or lower the voltage |
-| A trace shows light from the previous output | Settling too short for the OSA sweep | Raise **OSA/JDSU settling** to cover one full sweep |
+| A trace shows light from the previous output | The OSA trace freshness check or optical settling needs investigation | Check that the OSA is sweeping and increase **Extra OSA settle** if needed |
 | Arduino read fails with no clean samples | Every sample flagged as a jump or above **Ceiling [ADC]** (80) | Reduce optical power or check the detector range; adjust **Jump guard [ms]** |
 | Crosstalk meter test or scan will not start | The HP 8152A stream is running | Press **Stop** on the HP 8152A page |
 | A κ cell is empty or n.s. | Pair unmeasurable, pretest saw no movement, or only one heater has resistances | Read the **Plan** output; enter both heaters' resistances |

@@ -890,7 +890,8 @@ class HardwareMixin:
 
         ttk.Button(body, text="List", command=list_resources).grid(row=2, column=2, sticky="w", padx=(6, 0))
         ttk.Label(body, text="Extra settle [s]").grid(row=3, column=0, sticky="w", pady=4)
-        ttk.Entry(body, textvariable=self.osa_switch_settle_var, width=10).grid(
+        ttk.Combobox(body, textvariable=self.osa_switch_settle_var,
+                     values=("0", "0.25", "0.5", "1", "3"), width=8).grid(
             row=3, column=1, sticky="w", padx=(12, 0), pady=4)
         ttk.Checkbutton(body, text="Dry run", variable=self.osa_switch_dry_run_var).grid(
             row=4, column=1, sticky="w", padx=(12, 0), pady=(4, 0))

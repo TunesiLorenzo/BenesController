@@ -12,5 +12,5 @@
   "evaluation_sweeps": 10,
   "half_window_nm": 0.2,
   "presets": {},
-  "settle_s": 2.0
+  "settle_s": 0.0
 }

@@ -9,12 +9,14 @@ from itertools import product
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from benes.gui.theme import ACCENT, PANEL, POST_SWITCH_SWEEPS, TEXT, WDM_COLORS, WIRE
+from benes.gui.theme import ACCENT, BG, PANEL, POST_SWITCH_SWEEPS, TEXT, WDM_COLORS, WIRE
 from benes.gui.widgets import VerticalScrolledFrame, cap_width
 from benes.hardware import osa
 from benes.hardware.osa_output_switch import OUTPUTS
 from benes.measurements.dataset_registry import (analyze_dataset, create_dataset, save_measurement,
                                                  write_coverage_report)
+from benes.measurements.dataset_view import (format_transmission_share, load_output_spectra, load_target_summary,
+                                             saved_dataset_scans, saved_scan_entry)
 from benes.measurements.spectrum_export import write_spectra
 from benes.measurements.wdm_comb import (INPUTS, create_wdm_folder, evaluate_configuration,
                                          power_ratio_db, routed_wavelengths, save_wdm_scan, scan_outputs,
@@ -36,6 +38,10 @@ class DatasetMixin:
         metadata file.  File names alone cannot tell whether a trace represents
         one route, a fan-in measurement, or a full parallel acquisition.
         """
+        self.dataset_scan_views = {}
+        self.dataset_scan_entries = {}
+        self.dataset_scan_latest = None
+        self.dataset_scan_viewer = None
         controls_column = ttk.Frame(self.dataset_tab, padding=(18, 18, 8, 18))
         controls_column.pack(side="left", fill="y")
         control_scroll = VerticalScrolledFrame(controls_column)
@@ -124,6 +130,8 @@ class DatasetMixin:
         self.dataset_batch_stop_button = ttk.Button(batch, text="Stop after current output", command=self.stop_dataset_batch,
                                                     state="disabled")
         self.dataset_batch_stop_button.pack(fill="x", pady=(5, 0))
+        ttk.Button(batch, text="Live optical viewer…", command=self.show_dataset_scan_viewer).pack(
+            fill="x", pady=(5, 0))
 
         save_box = ttk.LabelFrame(controls, text="Save latest acquisition", padding=10)
         save_box.pack(fill="x", pady=(12, 0))
@@ -142,10 +150,11 @@ class DatasetMixin:
                   font=("Segoe UI", 14, "bold")).pack(anchor="w")
         ttk.Label(summary, text="The report counts the six routed input→output paths required for each expected permutation.",
                   wraplength=600).pack(anchor="w", pady=(2, 8))
-        ttk.Label(summary, text="Live optical power ratios", foreground=ACCENT,
+        ttk.Label(summary, text="Permutation tracker · live optical power", foreground=ACCENT,
                   font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(4, 2))
-        ttk.Label(summary, text=("Each row is one input wavelength at one switch state. Transmission and crosstalk "
-                                 "are in dB relative to that wavelength's linear power summed across measured outputs."),
+        ttk.Label(summary, text=("Each row is one input wavelength at one switch state. Transmission shows dB and "
+                                 "percent of that wavelength's power summed across all six outputs; other output "
+                                 "columns show crosstalk in dB."),
                   foreground="#9baec6", wraplength=600).pack(anchor="w", pady=(0, 4))
         metrics_frame = ttk.Frame(summary)
         metrics_frame.pack(fill="x", pady=(0, 10))
@@ -153,10 +162,10 @@ class DatasetMixin:
                          tuple(f"out{port}" for port in OUTPUTS)
         self.dataset_metrics_table = ttk.Treeview(metrics_frame, columns=metric_columns, show="headings", height=8)
         headings = {"state": "Switch state", "permutation": "Outputs", "input": "Input", "wavelength": "λ [nm]",
-                    "total": "Total [dBm]", "expected": "Expected", "transmission": "Tx / total [dB]"}
+                    "total": "Total [dBm]", "expected": "Expected", "transmission": "Tx / total [dB (%)]"}
         headings.update({f"out{port}": f"Out {port} XT / total [dB]" for port in OUTPUTS})
         widths = {"state": 125, "permutation": 110, "input": 60, "wavelength": 85, "total": 85,
-                  "expected": 75, "transmission": 115, **{f"out{port}": 125 for port in OUTPUTS}}
+                  "expected": 75, "transmission": 170, **{f"out{port}": 125 for port in OUTPUTS}}
         for column in metric_columns:
             self.dataset_metrics_table.heading(column, text=headings[column])
             self.dataset_metrics_table.column(column, width=widths[column], anchor="center", stretch=False)
@@ -213,20 +222,44 @@ class DatasetMixin:
         ttk.Label(scan, text="Line window ± [nm]").grid(row=7, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(scan, textvariable=self.wdm_window_var, width=8).grid(
             row=7, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
-        ttk.Label(scan, text="OSA/JDSU settling [s]").grid(row=8, column=0, sticky="w", pady=2)
-        ttk.Entry(scan, textvariable=self.wdm_settle_var, width=8).grid(
+        ttk.Label(scan, text="Extra JDSU settle [s]").grid(row=8, column=0, sticky="w", pady=2)
+        ttk.Combobox(scan, textvariable=self.osa_switch_settle_var,
+                     values=("0", "0.25", "0.5", "1", "3"), width=8).grid(
             row=8, column=1, sticky="w", padx=(8, 0), pady=2)
-        ttk.Label(scan, text="Evaluate sweeps per output").grid(row=9, column=0, sticky="w", pady=2)
-        ttk.Entry(scan, textvariable=self.wdm_evaluation_sweeps_var, width=8).grid(
+        ttk.Label(scan, text="Extra OSA settle [s]").grid(row=9, column=0, sticky="w", pady=2)
+        ttk.Combobox(scan, textvariable=self.wdm_settle_var,
+                     values=("0", "0.5", "1", "2"), width=8).grid(
             row=9, column=1, sticky="w", padx=(8, 0), pady=2)
-        ttk.Button(scan, text="Save six-laser configuration", command=self.save_wdm_plan).grid(
-            row=10, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        ttk.Label(scan, text=("Evaluate Configuration always scans all six outputs using this saved plan. "
-                              "Dataset Coverage has separate batch acquisition actions."), foreground="#9baec6",
-                  wraplength=280).grid(row=11, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(scan, text="Evaluate sweeps per output").grid(row=10, column=0, sticky="w", pady=2)
+        ttk.Entry(scan, textvariable=self.wdm_evaluation_sweeps_var, width=8).grid(
+            row=10, column=1, sticky="w", padx=(8, 0), pady=2)
+        ttk.Button(scan, text="Save six-laser configuration", command=self.save_dataset_scan_configuration).grid(
+            row=11, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(scan, text=("JDSU settled status and channel readback are checked before these extra delays. "
+                              "OSA reads still wait for two fresh sweeps."), foreground="#9baec6",
+                  wraplength=280).grid(row=12, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Label(scan, textvariable=self.wdm_status_var, foreground="#9baec6", wraplength=280).grid(
-            row=12, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            row=13, column=0, columnspan=2, sticky="w", pady=(6, 0))
         self.update_wdm_routing()
+
+    def save_dataset_scan_configuration(self):
+        """Persist the WDM plan and JDSU delay shown together in the scan panel."""
+        try:
+            settle_s = float(self.osa_switch_settle_var.get())
+            if not 0 <= settle_s <= 60:
+                raise ValueError("Extra JDSU settling time must be between 0 and 60 seconds")
+        except ValueError as error:
+            messagebox.showerror("OSA output switch", str(error), parent=self)
+            return False
+        try:
+            self.save_wdm_plan(quiet=True)
+        except (OSError, ValueError) as error:
+            messagebox.showerror("WDM plan", str(error), parent=self)
+            return False
+        if not self.save_osa_output_switch_settings():
+            return False
+        self.wdm_status_var.set("Six-laser plan and both settling delays saved.")
+        return True
 
     @staticmethod
     def last_dataset_folder():
@@ -314,15 +347,36 @@ class DatasetMixin:
                 raise RuntimeError("Connect the OSA output switch before filling the dataset")
             for output in OUTPUTS:
                 switch.channel_for(output)
+            if not simulate:
+                if not self.newport_controller.connected:
+                    raise RuntimeError("Connect the Newport laser controller in Hardware → Newport lasers "
+                                       "so the batch can turn on the six input lasers")
+                if self.newport_panel.busy:
+                    raise RuntimeError("Wait for the Newport command to finish")
             missing_calibration = [name for name in self.network.switches
                                    if self.controller.settings["calibration"][name]["cross"] is None or
                                    self.controller.settings["calibration"][name]["straight"] is None]
             if missing_calibration:
                 raise ValueError("Calibrate every MZI before automatically applying control states")
-            batch_sizes = {"all": "720 output permutations", "states": "4096 switch states"}
+            if scope == "active":
+                configurations = [(self.active_dataset_permutation(), dict(self.network.states))]
+            elif scope == "all":
+                # Resume: permutations the dataset already covers on all six paths are not measured again.
+                complete = {item["permutation"] for item in analyze_dataset(root)["configurations"]
+                            if item["complete"]}
+                configurations = [item for item in self.all_permutation_control_states()
+                                  if item[0] not in complete]
+                if not configurations:
+                    messagebox.showinfo("Dataset complete", "Every one of the 720 permutations is already "
+                                        "complete in this dataset.", parent=self)
+                    return
+            else:
+                configurations = self.all_switch_control_states()
+            batch_sizes = {"all": f"{len(configurations)} missing output permutation(s)",
+                           "states": "4096 switch states"}
             if scope in batch_sizes and not messagebox.askyesno(
-                    f"Run all {batch_sizes[scope]}",
-                    f"This will drive and measure all {batch_sizes[scope]}, with six OSA output scans each. "
+                    "Run dataset batch",
+                    f"This will drive and measure {batch_sizes[scope]}, with six OSA output scans each. "
                     "It can take a long time. Continue?", parent=self):
                 return
         except (OSError, RuntimeError, ValueError) as error:
@@ -331,12 +385,6 @@ class DatasetMixin:
 
         original_states = dict(self.network.states)
         original_zero = set(self.zero_volt_switches)
-        if scope == "active":
-            configurations = [(self.active_dataset_permutation(), dict(self.network.states))]
-        elif scope == "all":
-            configurations = self.all_permutation_control_states()
-        else:
-            configurations = self.all_switch_control_states()
         settings = self.wdm_plan.settings
         comment = self.dataset_comment_var.get()
         self.dataset_batch_running = True
@@ -351,12 +399,19 @@ class DatasetMixin:
         for tab in (self.route_tab, self.hardware_tab, self.calibration_tab, self.crosstalk_tab):
             self.set_tab_state(tab, "disabled")
         self.dataset_metrics_table.delete(*self.dataset_metrics_table.get_children())
+        self.refresh_dataset_scan_views(root)
         self.dataset_status_var.set(f"Preparing {len(configurations)} configuration(s) for acquisition...")
         stop_event = self.dataset_batch_stop_event
 
         def worker():
             saved, error = 0, None
             try:
+                if not simulate:
+                    self.after(0, lambda: self.dataset_status_var.set("Checking the six input lasers..."))
+                    switched = self.laser_bank.light_all()
+                    if switched:
+                        self.after(0, lambda ports=", ".join(map(str, switched)): self.dataset_status_var.set(
+                            f"Turned on the laser(s) for input {ports}."))
                 for index, (permutation, states) in enumerate(configurations, start=1):
                     if stop_event.is_set():
                         break
@@ -403,6 +458,8 @@ class DatasetMixin:
                         extra={"results_folder": str(folder), "batch_scope": scope})
                     save_wdm_scan(record, results, context, comment)
                     saved += 1
+                    self.after(0, lambda i=index, p=permutation, path=record:
+                               self.register_dataset_scan_view(i, p, path))
                     self.after(0, lambda i=index: self.update_activity(
                         "dataset", detail=f"Saved dataset configuration {i}/{len(configurations)}"))
             except Exception as error_value:
@@ -446,8 +503,167 @@ class DatasetMixin:
             self.dataset_metrics_table.insert("", "end", values=(
                 state, " ".join(map(str, permutation)), f"In {item.input_port}", f"{item.wavelength_nm:.3f}",
                 fmt(item.total_power_dbm), f"Out {item.expected_output}",
-                fmt(power_ratio_db(item.normalized_transmission)),
+                format_transmission_share(item.normalized_transmission),
                 *crosstalk))
+
+    def register_dataset_scan_view(self, index, permutation, folder):
+        """Make a completed configuration selectable without retaining its traces in RAM."""
+        entry = saved_scan_entry(folder)
+        if entry is None:
+            return
+        label = entry["label"]
+        previous_latest = self.dataset_scan_latest
+        self.dataset_scan_entries[label] = entry
+        self.dataset_scan_views = {item["label"]: item["folder"] for item in sorted(
+            self.dataset_scan_entries.values(), key=lambda item: (
+                item["number"], item["alternative"][0] if item["alternative"] else 0,
+                item["stamp"]))}
+        self.dataset_scan_latest = label
+        if self.dataset_scan_viewer is not None and self.dataset_scan_viewer.winfo_exists():
+            self.dataset_scan_picker.configure(values=tuple(self.dataset_scan_views))
+            if not self.dataset_scan_choice.get() or self.dataset_scan_choice.get() == previous_latest:
+                self.dataset_scan_choice.set(label)
+                self.draw_dataset_scan_view()
+
+    def refresh_dataset_scan_views(self, root=None):
+        """Include scans from previous sessions of the linked dataset."""
+        if root is None:
+            try:
+                root = self.dataset_root()
+            except ValueError as error:
+                messagebox.showerror("Live optical viewer", str(error), parent=self.dataset_scan_viewer or self)
+                return
+        root = Path(root)
+        entries = saved_dataset_scans(root)
+        self.dataset_scan_entries = {item["label"]: item for item in entries}
+        self.dataset_scan_views = {item["label"]: item["folder"] for item in entries}
+        self.dataset_scan_latest = max(entries, key=lambda item: item["stamp"])["label"] if entries else None
+        if self.dataset_scan_viewer is not None and self.dataset_scan_viewer.winfo_exists():
+            choice = self.dataset_scan_choice.get()
+            self.dataset_scan_picker.configure(values=tuple(self.dataset_scan_views))
+            if choice not in self.dataset_scan_views:
+                self.dataset_scan_choice.set(self.dataset_scan_latest or "")
+                if self.dataset_scan_latest:
+                    self.draw_dataset_scan_view()
+                else:
+                    self.dataset_scan_view_status.set("No completed six-output scans in this dataset yet.")
+                    self.dataset_scan_permutation_var.set("Permutation: no scan selected")
+                    self.dataset_scan_summary.delete(*self.dataset_scan_summary.get_children())
+                    for axis in self.dataset_scan_axes:
+                        axis.clear()
+                    self.dataset_scan_canvas.draw_idle()
+            else:
+                self.draw_dataset_scan_view()
+
+    def show_dataset_scan_viewer(self):
+        """Display six spectra from the current or an earlier dataset run."""
+        if self.dataset_scan_viewer is not None and self.dataset_scan_viewer.winfo_exists():
+            self.refresh_dataset_scan_views()
+            self.dataset_scan_viewer.lift()
+            return
+        try:
+            root = self.dataset_root()
+        except ValueError as error:
+            messagebox.showerror("Live optical viewer", str(error), parent=self)
+            return
+        self.refresh_dataset_scan_views(root)
+        try:
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            from matplotlib.figure import Figure
+        except ImportError:
+            messagebox.showerror("Batch spectra unavailable", "Install matplotlib to view OSA spectra.", parent=self)
+            return
+        window = tk.Toplevel(self)
+        window.title("Live optical viewer")
+        self.fit_dialog_to_screen(window, preferred_width=1150, preferred_height=800)
+        self.dataset_scan_viewer = window
+        controls = ttk.Frame(window, padding=10)
+        controls.pack(fill="x")
+        ttk.Label(controls, text="Saved configuration").pack(side="left")
+        self.dataset_scan_choice = tk.StringVar(value=self.dataset_scan_latest or "")
+        self.dataset_scan_picker = ttk.Combobox(
+            controls, textvariable=self.dataset_scan_choice,
+            values=tuple(self.dataset_scan_views), state="readonly", width=66)
+        self.dataset_scan_picker.pack(side="left", padx=(8, 0))
+        self.dataset_scan_picker.bind("<<ComboboxSelected>>", lambda _event: self.draw_dataset_scan_view())
+        ttk.Button(controls, text="Refresh", command=self.refresh_dataset_scan_views).pack(side="left", padx=(8, 0))
+        ttk.Label(controls, text="Latest scan follows automatically until you select an earlier one.").pack(
+            side="left", padx=(12, 0))
+        self.dataset_scan_view_status = tk.StringVar(value="Waiting for a completed configuration…")
+        ttk.Label(window, textvariable=self.dataset_scan_view_status).pack(anchor="w", padx=10)
+        pages = ttk.Notebook(window)
+        pages.pack(fill="both", expand=True)
+        spectra_page = ttk.Frame(pages)
+        summary_page = ttk.Frame(pages, padding=16)
+        pages.add(spectra_page, text="Output spectra")
+        pages.add(summary_page, text="Permutation summary")
+        self.dataset_scan_permutation_var = tk.StringVar(value="Permutation: waiting for a completed scan")
+        ttk.Label(summary_page, textvariable=self.dataset_scan_permutation_var,
+                  font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 12))
+        ttk.Label(summary_page, text="Tx / total is the routed line's share of its wavelength's measured power over all six outputs.",
+                  foreground="#9baec6").pack(anchor="w", pady=(0, 10))
+        columns = ("output", "input", "wavelength", "share", "peak", "mean")
+        self.dataset_scan_summary = ttk.Treeview(summary_page, columns=columns, show="headings", height=6)
+        for column, heading, width in (
+                ("output", "Output", 90), ("input", "Target input", 110),
+                ("wavelength", "Target λ [nm]", 140),
+                ("share", "Tx / total [dB (%)]", 190),
+                ("peak", "Target peak [dBm]", 165), ("mean", "Window mean [dBm]", 175)):
+            self.dataset_scan_summary.heading(column, text=heading)
+            self.dataset_scan_summary.column(column, width=width, anchor="center", stretch=False)
+        self.dataset_scan_summary.pack(fill="x")
+        summary_scroll = ttk.Scrollbar(summary_page, orient="horizontal",
+                                       command=self.dataset_scan_summary.xview,
+                                       style="Accent.Horizontal.TScrollbar")
+        self.dataset_scan_summary.configure(xscrollcommand=summary_scroll.set)
+        summary_scroll.pack(fill="x")
+        figure = Figure(figsize=(11, 7), facecolor=BG)
+        self.dataset_scan_axes = [figure.add_subplot(3, 2, output) for output in range(1, 7)]
+        figure.subplots_adjust(left=0.07, right=0.98, top=0.94, bottom=0.08, hspace=0.58, wspace=0.22)
+        self.dataset_scan_canvas = FigureCanvasTkAgg(figure, master=spectra_page)
+        self.dataset_scan_canvas.get_tk_widget().pack(fill="both", expand=True)
+        if self.dataset_scan_latest:
+            self.draw_dataset_scan_view()
+        else:
+            self.dataset_scan_canvas.draw_idle()
+
+    def draw_dataset_scan_view(self):
+        folder = self.dataset_scan_views.get(self.dataset_scan_choice.get())
+        if folder is None:
+            return
+        try:
+            spectra = load_output_spectra(folder)
+            permutation, summary = load_target_summary(folder)
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+            messagebox.showerror("Batch spectra unavailable", str(error), parent=self.dataset_scan_viewer)
+            return
+        for axis, (output, input_port, wavelength, wave, power) in zip(self.dataset_scan_axes, spectra):
+            axis.clear()
+            axis.set_facecolor(PANEL)
+            axis.plot(wave, power, color="#78b9ff", linewidth=0.9)
+            axis.axvline(wavelength, color="#ffbe69", linewidth=1.5, linestyle="--")
+            axis.set_title(f"Out {output}  ←  In {input_port} target: {wavelength:g} nm",
+                           color=TEXT, fontsize=10)
+            axis.tick_params(colors=TEXT, labelsize=8)
+            axis.grid(True, alpha=0.2)
+            axis.set_xlabel("Wavelength [nm]", color=TEXT, fontsize=8)
+            axis.set_ylabel("Power [dBm]", color=TEXT, fontsize=8)
+        entry = self.dataset_scan_entries.get(self.dataset_scan_choice.get())
+        identity = (f"Permutation P{entry['number']:03d}"
+                    + (f" · Path {entry['alternative'][0]}/{entry['alternative'][1]}"
+                       if entry['alternative'] else "")) if entry else "Permutation"
+        self.dataset_scan_permutation_var.set(
+            identity + "\n" + "   ".join(f"In {input_port} → Out {output}"
+                                          for input_port, output in enumerate(permutation, start=1)))
+        self.dataset_scan_summary.delete(*self.dataset_scan_summary.get_children())
+        for output, input_port, wavelength, peak, mean, share in summary:
+            self.dataset_scan_summary.insert("", "end", values=(
+                f"Out {output}", f"In {input_port}", f"{wavelength:.3f}",
+                format_transmission_share(share),
+                "—" if peak is None else f"{peak:.2f}",
+                "—" if mean is None else f"{mean:.2f}"))
+        self.dataset_scan_view_status.set(f"Showing configuration {self.dataset_scan_choice.get()}")
+        self.dataset_scan_canvas.draw_idle()
 
     def stop_dataset_batch(self):
         if self.dataset_batch_stop_event is not None:
