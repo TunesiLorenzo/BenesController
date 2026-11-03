@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from benes.measurements.mzi_characterization import FIT_TRUST_FRACTION, MZIFit, fit_mzi_response
+from benes.measurements.mzi_fit import FIT_TRUST_FRACTION, MZIFit, fit_mzi_response
 
 
 CROSS_COLOR = "#2a78d6"

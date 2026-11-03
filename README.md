@@ -10,6 +10,13 @@ No pip packages are required. Tkinter is included in the standard Windows Python
 Physical board control additionally needs the `pyserial` dependency used by the
 sibling VoltageTuner project.
 
+## Development checks
+
+Run the full standard-library test suite with `python -m unittest discover -v`.
+For repeatable local refactor checks, run `powershell -ExecutionPolicy Bypass -File tools/verify.ps1`.
+It always compiles the source and runs the tests; after `python -m pip install -e ".[dev]"`, it also runs Ruff
+and reports coverage.
+
 ## Project layout
 
 ```text

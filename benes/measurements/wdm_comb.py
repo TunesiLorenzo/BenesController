@@ -20,9 +20,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from benes.hardware.osa import trim_spurious_tail
 from benes.hardware.osa_output_switch import fiber_number
-from benes.measurements.osa_reading import validate_sweeps
+from benes.measurements.osa_reading import read_output_spectrum, validate_sweeps
 from benes.measurements.spectrum_export import write_spectra
 from benes.paths import app_dir
 
@@ -196,6 +195,15 @@ def line_power(wavelength, power_dbm, center_nm: float, half_window_nm: float) -
     return LinePower(peak_dbm, peak_nm, 10 * math.log10(mean_mw))
 
 
+def line_powers(wavelength, power_dbm, wavelengths, half_window_nm) -> dict[int, float | None]:
+    """Peak dBm for each input line in one validated OSA trace."""
+    return {
+        source: None if (line := line_power(wavelength, power_dbm, center_nm, half_window_nm)) is None
+        else line.peak_dbm
+        for source, center_nm in wavelengths.items()
+    }
+
+
 @dataclass
 class WDMOutputResult:
     output: int
@@ -319,7 +327,7 @@ def scan_outputs(switch, read_spectrum: Callable[[int], tuple], outputs, mapping
             step = min(0.1, remaining)
             sleep(step)
             remaining -= step
-        wave, power = trim_spurious_tail(*read_spectrum(output))
+        wave, power = read_output_spectrum(read_spectrum, output - 1)
         routed_input, wavelength = routed[output]
         lines = {port: line_power(wave, power, assignment[str(port)], half_window_nm)
                  for port in INPUTS if assignment[str(port)] is not None}

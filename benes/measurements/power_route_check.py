@@ -9,7 +9,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from benes.measurements.laser_calibration import _check_stop, _wait, reset_all
+from benes.measurements.laser_calibration import reset_all
+from benes.measurements.measurement_control import check_stop, wait
 from benes.measurements.mzi_characterization import mw_to_dbm
 
 
@@ -100,7 +101,7 @@ def run_power_route_check(controller, lasers, selector, read_power, network, set
         lasers.begin()
         current_source = None
         for index, (source, target, route) in enumerate(plan, start=1):
-            _check_stop(stop_event)
+            check_stop(stop_event)
             if source != current_source:
                 lasers.light_only(source, minimum_settle_s=5.0)
                 current_source = source
@@ -114,10 +115,10 @@ def run_power_route_check(controller, lasers, selector, read_power, network, set
                 if voltages[name] != required:
                     controller.drive_voltage(name, required)
                     voltages[name] = required
-            _wait(settle_s, stop_event, sleep)
+            wait(settle_s, stop_event, sleep)
             powers = []
             for output in range(network.size):
-                _check_stop(stop_event)
+                check_stop(stop_event)
                 selector.select_output(output + 1, extra_settle_s=0)
                 power = read_power()
                 if power is not None and (not math.isfinite(power) or power < 0):

@@ -18,6 +18,21 @@ FRESH_SWEEPS = 2
 MAX_SWEEPS = 16
 
 
+def trim_spectrum(spectrum) -> tuple[list[float], list[float]]:
+    """Validate and remove the OSA's spurious tail from one raw spectrum."""
+    wave, power = osa.trim_spurious_tail(*spectrum)
+    if not wave or len(wave) != len(power):
+        raise ValueError("The OSA returned an empty or mismatched spectrum")
+    if not all(math.isfinite(value) for value in (*wave, *power)):
+        raise ValueError("The OSA returned non-finite spectrum values")
+    return wave, power
+
+
+def read_output_spectrum(read_spectrum: Callable[[int], tuple], output: int) -> tuple[list[float], list[float]]:
+    """Read and validate the spectrum for a zero-based chip ``output``."""
+    return trim_spectrum(read_spectrum(output + 1))
+
+
 def validate_sweeps(value) -> int:
     try:
         count = int(value)

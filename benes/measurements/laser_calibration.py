@@ -24,18 +24,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from benes.hardware.osa import trim_spurious_tail
 from benes.hardware.osa_output_switch import fiber_number
+from benes.measurements.measurement_control import CalibrationStopped, check_stop, select_output, wait
+from benes.measurements.osa_reading import read_output_spectrum
 from benes.measurements.spectrum_export import write_spectra
-from benes.measurements.wdm_comb import input_fiber_number, line_power
+from benes.measurements.wdm_comb import input_fiber_number, line_powers
 
 CALIBRATION_SUBFOLDER = "MZI_calibration"
 # A state check passes when the commanded line beats the other by this margin.
 DEFAULT_PASS_DB = 10.0
-
-
-class CalibrationStopped(RuntimeError):
-    """The user stopped a calibration between two measurements."""
 
 
 @dataclass(frozen=True)
@@ -133,44 +130,6 @@ def switch_probes(network, states, name) -> tuple[SwitchProbe, ...]:
                  for output in range(network.size) if crossed.index(output) != straight.index(output))
 
 
-def line_powers(wave, power, wavelengths, half_window_nm) -> dict[int, float | None]:
-    """Peak dBm of each input's comb line in a trimmed OSA trace."""
-    lines = {}
-    for source, wavelength in wavelengths.items():
-        line = line_power(wave, power, wavelength, half_window_nm)
-        lines[source] = None if line is None else line.peak_dbm
-    return lines
-
-
-def _check_stop(stop_event) -> None:
-    if stop_event is not None and stop_event.is_set():
-        raise CalibrationStopped("Calibration stopped")
-
-
-def _wait(seconds, stop_event, sleep) -> None:
-    # Short steps keep Stop responsive during long settling delays.
-    while seconds > 0:
-        _check_stop(stop_event)
-        step = min(0.1, seconds)
-        sleep(step)
-        seconds -= step
-
-
-def _select(switch, output) -> None:
-    # A cached output number cannot establish where the physical JDSU is now.
-    # The selector confirms its channel readback after every command.
-    switch.select_output(output + 1)
-
-
-def _read(read_spectrum, output) -> tuple[list, list]:
-    wave, power = trim_spurious_tail(*read_spectrum(output + 1))
-    if not wave:
-        raise ValueError("The OSA returned an empty spectrum")
-    if not all(math.isfinite(value) for value in (*wave, *power)):
-        raise ValueError("The OSA returned non-finite spectrum values")
-    return wave, power
-
-
 def evaluate_switches(network, states, matrix) -> dict[str, SwitchCheck]:
     """Grade each MZI from line powers {output: {input: dBm}}, assuming the others are in ``states``."""
     checks = {}
@@ -193,9 +152,9 @@ def check_states(network, states, switch, read_spectrum, wavelengths, half_windo
     outputs = sorted(range(network.size), key=lambda output: output + 1 != switch.routed_output)
     readouts = []
     for index, output in enumerate(outputs, start=1):
-        _check_stop(stop_event)
-        _select(switch, output)
-        wave, power = _read(read_spectrum, output)
+        check_stop(stop_event)
+        select_output(switch, output)
+        wave, power = read_output_spectrum(read_spectrum, output)
         readout = OutputReadout(output, tuple(wave), tuple(power),
                                 line_powers(wave, power, wavelengths, half_window_nm))
         readouts.append(readout)
@@ -237,7 +196,7 @@ def check_alignment(controller, switch, read_spectrum, network, wavelengths, hal
     _require_ready(controller, network, settle_s=settle_s)
     try:
         reset_all(controller, network)
-        _wait(settle_s, stop_event, sleep)
+        wait(settle_s, stop_event, sleep)
         return check_states(network, reference_states(network), switch, read_spectrum, wavelengths,
                             half_window_nm, "Alignment (all 0 V)", on_output, stop_event)
     finally:
@@ -255,7 +214,7 @@ def check_calibrated_states(controller, switch, read_spectrum, network, states, 
     if missing:
         raise ValueError(f"Calibrate {', '.join(missing)} before checking these states")
     controller.apply_calibrated_states(states)
-    _wait(settle_s, stop_event, sleep)
+    wait(settle_s, stop_event, sleep)
     return check_states(network, states, switch, read_spectrum, wavelengths, half_window_nm,
                         label, on_output, stop_event)
 

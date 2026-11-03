@@ -29,8 +29,8 @@ from types import SimpleNamespace
 from typing import Sequence
 
 from benes.measurements.crosstalk_results import PLOT_X_POWER, PLOT_X_VOLTAGE, plot_x_values
-from benes.measurements.mzi_characterization import (EXTREME_TIE_FRACTION, MZIFit, SweepPoint, draw_phase_shifts,
-                                                     fit_trusted, fitted_extremes, mw_to_dbm, quadrature_point)
+from benes.measurements.mzi_characterization import draw_phase_shifts, mw_to_dbm, quadrature_point
+from benes.measurements.mzi_fit import EXTREME_TIE_FRACTION, MZIFit, SweepPoint, fit_trusted, fitted_extremes
 
 BRIGHT_SUFFIX = " (victim bright)"
 

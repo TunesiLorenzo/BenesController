@@ -12,7 +12,9 @@ import math
 import time
 from dataclasses import dataclass
 
-from benes.measurements.laser_calibration import _check_stop, _read, _select, _wait, line_powers
+from benes.measurements.measurement_control import check_stop, select_output, wait
+from benes.measurements.osa_reading import read_output_spectrum
+from benes.measurements.wdm_comb import line_powers
 
 OBJECTIVE_LEAK, OBJECTIVE_THROUGH = "leak", "through"
 # Half-width of the three-point bracket, and the narrowest one before an MZI counts as done.
@@ -187,12 +189,12 @@ def osa_line_reader(switch, read_spectrum, wavelengths, half_window_nm):
         current["source"] = source
 
     def select_output(output):
-        _select(switch, output)
+        select_output(switch, output)
         current["output"] = output
 
     def read():
         source = current["source"]
-        wave, power = _read(read_spectrum, current["output"])
+        wave, power = read_output_spectrum(read_spectrum, current["output"])
         dbm = line_powers(wave, power, {source: wavelengths[source]}, half_window_nm)[source]
         return 0.0 if dbm is None else 10 ** (dbm / 10)
 
@@ -214,19 +216,19 @@ def optimize_paths(controller, plan, read_power, *, objective=OBJECTIVE_LEAK, li
     paths = []
 
     def drive(name, voltage):
-        _check_stop(stop_event)
+        check_stop(stop_event)
         controller.drive_voltage(name, voltage)
-        _wait(settle_s, stop_event, sleep)
+        wait(settle_s, stop_event, sleep)
 
     def read():
-        _check_stop(stop_event)
+        check_stop(stop_event)
         return read_power()
 
     def routed(output):
         if select_output is None:
             return None
         select_output(output)
-        _wait(settle_s, stop_event, sleep)
+        wait(settle_s, stop_event, sleep)
         return read()
 
     for source, output, switches in plan:

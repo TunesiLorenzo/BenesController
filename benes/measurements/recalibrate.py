@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Sequence
 
 from benes.measurements.calibration_analysis import CalibrationAnalysisError, find_calibration_files, load_calibration
-from benes.measurements.mzi_characterization import SweepPoint, extract_calibration, fit_trusted
+from benes.measurements.mzi_fit import SweepPoint, extract_calibration, fit_trusted
 from benes.measurements.mzi_probing import Probe
 
 

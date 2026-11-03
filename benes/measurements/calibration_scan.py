@@ -6,7 +6,7 @@ import math
 import time
 from dataclasses import dataclass, field
 
-from benes.hardware import osa
+from benes.measurements.osa_reading import trim_spectrum
 
 
 @dataclass(frozen=True)
@@ -41,11 +41,7 @@ class SpectrumScanPoint(ScanPoint):
 
 def spectrum_scan_point(voltage: float, spectrum, reference_wavelength_nm: float | None = None,
                         half_window_nm: float | None = None) -> SpectrumScanPoint:
-    wavelength, power = osa.trim_spurious_tail(*spectrum)
-    if not wavelength or len(wavelength) != len(power):
-        raise ValueError("The OSA returned an empty or mismatched spectrum")
-    if not all(math.isfinite(value) for value in wavelength) or not all(math.isfinite(value) for value in power):
-        raise ValueError("The OSA returned non-finite spectrum values")
+    wavelength, power = trim_spectrum(spectrum)
     if reference_wavelength_nm is not None:
         if not math.isfinite(reference_wavelength_nm):
             raise ValueError("The OSA reference wavelength must be finite")

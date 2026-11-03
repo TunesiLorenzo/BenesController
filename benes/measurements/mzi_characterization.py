@@ -37,35 +37,22 @@ from datetime import datetime
 from pathlib import Path
 
 from benes.hardware.osa_output_switch import fiber_number
-from benes.measurements.laser_calibration import (CalibrationStopped, _read, _select, _wait, line_powers,
-                                                  reset_all)
+from benes.measurements.laser_calibration import reset_all
+from benes.measurements.measurement_control import CalibrationStopped, check_stop, wait
+from benes.measurements.mzi_fit import (DARK_TIE_DB, DEFAULT_MIN_EXTINCTION_DB, EXTREME_TIE_FRACTION,
+                                        EXTREME_WINDOW_RAD, FIT_TRUST_FRACTION, MZIFit, MZISweep, SweepPoint,
+                                        Reading, extract_calibration, fit_mzi_response, fit_trusted, linear_fit,
+                                        fitted_extremes, LIGHT_MAX_READS, LIGHT_POLL_S, LIGHT_TOLERANCE,
+                                        OSALineDetector, PowerMeterDetector, dbm_to_mw, mw_to_dbm)
 from benes.measurements.mzi_probing import Probe
 
 CROSSTALK_SUBFOLDER = "Crosstalk_matrix"
-# A probed MZI must change the reading by at least this much to be trusted.
-DEFAULT_MIN_EXTINCTION_DB = 3.0
-# Points within this share of the swing of the brightest count as bright.
-EXTREME_TIE_FRACTION = 0.02
-# Points within this many dB of the darkest count as dark: nulls are sharp, so a
-# share of the linear swing would let points 17 dB above the null tie with it.
-DARK_TIE_DB = 1.0
-# The fit only has to find the right fringe, so it is used while its rms stays
-# below this share of the amplitude; the measured points then place the extreme.
-FIT_TRUST_FRACTION = 0.15
-# Around a fitted extreme the response is monotonic on each side for ±π/2; the
-# measured extreme is taken within this phase of it.
-EXTREME_WINDOW_RAD = math.pi / 4
 # Pretest: the aggressor alternates between its sweep limits in low-high-high-low
 # blocks, so a linear drift of the reading cancels from the high-low difference.
 SCREEN_PATTERN = (False, True, True, False) * 2
 # A pretest step must exceed this many standard errors of the readings to count.
 SCREEN_SIGMA = 4.0
 DEFAULT_SCREEN_MIN_PHASE_RAD = 0.02
-# Before a power-meter curve starts, the first point is re-read until two
-# readings agree: a laser can take seconds past its command to emit.
-LIGHT_TOLERANCE = 0.1
-LIGHT_POLL_S = 0.2
-LIGHT_MAX_READS = 25
 # A crosstalk curve is not taken as thermal when light through the aggressor moves it:
 # the quadrature readout folds back as a shift nears ±π/2,
 READOUT_LIMIT_RAD = 1.3
@@ -77,322 +64,10 @@ PATH_MIN_AMPLITUDE_RAD = 0.15
 PATH_RESIDUAL_RATIO = 0.4
 
 
-def dbm_to_mw(dbm):
-    return None if dbm is None else 10 ** (dbm / 10)
-
-
-def mw_to_dbm(mw):
-    return None if mw is None or mw <= 0 else 10 * math.log10(mw)
-
-
-@dataclass(frozen=True)
-class Reading:
-    # Linear power in the detector's unit; None when the detector had no value.
-    power: float | None
-    # The other-state input's line at the same output (OSA only).
-    reference: float | None = None
-
-
-class OSALineDetector:
-    """All lasers on; the OSA reads the probed input's WDM line at the probed output."""
-
-    label = "OSA · all lasers on"
-    unit = "mW"
-
-    def __init__(self, switch, read_spectrum, wavelengths, half_window_nm):
-        self.switch = switch
-        self.read_spectrum = read_spectrum
-        self.wavelengths = dict(wavelengths)
-        self.half_window_nm = half_window_nm
-
-    @property
-    def inputs(self):
-        return tuple(sorted(self.wavelengths))
-
-    @property
-    def outputs(self):
-        return tuple(range(6))
-
-    @property
-    def background_settle_s(self):
-        return getattr(self.switch, "settings", {}).get("settle_s", 0.0)
-
-    def begin(self):
-        pass
-
-    def prepare(self, probe):
-        if probe.input not in self.wavelengths:
-            raise ValueError(f"Input {probe.input + 1} has no WDM line for {probe.name}")
-        _select(self.switch, probe.output)
-
-    def read(self, probe) -> Reading:
-        lines = line_powers(*_read(self.read_spectrum, probe.output), self.wavelengths, self.half_window_nm)
-        return Reading(dbm_to_mw(lines.get(probe.input)), dbm_to_mw(lines.get(probe.other_input)))
-
-    def finish(self):
-        pass
-
-
-class PowerMeterDetector:
-    """One Newport laser lit at a time; a power meter reads one output."""
-
-    def __init__(self, read_power, lasers, unit="mW", switch=None, fixed_output=None, label="Power meter",
-                 begin_curve=None, end_curve=None, rescan_points=None, finish_curve_points=None):
-        if (switch is None) == (fixed_output is None):
-            raise ValueError("Read the power meter through the JDSU or on one fixed output")
-        self.read_power = read_power
-        self.lasers = lasers
-        self.unit = unit
-        self.switch = switch
-        self.fixed_output = fixed_output
-        self.label = label
-        self.begin_curve = begin_curve
-        self.end_curve = end_curve
-        self.rescan_points = rescan_points
-        self.finish_curve_points = finish_curve_points
-
-    @property
-    def inputs(self):
-        return tuple(range(6))
-
-    @property
-    def outputs(self):
-        return tuple(range(6)) if self.switch is not None else (self.fixed_output,)
-
-    @property
-    def background_settle_s(self):
-        laser_wait = getattr(self.lasers, "settings", {}).get("settle_s", 0.0)
-        switch_wait = (getattr(self.switch, "settings", {}).get("settle_s", 0.0)
-                       if self.switch is not None else 0.0)
-        return max(laser_wait, switch_wait)
-
-    def begin(self):
-        self.lasers.begin()
-
-    def prepare(self, probe):
-        if probe.output not in self.outputs:
-            raise ValueError(f"{probe.name} needs the power meter on output {probe.output + 1}")
-        if self.switch is not None:
-            _select(self.switch, probe.output)
-        self.lasers.light_only(probe.input)
-        if self.begin_curve is not None:
-            self.begin_curve()
-
-    def read(self, probe) -> Reading:
-        return Reading(self.read_power())
-
-    def wait_for_light(self, probe, stop_event=None, sleep=time.sleep) -> bool:
-        """Re-read the first point until two readings agree within ``LIGHT_TOLERANCE``.
-
-        Returns False if the reading never settled; the curve then starts anyway.
-        """
-        previous = None
-        stable = False
-        for _ in range(LIGHT_MAX_READS):
-            _check_stop(stop_event)
-            power = self.read_power()
-            if (previous is not None and power is not None and min(previous, power) > 0
-                    and abs(power - previous) <= LIGHT_TOLERANCE * max(previous, power)):
-                stable = True
-                break
-            previous = power
-            _wait(LIGHT_POLL_S, stop_event, sleep)
-        if self.begin_curve is not None:
-            # The warm-up readings are not sweep points.
-            self.begin_curve()
-        return stable
-
-    def finish(self):
-        try:
-            if self.end_curve is not None:
-                self.end_curve()
-        finally:
-            self.lasers.finish()
-
-
-@dataclass(frozen=True)
-class SweepPoint:
-    voltage: float
-    power: float | None
-    reference: float | None = None
-
-    @property
-    def contrast_db(self) -> float | None:
-        """Probed line over the other-state line, when both were measured."""
-        if not self.power or not self.reference or self.power <= 0 or self.reference <= 0:
-            return None
-        return 10 * math.log10(self.power / self.reference)
-
-
-@dataclass(frozen=True)
-class MZIFit:
-    """T(x) = offset + amplitude·(1 + cos(π·x/x_pi + phase0))/2 against heater drive x."""
-
-    offset: float
-    amplitude: float
-    x_pi: float
-    phase0: float
-    rms: float
-    # "mW" of heater power, or "V²" when the heater resistance is unknown.
-    x_unit: str
-
-    def phase(self, x):
-        return math.pi * x / self.x_pi + self.phase0
-
-    def model(self, x):
-        return self.offset + self.amplitude * (1 + math.cos(self.phase(x))) / 2
-
-    @property
-    def phase_per_x(self):
-        """Victim phase per unit of its own heater drive [rad/x_unit]."""
-        return math.pi / self.x_pi
-
-
 def heater_drive(controller, name, voltage) -> tuple[float, str]:
     """Heater power in mW when the resistances are known, otherwise V²."""
     power = controller.heater_power_mw(name, voltage) if hasattr(controller, "heater_power_mw") else None
     return (power, "mW") if power is not None else (voltage * voltage, "V²")
-
-
-def _linear_fit(basis, values):
-    """Least-squares a, b in values ≈ a + b·basis; returns (a, b, sum of squares)."""
-    n = len(values)
-    mean_x, mean_y = sum(basis) / n, sum(values) / n
-    sxx = sum((x - mean_x) ** 2 for x in basis)
-    if sxx <= 0:
-        return mean_y, 0.0, sum((y - mean_y) ** 2 for y in values)
-    b = sum((x - mean_x) * (y - mean_y) for x, y in zip(basis, values)) / sxx
-    a = mean_y - b * mean_x
-    return a, b, sum((a + b * x - y) ** 2 for x, y in zip(basis, values))
-
-
-def fit_mzi_response(xs, powers, x_unit) -> MZIFit | None:
-    """Fit a cos² response by grid search over x_pi and phase, then a finer grid.
-
-    The phase grows linearly with heater power. Returns None with fewer than
-    four usable points or no swing.
-    """
-    data = [(x, p) for x, p in zip(xs, powers) if p is not None and math.isfinite(p)]
-    if len(data) < 4:
-        return None
-    xs, ps = [x for x, _ in data], [p for _, p in data]
-    span = max(xs) - min(xs)
-    if span <= 0 or max(ps) <= min(ps):
-        return None
-
-    def evaluate(x_pi, phase0):
-        basis = [(1 + math.cos(math.pi * x / x_pi + phase0)) / 2 for x in xs]
-        offset, amplitude, error = _linear_fit(basis, ps)
-        if amplitude < 0:
-            # The same curve with the phase shifted by π and a positive amplitude.
-            return error, x_pi, (phase0 + math.pi) % (2 * math.pi), offset + amplitude, -amplitude
-        return error, x_pi, phase0, offset, amplitude
-
-    best = None
-    for step in range(120):
-        x_pi = span / 12 * (60 ** (step / 119))
-        for phase_step in range(36):
-            candidate = evaluate(x_pi, phase_step * math.pi / 36)
-            if best is None or candidate[0] < best[0]:
-                best = candidate
-    for _ in range(3):
-        _, x_pi, phase0 = best[:3]
-        for scale in [1 + k / 200 for k in range(-12, 13)]:
-            for shift in [k * math.pi / 360 for k in range(-6, 7)]:
-                candidate = evaluate(x_pi * scale, phase0 + shift)
-                if candidate[0] < best[0]:
-                    best = candidate
-    error, x_pi, phase0, offset, amplitude = best
-    return MZIFit(offset, amplitude, x_pi, phase0 % (2 * math.pi), math.sqrt(error / len(ps)), x_unit)
-
-
-@dataclass(frozen=True)
-class MZISweep:
-    probe: object
-    points: tuple[SweepPoint, ...]
-    cross: SweepPoint
-    bar: SweepPoint
-    extinction_db: float
-    fit: MZIFit | None
-    unit: str
-
-    @property
-    def name(self):
-        return self.probe.name
-
-
-def _extreme(points, value, highest, tie):
-    target = max(map(value, points)) if highest else min(map(value, points))
-    close = [point for point in points if abs(value(point) - target) <= tie(target)]
-    return min(close, key=lambda point: (abs(point.voltage), -value(point) if highest else value(point)))
-
-
-def fit_trusted(fit) -> bool:
-    return fit is not None and fit.amplitude > 0 and fit.rms < FIT_TRUST_FRACTION * fit.amplitude
-
-
-def fitted_extremes(fit, xs, points):
-    """The measured points at the fit's first maximum and first null.
-
-    Counting from the sweep start, an extreme already passed by less than
-    π/2 is still the first one; the start point is then the best reachable.
-    The maximum is the point nearest the fitted one: the bright lobes
-    dominate the fit, and a flat top hides its peak in the reading noise.
-    The null is sharp, so a step off costs many dB, while a cos² over the
-    whole sweep places it only to about a step; it is the darkest measured
-    point within ``EXTREME_WINDOW_RAD`` of the fitted null.
-    """
-    measured = [(x, point) for x, point in zip(xs, points) if point.power is not None]
-    start, stop = min(x for x, _ in measured), max(x for x, _ in measured)
-    start_phase = fit.phase(start)
-    targets = []
-    for offset in (0.0, math.pi):
-        turns = math.ceil((start_phase - math.pi / 2 - offset) / (2 * math.pi))
-        target = (offset + 2 * math.pi * turns - fit.phase0) / fit.phase_per_x
-        targets.append(min(max(target, start), stop))
-    bright, null = (min(measured, key=lambda item: (abs(item[0] - target), item[0])) for target in targets)
-    window = EXTREME_WINDOW_RAD / fit.phase_per_x
-    near = [item for item in measured if abs(item[0] - targets[1]) <= window] or [null]
-    return bright[1], min(near, key=lambda item: (item[1].power, item[0]))[1]
-
-
-def extract_calibration(probe, points, xs, unit="mW", x_unit="mW",
-                        min_extinction_db=DEFAULT_MIN_EXTINCTION_DB) -> MZISweep:
-    """Bright and dark extremes become cross/bar by the probe's bright state.
-
-    Power is flat around its extremes, so a good cos² fit of the probed power
-    places the first maximum and null. Otherwise the data decide: with a
-    reference line (OSA) the contrast between the two lines, else the power,
-    with near-equal points resolved to the lowest voltage.
-    """
-    points = tuple(points)
-    fit = fit_mzi_response(xs, [point.power for point in points], x_unit)
-    with_contrast = [point for point in points if point.contrast_db is not None]
-    contrast = len(with_contrast) >= 2 and len(with_contrast) == len([p for p in points if p.power is not None])
-    if contrast:
-        measured, value = with_contrast, (lambda point: point.contrast_db)
-        bright_tie = dark_tie = lambda target: 0.5
-        extinction = max(map(value, measured)) - min(map(value, measured))
-    else:
-        measured = [point for point in points if point.power is not None and math.isfinite(point.power)]
-        if len(measured) < 2:
-            raise ValueError(f"{probe.name}: the detector returned fewer than two readings")
-        value = lambda point: point.power
-        high, low = max(map(value, measured)), min(map(value, measured))
-        bright_tie = lambda target: EXTREME_TIE_FRACTION * (high - low)
-        dark_tie = lambda target: (target * (10 ** (DARK_TIE_DB / 10) - 1) if target > 0
-                                   else EXTREME_TIE_FRACTION * (high - low))
-        extinction = math.inf if low <= 0 < high else 10 * math.log10(high / low) if low > 0 else 0.0
-    if extinction < min_extinction_db:
-        raise ValueError(f"{probe.name}: only {extinction:.1f} dB change at output {probe.output + 1}; "
-                         f"check that input {probe.input + 1} is lit and the detector is on that output")
-    if fit_trusted(fit):
-        bright, dark = fitted_extremes(fit, xs, points)
-    else:
-        bright = _extreme(measured, value, True, bright_tie)
-        dark = _extreme(measured, value, False, dark_tie)
-    cross, bar = (bright, dark) if probe.bright_crossed else (dark, bright)
-    return MZISweep(probe, points, cross, bar, extinction, fit, unit)
 
 
 @dataclass(frozen=True)
@@ -521,10 +196,10 @@ def screen_aggressor(controller, detector, probe, victim_fit, aggressor, low_vol
         controller.drive_voltage(probe.name, victim_voltage)
         low, high = readings[is_reference]
         for raised in SCREEN_PATTERN:
-            _check_stop(stop_event)
+            check_stop(stop_event)
             voltage = high_voltage if raised else low_voltage
             controller.drive_voltage(aggressor, voltage)
-            _wait(settle_s, stop_event, sleep)
+            wait(settle_s, stop_event, sleep)
             power = detector.read(probe).power
             (high if raised else low).append(power)
             count += 1
@@ -619,7 +294,7 @@ def _phase_slope(drive, shifts):
     pairs = [(x, shift) for x, shift in zip(drive, shifts) if shift is not None]
     if len(pairs) < 2 or max(x for x, _ in pairs) <= min(x for x, _ in pairs):
         return None
-    return _linear_fit([x for x, _ in pairs], [shift for _, shift in pairs])[1]
+    return linear_fit([x for x, _ in pairs], [shift for _, shift in pairs])[1]
 
 
 def _least_squares(columns, values):
@@ -751,24 +426,19 @@ def apply_background(controller, probe, found=None, zero_cross=False) -> dict[st
     return voltages
 
 
-def _check_stop(stop_event):
-    if stop_event is not None and stop_event.is_set():
-        raise CalibrationStopped("Measurement stopped")
-
-
 def sweep(controller, detector, probe, name, voltages, settle_s, on_point=None, stop_event=None,
           sleep=time.sleep) -> list[SweepPoint]:
     """Drive ``name`` through ``voltages`` and read the probe after each settle."""
     wait_for_light = getattr(detector, "wait_for_light", None)
     if wait_for_light is not None and voltages:
         controller.drive_voltage(name, voltages[0])
-        _wait(settle_s, stop_event, sleep)
+        wait(settle_s, stop_event, sleep)
         wait_for_light(probe, stop_event, sleep)
     points = []
     for voltage in voltages:
-        _check_stop(stop_event)
+        check_stop(stop_event)
         controller.drive_voltage(name, voltage)
-        _wait(settle_s, stop_event, sleep)
+        wait(settle_s, stop_event, sleep)
         reading = detector.read(probe)
         point = SweepPoint(voltage, reading.power, reading.reference)
         points.append(point)
@@ -857,7 +527,7 @@ def run_calibration(controller, detector, network, steps, voltages, settle_s, sa
 
     def body():
         for index, probe in enumerate(steps, start=1):
-            _check_stop(stop_event)
+            check_stop(stop_event)
             if on_step is not None:
                 on_step(probe, index, len(steps))
             before = dict(controller.applied_voltages)
@@ -865,7 +535,7 @@ def run_calibration(controller, detector, network, steps, voltages, settle_s, sa
             background_changed = any(before.get(name) != voltage for name, voltage in background.items())
             detector.prepare(probe)
             if background_changed:
-                _wait(max(settle_s, getattr(detector, "background_settle_s", 0.0)), stop_event, sleep)
+                wait(max(settle_s, getattr(detector, "background_settle_s", 0.0)), stop_event, sleep)
             points = sweep(controller, detector, probe, probe.name, voltages, settle_s,
                            on_point, stop_event, sleep)
             rescan = getattr(detector, "rescan_points", None)
@@ -930,7 +600,7 @@ def run_crosstalk(controller, detector, network, groups, voltages, settle_s, pat
     def body():
         for index, group in enumerate(groups, start=1):
             probe = group.probe
-            _check_stop(stop_event)
+            check_stop(stop_event)
             if on_step is not None:
                 on_step(group, index, len(groups))
             detector.prepare(probe)
@@ -969,12 +639,12 @@ def run_crosstalk(controller, detector, network, groups, voltages, settle_s, pat
                 reference = ()
                 if path_reference:
                     controller.drive_voltage(probe.name, bright.voltage)
-                    _wait(settle_s, stop_event, sleep)
+                    wait(settle_s, stop_event, sleep)
                     reference = sweep(controller, detector, probe, aggressor, voltages, settle_s,
                                       on_point, stop_event, sleep)
                     controller.drive_voltage(aggressor, background.get(aggressor, 0.0))
                 controller.drive_voltage(probe.name, bias.voltage)
-                _wait(settle_s, stop_event, sleep)
+                wait(settle_s, stop_event, sleep)
                 points = sweep(controller, detector, probe, aggressor, voltages, settle_s,
                                on_point, stop_event, sleep)
                 controller.drive_voltage(aggressor, background.get(aggressor, 0.0))
