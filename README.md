@@ -238,6 +238,77 @@ configurations. `coverage_report.csv` in the dataset root holds the full
 configuration-by-configuration list, so it remains practical for all 720
 permutations.
 
+### Offline 720-permutation analysis
+
+After a full WDM batch, generate an aggregate dashboard and CSV tables with:
+
+```powershell
+python -m benes.measurements.permutation_analysis Datasets/Dataset1
+```
+
+The command accepts scans stored either directly below the dataset root or in a
+`Measurements` directory. It writes a summary dashboard, separate figures in
+`Analysis/Figures`, a Markdown and JSON summary, and per-permutation,
+per-channel, per-input, per-output, per-port-pair, and switch-diagnostic CSV tables. The
+figure set includes one count histogram for every input, every intended output,
+and every input/output pair. Each input and intended-output figure also has an
+empirical percentile curve with its 5th, 50th, and 95th percentiles, and the
+CSV summaries include the 5th, 10th, 25th, 50th, 75th, 90th, and 95th
+percentiles. The yield criterion defaults to 10 dB
+worst-channel routing isolation and can be changed with
+`--isolation-threshold-db`.
+
+### Offline crosstalk-matrix analysis
+
+To condense a saved crosstalk-matrix run into a few overview figures, run:
+
+```powershell
+python -m benes.measurements.crosstalk_analysis Datasets/Calibration1/<run>_matrix
+```
+
+It writes to `<run>_matrix/Analysis`. The outputs are a per-pair summary (κ,
+phase shift at full drive, curve exponent against aggressor voltage, and the
+equivalent shared series resistance), every victim curve on one shared-axis
+grid, the curves normalised against voltage and against power, and per-switch
+totals with the worst-case extinction at the calibrated states. Per-pair and
+per-switch CSVs and a `summary.md` come with them.
+
+To redraw the tab's two-panel **Victims** figures without hardware, run:
+
+```powershell
+python -m benes.measurements.crosstalk_victim_plots Results/Crosstalk_matrix/<run>_matrix
+```
+
+For each victim, `<victim>_victim.png` is saved beside the run's files. The left
+panel shows each probe's measured sweep, its cos² fit, the quadrature bias and
+the bright path-reference point. The right panel shows the phase shift from each
+aggressor. Fits, bias voltages, κ and heater resistances come from
+`crosstalk_matrix.json`, and the sweeps from `crosstalk_sweeps.csv`. `--x power`
+plots the victim against heater power instead of voltage. A missing reading
+leaves a gap. A victim without a fit is drawn without its line or operating
+points. A victim whose probe failed gets a figure that states the reason. Without
+`crosstalk_matrix.json`, only the measurements are drawn.
+
+### Offline MZI calibration analysis
+
+Summarize a saved MZI calibration sweep with:
+
+```powershell
+python -m benes.measurements.calibration_analysis Datasets/Calibration1
+```
+
+Every `mzi_calibration.json` below the path is read with the `mzi_sweeps.csv`
+beside it, and the results go to an `Analysis` folder in that sweep folder.
+`calibration_summary.csv` and `.md` list, per MZI, the highest and lowest detected
+power and their voltages, the extinction, Vπ, Pπ, the heater's effective
+resistance (V²/P), the phase error at 0 V and at the saved cross/bar voltages
+with the leak it implies for ideal couplers, and the exact cross/bar voltages
+from the fit. Flags mark low extinction, a setpoint on a later fringe than
+needed, and a cross or bar more than 10° off. The figures show every sweep with
+its fit, the per-MZI metrics, all sweeps on a common phase axis, the peak power
+per probe path, and the setpoint change since the previous calibration. Powers
+are at the detector, so they include laser power and path loss.
+
 ## Arduino power meter
 
 The same tab can use the Arduino detector stream from the sibling

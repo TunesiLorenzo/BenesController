@@ -2,6 +2,7 @@
 /Results/
 /dist/
 /build/
+/Datasets/
 
 # Python caches and local environments
 __pycache__/
