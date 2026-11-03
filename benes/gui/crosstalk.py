@@ -10,7 +10,6 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from benes.gui.theme import ACCENT, PANEL, PLOT_MIN_SIZE, POWER_METER_COLOR, TEXT
 from benes.gui.widgets import VerticalScrolledFrame
-from benes.hardware import osa
 from benes.hardware.hp8152a import HP8152A, RANGES_DBM
 from benes.measurements.calibration_scan import (ScanPoint, scan_switches_with_reader,
                                                  scan_voltages, spectrum_scan_point)
@@ -686,11 +685,7 @@ class CrosstalkMixin:
                     raise ValueError("Set a line window between 0 and 10 nm in the WDM comb tab")
                 if self.osa_button.instate(["disabled"]):
                     raise RuntimeError("Wait for the current OSA trace read to finish")
-                simulate_osa = self.osa_dry_run_var.get()
-                osa_host = self.osa_host_var.get().strip()
-                osa_port = int(self.osa_port_var.get()) if not simulate_osa else 0
-                if not simulate_osa and (not osa_host or not 1 <= osa_port <= 65535):
-                    raise ValueError("Enter a valid OSA host and port in Hardware")
+                read_osa = self.osa_reader()
                 response_unit = "dBm"
             for name in names:
                 if self.controller.settings["mapping"][name] is None:
@@ -778,8 +773,7 @@ class CrosstalkMixin:
                         self.osa_output_switch.select_output(self.destination + 1)
 
                     def read_osa_point(voltage):
-                        spectrum = osa.simulated_spectrum() if simulate_osa else osa.get_spectrum(osa_host, osa_port)
-                        return spectrum_scan_point(voltage, spectrum, wavelength, half_window_nm)
+                        return spectrum_scan_point(voltage, read_osa(), wavelength, half_window_nm)
 
                     scan_switches_with_reader(self.controller, names, voltages, settle_ms / 1000,
                                                read_osa_point, on_point)

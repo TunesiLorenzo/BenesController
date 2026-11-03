@@ -5,6 +5,8 @@ import random
 import threading
 import time
 import tkinter as tk
+from collections.abc import Callable
+from dataclasses import dataclass
 from tkinter import messagebox, ttk
 
 from benes.gui.theme import (ACCENT, BG, COLORS, OSA_COLOR, PANEL, POWER_METER_COLOR, TEXT, WDM_COLORS, WIRE,
@@ -16,8 +18,29 @@ from benes.measurements.arduino_hp_range import (DEFAULT_HIGH_ADC, DEFAULT_LOW_A
 from benes.measurements.laser_calibration import CalibrationStopped
 from benes.measurements.mzi_characterization import mw_to_dbm
 from benes.measurements.voltage_optimizer import (OBJECTIVE_LEAK, OBJECTIVE_THROUGH, optimization_plan,
-                                                  optimize_paths)
+                                                  optimize_paths, osa_line_reader)
 from benes.paths import app_dir
+
+
+@dataclass
+class OptimizerSetup:
+    """What one detection brings to the voltage optimizer.
+
+    ``open()`` runs on the worker and returns (read, light, select_output) for
+    ``optimize_paths``; ``close()`` runs there afterwards and returns cleanup errors;
+    ``claim(busy)`` marks the instruments in use on the Tk thread.
+    """
+
+    sources: list
+    objective: str
+    # How the readings are taken, for the status line.
+    detector: str
+    open: Callable
+    close: Callable
+    claim: Callable
+    switch: object = None
+    # The one output a fixed meter reads, 0-based.
+    fixed_output: int | None = None
 
 # Ring around an input whose Newport laser is on.
 LASER_ON_COLOR = "#ff4d4d"
@@ -372,131 +395,174 @@ class RoutingMixin:
             self.start_voltage_optimizer()
 
     def start_voltage_optimizer(self):
-        """Nudge the MZIs on the lit paths for the most Arduino power at their routed outputs.
+        """Nudge the MZIs on the lit paths toward their best nearby voltages.
 
-        With an input selected only its path is tuned; otherwise every input is lit in
-        turn through the Newport. Through the JDSU each MZI is tuned for the least light
-        at its leak output; a meter fixed on one output can only maximize the routed power.
+        Detection follows MZI calibration → Detection. With an input selected only its path
+        is tuned. Through the JDSU each MZI is tuned for the least light at its leak output;
+        a meter fixed on one output can only maximize the routed power.
         """
         try:
             if self.measurement_busy() or self._bnc_reference_busy:
                 raise RuntimeError("Wait for the current measurement to finish")
-            if not self.controller.connected:
-                raise RuntimeError("Connect the voltage board first (Hardware)")
-            if not self.power_meter.connected or self.hp_meter_session is None:
-                raise RuntimeError("Connect both the Arduino and the HP 8152A first")
-            if self.hp_meter_busy:
-                raise RuntimeError("Stop the HP meter stream or test first")
-            if self.bnc_reference is None:
-                raise ValueError("Set the BNC dBm reference first")
-            options = self.hp_meter_session_options
-            channel = 1 if options["channel"] == "A" else 2
-            reference = self.bnc_reference
-            if (reference.resource, reference.channel) != (options["resource"], channel):
-                raise ValueError("Set a new BNC dBm reference for this HP channel")
-            try:
-                low_adc, high_adc = float(self.hp_bnc_low_adc_var.get()), float(self.hp_bnc_high_adc_var.get())
-            except ValueError:
-                low_adc, high_adc = DEFAULT_LOW_ADC, DEFAULT_HIGH_ADC
-            use_lasers = self.newport_controller.connected and not self.newport_panel.busy
-            sources = [self.source] if self.source is not None else list(range(self.network.size))
-            if len(sources) > 1 and not use_lasers:
-                raise ValueError("Select one input to tune with the light that is on now, or connect the "
-                                 "Newport controller to light the inputs one at a time")
-            if use_lasers:
-                self.laser_bank.configure({port: variable.get() for port, variable in self.laser_slot_vars.items()},
-                                          self.laser_settle_var.get())
-            switch = None
-            plan = optimization_plan(self.network, sources)
-            if self.detection_position_var.get() == METER_VIA_JDSU:
-                if not self.osa_output_switch.connected:
-                    raise RuntimeError("Connect the JDSU switch, or set where the meter sits in "
-                                       "MZI calibration → Detection")
-                switch = self.osa_output_switch
-            else:
-                fixed = int(self.detection_position_var.get().split()[-1]) - 1
-                plan = tuple(item for item in plan if item[1] == fixed)
-                if not plan:
-                    raise ValueError(f"The meter sits on output {fixed + 1}, which "
-                                     + (f"input {sources[0] + 1} does not reach now" if len(sources) == 1
-                                        else "no input reaches now"))
-            objective = OBJECTIVE_LEAK if switch is not None else OBJECTIVE_THROUGH
-            mapped = self.controller.settings["mapping"]
-            plan = tuple((source, output, tuple((name, leak) for name, leak in names
-                                                if mapped.get(name) is not None
-                                                and name in self.controller.applied_voltages))
-                         for source, output, names in plan)
-            total = sum(len(names) for _, _, names in plan)
-            if not total:
-                raise ValueError("No MZI on the chosen path has a board pin and a known voltage")
+            setup = self.meter_optimizer_setup() if self.power_meter_method() else self.osa_optimizer_setup()
+            plan = self.optimizer_plan(setup.sources, setup.fixed_output)
         except (OSError, RuntimeError, ValueError) as error:
             messagebox.showerror("Voltage optimizer unavailable", str(error), parent=self)
             return
+        self.run_voltage_optimizer(plan, setup)
 
+    def optimizer_plan(self, sources, fixed_output=None):
+        """The planned MZIs with a board pin and a known voltage, on paths the detector can read."""
+        plan = optimization_plan(self.network, sources)
+        if fixed_output is not None:
+            plan = tuple(item for item in plan if item[1] == fixed_output)
+            if not plan:
+                raise ValueError(f"The meter sits on output {fixed_output + 1}, which "
+                                 + (f"input {sources[0] + 1} does not reach now" if len(sources) == 1
+                                    else "no input reaches now"))
+        mapped = self.controller.settings["mapping"]
+        plan = tuple((source, output, tuple((name, leak) for name, leak in names
+                                            if mapped.get(name) is not None
+                                            and name in self.controller.applied_voltages))
+                     for source, output, names in plan)
+        if not any(names for _, _, names in plan):
+            raise ValueError("No MZI on the chosen path has a board pin and a known voltage")
+        return plan
+
+    def osa_optimizer_setup(self):
+        """Every laser on; each read takes the tuned input's WDM line at the MZI's leak output.
+
+        That line is the light leaking from that MZI alone, so no laser is switched.
+        """
+        read_spectrum, wavelengths, half_window, _ = self.calibration_hardware()
+        sources = [self.source] if self.source is not None else sorted(wavelengths)
+        missing = [source + 1 for source in sources if source not in wavelengths]
+        if missing:
+            raise ValueError(f"Input {missing[0]} has no WDM wavelength; set it in the WDM comb tab")
+        switch = self.osa_output_switch
+        light, select_output, read = osa_line_reader(switch, read_spectrum, wavelengths, half_window)
+        return OptimizerSetup(sources, OBJECTIVE_LEAK, "on the OSA", lambda: (read, light, select_output),
+                              lambda: [], self.set_osa_reading, switch)
+
+    def meter_optimizer_setup(self):
+        """The Arduino through the HP BNC output; the Newport lights the inputs one at a time."""
+        if not self.controller.connected:
+            raise RuntimeError("Connect the voltage board first (Hardware)")
+        if not self.power_meter.connected or self.hp_meter_session is None:
+            raise RuntimeError("Connect both the Arduino and the HP 8152A first")
+        if self.hp_meter_busy:
+            raise RuntimeError("Stop the HP meter stream or test first")
+        if self.bnc_reference is None:
+            raise ValueError("Set the BNC dBm reference first")
+        hp, options = self.hp_meter_session, self.hp_meter_session_options
+        channel = 1 if options["channel"] == "A" else 2
+        reference = self.bnc_reference
+        if (reference.resource, reference.channel) != (options["resource"], channel):
+            raise ValueError("Set a new BNC dBm reference for this HP channel")
+        try:
+            low_adc, high_adc = float(self.hp_bnc_low_adc_var.get()), float(self.hp_bnc_high_adc_var.get())
+        except ValueError:
+            low_adc, high_adc = DEFAULT_LOW_ADC, DEFAULT_HIGH_ADC
+        use_lasers = self.newport_controller.connected and not self.newport_panel.busy
+        sources = [self.source] if self.source is not None else list(range(self.network.size))
+        if len(sources) > 1 and not use_lasers:
+            raise ValueError("Select one input to tune with the light that is on now, or connect the "
+                             "Newport controller to light the inputs one at a time")
+        if use_lasers:
+            self.laser_bank.configure({port: variable.get() for port, variable in self.laser_slot_vars.items()},
+                                      self.laser_settle_var.get())
+        switch = fixed_output = None
+        if self.detection_position_var.get() == METER_VIA_JDSU:
+            if not self.osa_output_switch.connected:
+                raise RuntimeError("Connect the JDSU switch, or set where the meter sits in "
+                                   "MZI calibration → Detection")
+            switch = self.osa_output_switch
+        else:
+            fixed_output = int(self.detection_position_var.get().split()[-1]) - 1
+
+        def light(source):
+            self.laser_bank.light_only(source)
+            self.after(0, self.show_reference_laser)
+
+        def open_meter():
+            if use_lasers:
+                self.laser_bank.begin()
+            reader = ArduinoHPRangeSweep(self.power_meter, hp, channel, low_adc=low_adc, high_adc=high_adc,
+                                         bnc_reference=reference)
+            return (reader.read, light if use_lasers else None,
+                    None if switch is None else (lambda output: switch.select_output(output + 1)))
+
+        def close_meter():
+            errors = []
+            if use_lasers:
+                try:
+                    self.laser_bank.finish()
+                except Exception as failure:
+                    errors.append(str(failure))
+            try:
+                self.configure_hp_meter(hp, options)
+            except Exception as failure:
+                errors.append(f"HP settings: {failure}")
+            return errors
+
+        def claim(busy):
+            self.hp_meter_busy = "optimizer" if busy else None
+            self.refresh_hp_connection_buttons()
+            if use_lasers:
+                self.newport_panel.busy = busy
+                if not busy:
+                    try:
+                        self.newport_controller.read_states()
+                    except Exception:
+                        pass  # The panel shows the last known states; Refresh reads them again.
+                self.newport_panel.render()
+
+        return OptimizerSetup(sources, OBJECTIVE_LEAK if switch is not None else OBJECTIVE_THROUGH,
+                              "with the power meter" + (", inputs lit one at a time" if use_lasers else ""),
+                              open_meter, close_meter, claim, switch, fixed_output)
+
+    def run_voltage_optimizer(self, plan, setup):
+        total = sum(len(names) for _, _, names in plan)
+        switch = setup.switch
         self.route_optimizer_running = True
         self.route_optimizer_stop = stop_event = threading.Event()
         self.optimize_button.configure(text="Stop optimizer")
         self.evaluate_button.configure(state="disabled")
-        self.hp_meter_busy = "optimizer"
-        self.refresh_hp_connection_buttons()
-        if use_lasers:
-            self.newport_panel.busy = True
-            self.newport_panel.render()
+        setup.claim(True)
         zero_before = set(self.zero_volt_switches)
         states_before = dict(self.network.states)
-        which = f"input {sources[0] + 1}" if len(sources) == 1 else f"{len(plan)} inputs, one at a time"
-        goal = ("least light at each MZI's leak output" if objective == OBJECTIVE_LEAK
+        which = f"input {plan[0][0] + 1}" if len(plan) == 1 else f"{len(plan)} inputs"
+        goal = ("least light at each MZI's leak output" if setup.objective == OBJECTIVE_LEAK
                 else "most light at the routed output")
-        self.begin_activity("route_optimize", f"Optimizing MZI voltages for {which}...", total)
-        self.status.configure(text=f"Optimizing {total} MZI voltage(s) for {which}: {goal}...")
+        self.begin_activity("route_optimize", f"Optimizing MZI voltages for {which} {setup.detector}...", total)
+        self.status.configure(text=f"Optimizing {total} MZI voltage(s) for {which} {setup.detector}: {goal}...")
         previous_output = switch.routed_output if switch is not None else None
         done = []
         paths = []
 
         def on_read(source, output, name, voltage, power):
-            dbm = mw_to_dbm(power) if power > 0 else None
-            text = "below floor" if dbm is None else f"{dbm:.2f} dBm"
+            text = "below floor" if power <= 0 else f"{mw_to_dbm(power):.2f} dBm"
             self.after(0, lambda: self.route_arduino_var.set(
                 f"Optimizer: input {source + 1}, {name} at {voltage:.2f} V → output {output + 1}: {text}"))
 
         def on_switch(item):
             self.after(0, self.voltage_optimizer_switch_done, item, len(done), total)
 
-        def light(source):
-            self.laser_bank.light_only(source)
-            self.after(0, self.show_reference_laser)
-
         def worker():
-            hp = self.hp_meter_session
             error = None
             stopped = False
             try:
-                if use_lasers:
-                    self.laser_bank.begin()
-                reader = ArduinoHPRangeSweep(self.power_meter, hp, channel, low_adc=low_adc, high_adc=high_adc,
-                                             bnc_reference=reference)
+                read, light, select_output = setup.open()
                 paths.extend(optimize_paths(
-                    self.controller, plan, reader.read, objective=objective,
-                    light=light if use_lasers else None,
-                    select_output=None if switch is None else (
-                        lambda output: switch.select_output(output + 1)),
-                    allowed=self.optimizer_voltage_allowed, on_switch=on_switch, on_read=on_read,
-                    stop_event=stop_event, results=done))
+                    self.controller, plan, read, objective=setup.objective, light=light,
+                    select_output=select_output, allowed=self.optimizer_voltage_allowed, on_switch=on_switch,
+                    on_read=on_read, stop_event=stop_event, results=done))
             except CalibrationStopped:
                 stopped = True
             except Exception as failure:
                 error = str(failure) or type(failure).__name__
             finally:
-                cleanup = []
-                if use_lasers:
-                    try:
-                        self.laser_bank.finish()
-                    except Exception as failure:
-                        cleanup.append(str(failure))
-                try:
-                    self.configure_hp_meter(hp, options)
-                except Exception as failure:
-                    cleanup.append(f"HP settings: {failure}")
+                cleanup = setup.close()
                 if previous_output is not None:
                     try:
                         switch.select_output(previous_output)
@@ -505,8 +571,8 @@ class RoutingMixin:
                 if cleanup and error is None:
                     error = "; ".join(cleanup)
             try:
-                self.after(0, self.finish_voltage_optimizer, list(done), paths, error, stopped, use_lasers,
-                           switch is not None, zero_before, states_before)
+                self.after(0, self.finish_voltage_optimizer, list(done), paths, error, stopped, setup,
+                           zero_before, states_before)
             except (RuntimeError, tk.TclError):
                 pass
 
@@ -529,23 +595,14 @@ class RoutingMixin:
             + ("" if gain is None else f" ({gain:+.2f} dB)")))
         self.draw()
 
-    def finish_voltage_optimizer(self, switches, paths, error, stopped, used_lasers, used_switch,
-                                 zero_before, states_before):
+    def finish_voltage_optimizer(self, switches, paths, error, stopped, setup, zero_before, states_before):
         self.route_optimizer_running = False
         self.route_optimizer_stop = None
         self.optimize_button.configure(text="Optimize voltages", state="normal")
         self.evaluate_button.configure(state="normal")
-        self.hp_meter_busy = None
-        self.refresh_hp_connection_buttons()
-        if used_lasers:
-            self.newport_panel.busy = False
-            try:
-                self.newport_controller.read_states()
-            except Exception:
-                pass  # The panel shows the last known states; Refresh reads them again.
-            self.newport_panel.render()
-        if used_switch and self.osa_output_switch.routed_output is not None:
-            self.osa_output_var.set(str(self.osa_output_switch.routed_output))
+        setup.claim(False)
+        if setup.switch is not None and setup.switch.routed_output is not None:
+            self.osa_output_var.set(str(setup.switch.routed_output))
         for item in switches:
             self.voltage_vars[item.name].set(f"{item.best_v:.2f}")
             if item.moved:

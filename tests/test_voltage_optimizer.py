@@ -154,5 +154,31 @@ class OptimizePathsTests(unittest.TestCase):
         self.assertEqual(self.controller.applied_voltages["S2.1"], 1.25)
 
 
+class OSAReaderTests(unittest.TestCase):
+    def test_osa_reads_the_tuned_input_line_and_lowers_each_leak(self):
+        from benes.measurements.laser_calibration import SimulatedChip
+        from benes.measurements.voltage_optimizer import osa_line_reader
+        from tests.test_laser_calibration import WAVELENGTHS, FakeSelector
+
+        network = BenesNetwork()
+        controller = FakeController({})
+        chip = SimulatedChip(network, lambda name: controller.applied_voltages.get(name, 0.0), WAVELENGTHS)
+        # Every MZI 0.25 V above its simulated bar voltage, so input 1's path leaks.
+        for name in network.switches:
+            network.states[name] = False
+            bar = chip.v_pi[name] * math.sqrt(1 - chip.phase[name] / math.pi)
+            controller.applied_voltages[name] = round(bar + 0.25, 2)
+        selector = FakeSelector()
+        light, select_output, read = osa_line_reader(selector, chip.spectrum, WAVELENGTHS, 0.05)
+        plan = optimization_plan(network, [0])
+        (path,) = optimize_paths(controller, plan, read, light=light, select_output=select_output,
+                                 sleep=lambda seconds: None)
+        self.assertTrue(path.switches)
+        self.assertTrue(all(item.best_mw <= item.start_mw for item in path.switches))
+        self.assertGreater(max(item.gain_db for item in path.switches), 3)
+        with self.assertRaisesRegex(ValueError, "Input 7"):
+            light(6)
+
+
 if __name__ == "__main__":
     unittest.main()

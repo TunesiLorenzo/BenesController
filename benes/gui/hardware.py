@@ -76,6 +76,8 @@ class HardwareMixin:
         ttk.Entry(osa_controls, textvariable=self.osa_host_var, width=16).pack(side="left")
         ttk.Label(osa_controls, text="Port").pack(side="left", padx=(10, 4))
         ttk.Entry(osa_controls, textvariable=self.osa_port_var, width=6).pack(side="left")
+        ttk.Label(osa_controls, text="Sweeps per reading").pack(side="left", padx=(10, 4))
+        ttk.Entry(osa_controls, textvariable=self.osa_sweeps_var, width=4).pack(side="left")
         ttk.Combobox(osa_controls, textvariable=self.osa_plot_mode, values=("Overlay", "New window"), state="readonly", width=11).pack(side="left", padx=10)
         ttk.Checkbutton(osa_controls, text="Simulate", variable=self.osa_dry_run_var).pack(side="left")
         self.osa_button = ttk.Button(osa_controls, text="Read trace", style="Accent.TButton", command=self.read_spectrum)

@@ -1,4 +1,4 @@
-"""Nudge the MZI voltages on lit paths toward their best nearby setting, read with one power meter.
+"""Nudge the MZI voltages on lit paths toward their best nearby setting, read with a power meter or the OSA.
 
 Each MZI on a lit path is tuned on its own, either for the least light leaking out of
 its unused port (read at the output that leak reaches) or, when the meter cannot
@@ -12,7 +12,7 @@ import math
 import time
 from dataclasses import dataclass
 
-from benes.measurements.laser_calibration import _check_stop, _wait
+from benes.measurements.laser_calibration import _check_stop, _read, _select, _wait, line_powers
 
 OBJECTIVE_LEAK, OBJECTIVE_THROUGH = "leak", "through"
 # Half-width of the three-point bracket, and the narrowest one before an MZI counts as done.
@@ -170,6 +170,33 @@ def optimize_switch(drive, read, name, start_v, *, minimize=False, low_v=LOW_V, 
             step_v /= 2
     drive(name, best_v)
     return best_v, start_mw, best_mw, reads
+
+
+def osa_line_reader(switch, read_spectrum, wavelengths, half_window_nm):
+    """``light``, ``select_output`` and ``read`` for ``optimize_paths`` on the OSA, every laser on.
+
+    ``light`` only notes the input being tuned; ``read`` takes that input's WDM line from
+    the trace at the selected output, so the light leaking from one MZI is read alone.
+    Linear mW, 0 when the trace has no bins at that line.
+    """
+    current = {"source": None, "output": None}
+
+    def light(source):
+        if source not in wavelengths:
+            raise ValueError(f"Input {source + 1} has no WDM wavelength")
+        current["source"] = source
+
+    def select_output(output):
+        _select(switch, output)
+        current["output"] = output
+
+    def read():
+        source = current["source"]
+        wave, power = _read(read_spectrum, current["output"])
+        dbm = line_powers(wave, power, {source: wavelengths[source]}, half_window_nm)[source]
+        return 0.0 if dbm is None else 10 ** (dbm / 10)
+
+    return light, select_output, read
 
 
 def optimize_paths(controller, plan, read_power, *, objective=OBJECTIVE_LEAK, light=None, select_output=None,

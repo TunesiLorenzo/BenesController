@@ -99,6 +99,7 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
         self.osa_host_var = tk.StringVar(value="192.168.0.200")
         self.osa_port_var = tk.StringVar(value="8002")
         self.osa_dry_run_var = tk.BooleanVar(value=False)
+        self.osa_sweeps_var = tk.StringVar(value=str(self.wdm_plan.settings["osa_sweeps"]))
         self.osa_plot_mode = tk.StringVar(value="Overlay")
         self.osa_axes = None
         self.trace_count = 0
@@ -199,10 +200,11 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
 
     def begin_activity(self, key, label, total=None):
         """Show a running job in the fixed status strip; call from the Tk thread."""
-        self.activities[key] = {"label": label, "detail": label, "done": 0, "total": total}
+        self.activities[key] = {"label": label, "detail": label, "done": 0,
+                                "total": total, "time_left": None}
         self._render_activity()
 
-    def update_activity(self, key, done=None, total=None, detail=None):
+    def update_activity(self, key, done=None, total=None, detail=None, time_left=None):
         if key not in self.activities:
             return
         activity = self.activities[key]
@@ -212,6 +214,8 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
             activity["total"] = total
         if detail is not None:
             activity["detail"] = detail
+        if time_left is not None:
+            activity["time_left"] = time_left
         self._render_activity()
 
     def finish_activity(self, key, detail):
@@ -236,7 +240,10 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
             self.activity_bar.stop()
             self.activity_bar.configure(mode="determinate", maximum=max(1, total),
                                         value=min(activity["done"], total))
-        self.activity_text.set(activity["detail"])
+        detail = activity["detail"]
+        if activity["time_left"] is not None:
+            detail += f"  ·  Est. time left: {activity['time_left']}"
+        self.activity_text.set(detail)
 
     def fit_dialog_to_screen(self, dialog, preferred_width=900, preferred_height=650):
         """Size a dialog within the current display, leaving OS chrome visible."""

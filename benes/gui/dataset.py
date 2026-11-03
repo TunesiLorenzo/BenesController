@@ -3,20 +3,20 @@
 import csv
 import json
 import threading
+import time
 import tkinter as tk
-from datetime import datetime
+from datetime import datetime, timedelta
 from itertools import product
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from benes.gui.theme import ACCENT, BG, PANEL, POST_SWITCH_SWEEPS, TEXT, WDM_COLORS, WIRE
+from benes.gui.theme import ACCENT, BG, PANEL, TEXT, WDM_COLORS, WIRE
 from benes.gui.widgets import VerticalScrolledFrame, cap_width
-from benes.hardware import osa
 from benes.hardware.osa_output_switch import OUTPUTS
 from benes.measurements.dataset_registry import (analyze_dataset, create_dataset, save_measurement,
                                                  write_coverage_report)
 from benes.measurements.dataset_view import (format_transmission_share, load_output_spectra, load_target_summary,
-                                             saved_dataset_scans, saved_scan_entry)
+                                             load_total_power_history, saved_dataset_scans, saved_scan_entry)
 from benes.measurements.spectrum_export import write_spectra
 from benes.measurements.wdm_comb import (INPUTS, create_wdm_folder, evaluate_configuration,
                                          power_ratio_db, routed_wavelengths, save_wdm_scan, scan_outputs,
@@ -26,6 +26,14 @@ from benes.paths import app_dir
 
 # Remembers the last dataset folder, so the next session links it again.
 DATASET_CONFIG = "benes_dataset_config.json"
+
+
+def estimated_time_left(elapsed_s, completed, total):
+    """Estimate remaining batch time from completed configurations."""
+    if completed <= 0:
+        return "calculating..."
+    remaining_s = elapsed_s / completed * max(0, total - completed)
+    return str(timedelta(seconds=round(remaining_s)))
 
 
 class DatasetMixin:
@@ -42,6 +50,8 @@ class DatasetMixin:
         self.dataset_scan_entries = {}
         self.dataset_scan_latest = None
         self.dataset_scan_viewer = None
+        self.dataset_power_window = None
+        self.dataset_power_root = None
         controls_column = ttk.Frame(self.dataset_tab, padding=(18, 18, 8, 18))
         controls_column.pack(side="left", fill="y")
         control_scroll = VerticalScrolledFrame(controls_column)
@@ -150,6 +160,8 @@ class DatasetMixin:
                   font=("Segoe UI", 14, "bold")).pack(anchor="w")
         ttk.Label(summary, text="The report counts the six routed input→output paths required for each expected permutation.",
                   wraplength=600).pack(anchor="w", pady=(2, 8))
+        ttk.Button(summary, text="Total power vs time…", command=self.show_dataset_power_history).pack(
+            anchor="w", pady=(0, 10))
         ttk.Label(summary, text="Permutation tracker · live optical power", foreground=ACCENT,
                   font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(4, 2))
         ttk.Label(summary, text=("Each row is one input wavelength at one switch state. Transmission shows dB and "
@@ -200,7 +212,6 @@ class DatasetMixin:
         self.wdm_comb_var = tk.StringVar(value=" ".join(f"{line:g}" for line in settings["comb_lines"]))
         self.wdm_window_var = tk.StringVar(value=f"{settings['half_window_nm']:g}")
         self.wdm_settle_var = tk.StringVar(value=f"{settings['settle_s']:g}")
-        self.wdm_evaluation_sweeps_var = tk.StringVar(value=str(settings["evaluation_sweeps"]))
         self.wdm_output_vars = {output: tk.BooleanVar(value=True) for output in OUTPUTS}
         self.wdm_comment_var = self.dataset_comment_var
         self.wdm_dataset_var = tk.BooleanVar(value=True)
@@ -230,13 +241,11 @@ class DatasetMixin:
         ttk.Combobox(scan, textvariable=self.wdm_settle_var,
                      values=("0", "0.5", "1", "2"), width=8).grid(
             row=9, column=1, sticky="w", padx=(8, 0), pady=2)
-        ttk.Label(scan, text="Evaluate sweeps per output").grid(row=10, column=0, sticky="w", pady=2)
-        ttk.Entry(scan, textvariable=self.wdm_evaluation_sweeps_var, width=8).grid(
-            row=10, column=1, sticky="w", padx=(8, 0), pady=2)
         ttk.Button(scan, text="Save six-laser configuration", command=self.save_dataset_scan_configuration).grid(
             row=11, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         ttk.Label(scan, text=("JDSU settled status and channel readback are checked before these extra delays. "
-                              "OSA reads still wait for two fresh sweeps."), foreground="#9baec6",
+                              "Every OSA reading then waits for two fresh sweeps and averages the sweeps per reading set "
+                              "in Hardware → OSA."), foreground="#9baec6",
                   wraplength=280).grid(row=12, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Label(scan, textvariable=self.wdm_status_var, foreground="#9baec6", wraplength=280).grid(
             row=13, column=0, columnspan=2, sticky="w", pady=(6, 0))
@@ -337,7 +346,9 @@ class DatasetMixin:
                 raise ValueError("Save a wavelength for every input before filling the dataset")
             if self.osa_button.instate(["disabled"]):
                 raise RuntimeError("Wait for the current OSA trace read to finish")
-            host, port, simulate = self.osa_connection()
+            simulate = self.osa_dry_run_var.get()
+            routed_now = {}
+            read_osa = self.osa_reader(lambda output: simulated_comb_spectrum(assignment, routed_now[output][0]))
             if not self.controller.connected:
                 raise RuntimeError("Connect the voltage board before filling the dataset")
             if self.controller.settings["dry_run"] != simulate:
@@ -389,6 +400,8 @@ class DatasetMixin:
         comment = self.dataset_comment_var.get()
         self.dataset_batch_running = True
         self.begin_activity("dataset", "Preparing dataset acquisition...", len(configurations) * len(OUTPUTS) + 1)
+        self.update_activity("dataset", time_left="calculating...")
+        batch_started_at = time.monotonic()
         self.dataset_batch_stop_event = threading.Event()
         self.dataset_active_scan_button.configure(state="disabled")
         self.dataset_all_scan_button.configure(state="disabled")
@@ -419,16 +432,12 @@ class DatasetMixin:
                     self.network.states.update(states)
                     self.zero_volt_switches.clear()
                     mapping = self.network.mapping()
-                    routed = routed_wavelengths(mapping, assignment)
+                    routed_now.clear()
+                    routed_now.update(routed_wavelengths(mapping, assignment))
                     self.after(0, lambda i=index, total=len(configurations): self.dataset_status_var.set(
                         f"Configuration {i}/{total}: scanning six outputs..."))
                     self.after(0, lambda i=index, total=len(configurations): self.update_activity(
                         "dataset", detail=f"Dataset configuration {i}/{total}: applying controls..."))
-
-                    def read(output):
-                        if simulate:
-                            return simulated_comb_spectrum(assignment, routed[output][0])
-                        return osa.get_spectrum(host, port, fresh_sweeps=POST_SWITCH_SWEEPS)
 
                     def on_result(result, output_index, output_total):
                         self.after(0, lambda i=index, o=result.output, oi=output_index, ot=output_total:
@@ -437,7 +446,7 @@ class DatasetMixin:
                                        detail=f"Dataset configuration {i}/{len(configurations)}: "
                                               f"output {o} ({oi}/{ot})"))
 
-                    results = scan_outputs(switch, read, OUTPUTS, mapping, assignment, settings["half_window_nm"],
+                    results = scan_outputs(switch, read_osa, OUTPUTS, mapping, assignment, settings["half_window_nm"],
                                            settings["settle_s"], on_result=on_result, stop_event=stop_event)
                     if len(results) != len(OUTPUTS):
                         break
@@ -458,10 +467,14 @@ class DatasetMixin:
                         extra={"results_folder": str(folder), "batch_scope": scope})
                     save_wdm_scan(record, results, context, comment)
                     saved += 1
+                    time_left = estimated_time_left(time.monotonic() - batch_started_at,
+                                                    saved, len(configurations))
                     self.after(0, lambda i=index, p=permutation, path=record:
                                self.register_dataset_scan_view(i, p, path))
-                    self.after(0, lambda i=index: self.update_activity(
-                        "dataset", detail=f"Saved dataset configuration {i}/{len(configurations)}"))
+                    self.after(0, lambda i=index, eta=time_left: self.update_activity(
+                        "dataset", done=i * len(OUTPUTS),
+                        detail=f"Saved dataset configuration {i}/{len(configurations)}",
+                        time_left=eta))
             except Exception as error_value:
                 error = str(error_value)
             finally:
@@ -664,6 +677,96 @@ class DatasetMixin:
                 "—" if mean is None else f"{mean:.2f}"))
         self.dataset_scan_view_status.set(f"Showing configuration {self.dataset_scan_choice.get()}")
         self.dataset_scan_canvas.draw_idle()
+
+    def show_dataset_power_history(self):
+        """Plot each wavelength's six-output power against saved scan time."""
+        try:
+            root = self.dataset_root()
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            from matplotlib.figure import Figure
+            from matplotlib.dates import AutoDateLocator, ConciseDateFormatter
+        except (ValueError, ImportError) as error:
+            messagebox.showerror("Total power history unavailable", str(error), parent=self)
+            return
+        if self.dataset_power_window is not None and self.dataset_power_window.winfo_exists():
+            if root == self.dataset_power_root:
+                self.dataset_power_window.lift()
+                return
+            self.dataset_power_window.destroy()
+
+        window = tk.Toplevel(self)
+        window.title("Dataset total power vs time")
+        self.fit_dialog_to_screen(window, preferred_width=1050, preferred_height=650)
+        self.dataset_power_window = window
+        self.dataset_power_root = root
+        status = tk.StringVar(value="Loading saved WDM scans…")
+        ttk.Label(window, textvariable=status, wraplength=960, padding=10).pack(anchor="w")
+        figure = Figure(figsize=(10, 6), facecolor=BG)
+        axis = figure.add_subplot(111)
+        axis.set_facecolor(PANEL)
+        canvas = FigureCanvasTkAgg(figure, master=window)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        def save_figure():
+            path = filedialog.asksaveasfilename(parent=window, title="Save total power history",
+                                                initialdir=str(root), initialfile="total_power_vs_time.png",
+                                                defaultextension=".png", filetypes=[("PNG image", "*.png")])
+            if path:
+                try:
+                    figure.savefig(path, dpi=160, bbox_inches="tight")
+                except OSError as error:
+                    messagebox.showerror("Could not save plot", str(error), parent=window)
+
+        buttons = ttk.Frame(window, padding=10)
+        buttons.pack(anchor="e")
+        ttk.Button(buttons, text="Save PNG…", command=save_figure).pack(side="right")
+
+        def draw(history):
+            if not window.winfo_exists():
+                return
+            axis.clear()
+            count = 0
+            for input_port, points in history.items():
+                if not points:
+                    continue
+                wavelength = points[0][1]
+                axis.plot([point[0] for point in points], [point[2] for point in points], ".-",
+                          color=WDM_COLORS[(input_port - 1) % len(WDM_COLORS)], markersize=3,
+                          linewidth=0.8, label=f"In {input_port} · {wavelength:g} nm")
+                count += len(points)
+            axis.set(xlabel="Scan time", ylabel="Total line peak power across six outputs [dBm]",
+                     title="Wavelength power over the dataset acquisition")
+            axis.tick_params(colors=TEXT)
+            axis.xaxis.label.set_color(TEXT)
+            axis.yaxis.label.set_color(TEXT)
+            axis.title.set_color(TEXT)
+            axis.grid(True, alpha=0.25)
+            if count:
+                locator = AutoDateLocator()
+                axis.xaxis.set_major_locator(locator)
+                axis.xaxis.set_major_formatter(ConciseDateFormatter(locator))
+                axis.legend(fontsize=9)
+                status.set(f"{count} channel points from saved scans. Each point sums line peaks in mW; "
+                           "the scan timestamp is recorded after all six outputs are read.")
+            else:
+                status.set("No complete, physical six-output WDM scans with timestamps were found in this dataset.")
+            figure.tight_layout()
+            canvas.draw_idle()
+
+        def worker():
+            try:
+                history = load_total_power_history(root)
+            except Exception as error:
+                self.after(0, lambda message=str(error): status.set(f"Could not load scans: {message}"))
+            else:
+                self.after(0, lambda: draw(history))
+
+        def refresh():
+            status.set("Loading saved WDM scans…")
+            threading.Thread(target=worker, daemon=True).start()
+
+        ttk.Button(buttons, text="Refresh", command=refresh).pack(side="right", padx=(0, 8))
+        refresh()
 
     def stop_dataset_batch(self):
         if self.dataset_batch_stop_event is not None:

@@ -2,17 +2,42 @@
 
 import csv
 import json
+import math
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from benes.core.network import BenesNetwork
 from benes.measurements.dataset_view import (format_transmission_share, load_output_spectra,
-                                             load_target_summary,
+                                             load_target_summary, load_total_power_history,
                                              saved_dataset_scans, saved_scan_entry)
 
 
 class DatasetViewTests(unittest.TestCase):
+    def test_total_power_history_sums_output_peaks_in_linear_units_and_sorts_by_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, stamp, peak, simulated in (
+                    ("later", "2026-11-02T13:00:00+01:00", -10.0, False),
+                    ("earlier", "2026-11-02T12:00:00+01:00", -20.0, False),
+                    ("simulation", "2026-11-02T14:00:00+01:00", 0.0, True)):
+                folder = root / "Measurements" / name
+                folder.mkdir(parents=True)
+                scan = {"started_at": stamp, "simulated_osa": simulated,
+                        "assignment": {"1": 1558.29},
+                        "outputs": [{"output": output, "lines": {"1": {"peak_dbm": peak}}}
+                                    for output in range(1, 7)]}
+                (folder / "wdm_scan.json").write_text(json.dumps(scan), encoding="utf-8")
+            history = load_total_power_history(root)
+            self.assertEqual([point[0] for point in history[1]],
+                             [datetime.fromisoformat("2026-11-02T12:00:00+01:00"),
+                              datetime.fromisoformat("2026-11-02T13:00:00+01:00")])
+            self.assertEqual([point[1] for point in history[1]], [1558.29, 1558.29])
+            self.assertAlmostEqual(history[1][0][2], -20 + 10 * math.log10(6))
+            self.assertAlmostEqual(history[1][1][2], -10 + 10 * math.log10(6))
+            self.assertEqual(history[2], [])
+
     def test_loads_each_output_with_its_own_routed_target(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)

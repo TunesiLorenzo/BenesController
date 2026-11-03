@@ -26,11 +26,13 @@ The JDSU switch is what makes every output reachable from a single detector: clo
 | Instrument | Role | PC link (default) | Set up in | Saved in |
 | --- | --- | --- | --- | --- |
 | Voltage board (`../VoltageTuner/board.py`) | Drives the 12 heaters with `DC <pin> <voltage>` | USB serial, COM4, 115200 baud | Hardware → Voltage board | `benes_voltage_config.json` |
-| VIAVI OSA 500RS | Reads trace 1 spectra | TCP 192.168.0.200:8002 | Hardware → OSA & output switch | — |
+| VIAVI OSA 500RS | Reads trace 1 spectra | TCP 192.168.0.200:8002 | Hardware → OSA & output switch | Sweeps per reading in `benes_wdm_plan_config.json` |
 | JDSU SC optical switch | Picks which chip output reaches the detector | GPIB0::25::INSTR, SC command set, CR+LF | OSA & output switch → Selector setup… | `benes_osa_output_switch_config.json` |
 | HP 8152A power meter | Triggered power readings for calibration and crosstalk | GPIB0::23::INSTR, channel A, 1550 nm, autorange | Hardware → HP 8152A meter | `benes_hp8152a_config.json` |
 | Arduino Uno + detector | Raw A0 optical stream for calibration and scans | USB serial, COM3, 2,000,000 baud, Stream: raw | Hardware → Arduino meter | `benes_power_meter_config.json` |
 | Newport 9016 laser bank | One laser per chip input | GPIB0::19::INSTR | Hardware → Newport lasers; slot map in MZI calibration | `benes_laser_bank_config.json` |
+
+Every OSA reading, in every tab (trace reads, laser detection, MZI calibration, crosstalk scans and matrix, the voltage optimizer, WDM scans, Evaluate Configuration and dataset batches), is taken the same way: it waits for two complete sweeps after the last change, so the trace lies wholly after a JDSU move or heater step, then averages **Sweeps per reading** (Hardware → OSA, 1–16, default 1) in linear power. More sweeps reduce noise and multiply the time of every reading.
 
 To diagnose a rejected low range remotely, turn off the lasers, then use
 **Hardware → HP 8152A meter → Test -60 dBm range**. It tries separate 10 dB
@@ -90,7 +92,7 @@ The window has seven tabs, ordered by workflow, and a status strip under the tit
 - Type six outputs and press **Route permutation** to set all six connections at once. **Equivalent full-network routings** lists every switch state that gives the same permutation.
 - Clicking an MZI cycles cross → bar → 0 V. Cross and bar send the calibrated voltages; 0 V is drawn amber and routes as cross, the chip's unbiased state.
 - Coloured rings mark the outputs where the **Power Meter** and **OSA** sit; they are saved with every scan.
-- **Optimize voltages** fine-tunes the MZIs on the lit paths around their present voltages, read with the Arduino through the HP BNC output (connect both and set the BNC dBm reference first). With an input selected, only that input's path is tuned. With **None**, every input is lit in turn through the Newport and each MZI is tuned once. Each MZI is bracketed by ±0.15 V, moved to the vertex of a parabola through the three readings, and the bracket narrows to 0.03 V. A move counts only when the reading improves beyond the noise. An MZI stays within 0.5 V of its start and inside 0–5 V and the safe current density, and the whole search takes about 8–16 readings per MZI.
+- **Optimize voltages** fine-tunes the MZIs on the lit paths around their present voltages. It reads with the detection chosen in MZI calibration → Detection. With **OSA**, every laser stays on, the JDSU brings each MZI's leak output to the OSA, and the tuned input's own WDM line there is minimized; it needs the OSA, the JDSU and a wavelength for each tuned input, but no power meter. With **Power meter**, it reads the Arduino through the HP BNC output (connect both and set the BNC dBm reference first). With an input selected, only that input's path is tuned. With **None**, every input is tuned in turn (with the power meter, lit one at a time through the Newport) and each MZI is tuned once. Each MZI is bracketed by ±0.15 V, moved to the vertex of a parabola through the three readings, and the bracket narrows to 0.03 V. A move counts only when the reading improves beyond the noise. An MZI stays within 0.5 V of its start and inside 0–5 V and the safe current density, and the whole search takes about 8–16 readings per MZI.
   - With the meter on the JDSU common (MZI calibration → Detection), each MZI is tuned for the **least light at its leak output**, where its unused port sends the light. That minimum is sharp, so it fixes extinction that the routed power hardly shows. The routed power is read before and after each path.
   - With the meter fixed on one output, only the input routed there can be tuned, and only for the **most routed power**.
   - The new voltages stay applied. Afterwards you are asked whether to save them as the calibrated cross/bar voltages. **Stop optimizer** returns the MZI being tuned to its start voltage and keeps those already finished.
@@ -154,8 +156,10 @@ T(x) = \text{offset} + A\,\frac{1 + \cos\left(\pi x / x_\pi + \varphi_0\right)}{
 $$
 
 - $x$ is heater power in mW, $x = I^2 R_\text{heater}$ with $I = V / R_\text{total}$, or $x = V^2$ when the resistance is unknown.
-- Good fit (RMS under 5% of $A$): cross and bar are the measured points nearest the first maximum and first null. A sweep past $2\pi$ never picks the second extreme.
-- Poor fit: the extremes come from the data, the two-line contrast for the OSA or the power for a meter. Points within 2% of the swing resolve to the lowest voltage.
+- Usable fit (RMS under 15% of $A$): the fit picks the first fringe, so a sweep past $2\pi$ never takes the second extreme. The bright extreme is the measured point nearest the fitted maximum, since its flat top hides the peak in the reading noise. The dark extreme is the darkest measured point within $\pm\pi/4$ of the fitted null: one cos² over the whole sweep places a null only to about a step, and a step off a null costs many dB.
+- No usable fit: the extremes come from the data, the two-line contrast for the OSA or the power for a meter. Bright points within 2% of the swing, and dark points within 1 dB of the darkest, resolve to the lowest voltage.
+
+To apply a change in this extraction to a saved run without measuring again, press **Re-extract saved calibration…** in MZI calibration and pick the run's folder. A table shows the voltages in use beside the re-extracted ones; **Apply** saves the changed ones and re-sends the Routing states. Outside the app, `python -m benes.measurements.recalibrate <calibration folder>` prints the same table, and `--apply` writes it into `benes_voltage_config.json` after saving a timestamped `.bak` copy (close the app first, since it rewrites that file from memory).
 - Fewer than 3 dB of change rejects the MZI; usually the wrong input is lit or the detector is on the wrong output.
 - Every MZI returns to 0 V at the end, also after **Stop** or an error.
 
@@ -260,7 +264,7 @@ Two workflows use a routed chip: WDM configuration evaluation (does each wavelen
 
 Every input carries its own comb line, so one OSA trace per output shows the routed signal and the leakage of all other inputs at once.
 
-1. In **Dataset coverage → Six-laser OSA scan configuration**, set **Comb lines [nm]** (or use **Detect six lasers**), **Line window ± [nm]**, **Extra JDSU settle [s]** (default 0.25), **Extra OSA settle [s]** (default 0), and **Evaluate sweeps per output** (1–16, default 10). Press **Save six-laser configuration** to save both delays.
+1. In **Dataset coverage → Six-laser OSA scan configuration**, set **Comb lines [nm]** (or use **Detect six lasers**), **Line window ± [nm]**, **Extra JDSU settle [s]** (default 0.25), and **Extra OSA settle [s]** (default 0). Press **Save six-laser configuration** to save both delays. The traces averaged per output are the shared **Sweeps per reading** in Hardware → OSA.
 2. Route a permutation on the Routing tab.
 3. Press **Evaluate Configuration**. The JDSU steps through all six outputs; each output waits the settling delay and averages the sweeps in linear power.
 

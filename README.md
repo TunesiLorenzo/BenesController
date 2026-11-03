@@ -159,11 +159,11 @@ always scans all six output ports using that persisted configuration. Its result
 window overlays the six spectra and includes a table for every wavelength:
 linear-sum power across all outputs in dBm, expected routed output, transmission
 there in dBm, and transmission and crosstalk ratios relative to the total in dB.
-Set **Evaluate sweeps per output** under **Dataset coverage** and save the
-six-laser configuration to average 1–16 fresh OSA sweeps at each output (default
-10). Each trace is averaged in linear power before the evaluation and spectra
-CSV are calculated; `wdm_scan.json` records the sweep count. More sweeps take
-longer and reduce sample variation, but cannot correct a shifted coupling mean.
+Every OSA reading in the suite averages **Sweeps per reading** (Hardware → OSA,
+1–16, default 1) fresh sweeps in linear power, after waiting for two sweeps that
+lie wholly after the last switch or heater change; `wdm_scan.json` records the
+count. More sweeps take longer and reduce sample variation, but cannot correct a
+shifted coupling mean.
 
 The saved plan records which comb wavelength enters each input. Configure the
 wavelengths under **Dataset coverage**; an input left empty carries no line. The

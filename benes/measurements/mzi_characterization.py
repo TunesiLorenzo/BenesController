@@ -44,8 +44,17 @@ from benes.measurements.mzi_probing import Probe
 CROSSTALK_SUBFOLDER = "Crosstalk_matrix"
 # A probed MZI must change the reading by at least this much to be trusted.
 DEFAULT_MIN_EXTINCTION_DB = 3.0
-# Points within this share of the swing of an extreme count as that extreme.
+# Points within this share of the swing of the brightest count as bright.
 EXTREME_TIE_FRACTION = 0.02
+# Points within this many dB of the darkest count as dark: nulls are sharp, so a
+# share of the linear swing would let points 17 dB above the null tie with it.
+DARK_TIE_DB = 1.0
+# The fit only has to find the right fringe, so it is used while its rms stays
+# below this share of the amplitude; the measured points then place the extreme.
+FIT_TRUST_FRACTION = 0.15
+# Around a fitted extreme the response is monotonic on each side for ±π/2; the
+# measured extreme is taken within this phase of it.
+EXTREME_WINDOW_RAD = math.pi / 4
 # Pretest: the aggressor alternates between its sweep limits in low-high-high-low
 # blocks, so a linear drift of the reading cancels from the high-low difference.
 SCREEN_PATTERN = (False, True, True, False) * 2
@@ -314,26 +323,37 @@ class MZISweep:
 
 def _extreme(points, value, highest, tie):
     target = max(map(value, points)) if highest else min(map(value, points))
-    close = [point for point in points if abs(value(point) - target) <= tie]
+    close = [point for point in points if abs(value(point) - target) <= tie(target)]
     return min(close, key=lambda point: (abs(point.voltage), -value(point) if highest else value(point)))
 
 
+def fit_trusted(fit) -> bool:
+    return fit is not None and fit.amplitude > 0 and fit.rms < FIT_TRUST_FRACTION * fit.amplitude
+
+
 def fitted_extremes(fit, xs, points):
-    """The measured points nearest the fit's first maximum and first null.
+    """The measured points at the fit's first maximum and first null.
 
     Counting from the sweep start, an extreme already passed by less than
     π/2 is still the first one; the start point is then the best reachable.
+    The maximum is the point nearest the fitted one: the bright lobes
+    dominate the fit, and a flat top hides its peak in the reading noise.
+    The null is sharp, so a step off costs many dB, while a cos² over the
+    whole sweep places it only to about a step; it is the darkest measured
+    point within ``EXTREME_WINDOW_RAD`` of the fitted null.
     """
     measured = [(x, point) for x, point in zip(xs, points) if point.power is not None]
     start, stop = min(x for x, _ in measured), max(x for x, _ in measured)
     start_phase = fit.phase(start)
-    chosen = []
+    targets = []
     for offset in (0.0, math.pi):
         turns = math.ceil((start_phase - math.pi / 2 - offset) / (2 * math.pi))
         target = (offset + 2 * math.pi * turns - fit.phase0) / fit.phase_per_x
-        target = min(max(target, start), stop)
-        chosen.append(min(measured, key=lambda item: (abs(item[0] - target), item[0]))[1])
-    return tuple(chosen)
+        targets.append(min(max(target, start), stop))
+    bright, null = (min(measured, key=lambda item: (abs(item[0] - target), item[0])) for target in targets)
+    window = EXTREME_WINDOW_RAD / fit.phase_per_x
+    near = [item for item in measured if abs(item[0] - targets[1]) <= window] or [null]
+    return bright[1], min(near, key=lambda item: (item[1].power, item[0]))[1]
 
 
 def extract_calibration(probe, points, xs, unit="mW", x_unit="mW",
@@ -350,7 +370,8 @@ def extract_calibration(probe, points, xs, unit="mW", x_unit="mW",
     with_contrast = [point for point in points if point.contrast_db is not None]
     contrast = len(with_contrast) >= 2 and len(with_contrast) == len([p for p in points if p.power is not None])
     if contrast:
-        measured, value, tie = with_contrast, (lambda point: point.contrast_db), 0.5
+        measured, value = with_contrast, (lambda point: point.contrast_db)
+        bright_tie = dark_tie = lambda target: 0.5
         extinction = max(map(value, measured)) - min(map(value, measured))
     else:
         measured = [point for point in points if point.power is not None and math.isfinite(point.power)]
@@ -358,16 +379,18 @@ def extract_calibration(probe, points, xs, unit="mW", x_unit="mW",
             raise ValueError(f"{probe.name}: the detector returned fewer than two readings")
         value = lambda point: point.power
         high, low = max(map(value, measured)), min(map(value, measured))
-        tie = EXTREME_TIE_FRACTION * (high - low)
+        bright_tie = lambda target: EXTREME_TIE_FRACTION * (high - low)
+        dark_tie = lambda target: (target * (10 ** (DARK_TIE_DB / 10) - 1) if target > 0
+                                   else EXTREME_TIE_FRACTION * (high - low))
         extinction = math.inf if low <= 0 < high else 10 * math.log10(high / low) if low > 0 else 0.0
     if extinction < min_extinction_db:
         raise ValueError(f"{probe.name}: only {extinction:.1f} dB change at output {probe.output + 1}; "
                          f"check that input {probe.input + 1} is lit and the detector is on that output")
-    if fit is not None and fit.rms < 0.05 * fit.amplitude:
+    if fit_trusted(fit):
         bright, dark = fitted_extremes(fit, xs, points)
     else:
-        bright = _extreme(measured, value, True, tie)
-        dark = _extreme(measured, value, False, tie)
+        bright = _extreme(measured, value, True, bright_tie)
+        dark = _extreme(measured, value, False, dark_tie)
     cross, bar = (bright, dark) if probe.bright_crossed else (dark, bright)
     return MZISweep(probe, points, cross, bar, extinction, fit, unit)
 

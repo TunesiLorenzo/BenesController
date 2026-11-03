@@ -1,0 +1,202 @@
+{
+  "baud": 115200,
+  "calibration": {
+    "S1.1": {
+      "cross": 0.3,
+      "straight": 2.3
+    },
+    "S1.2": {
+      "cross": 0.7,
+      "straight": 2.4
+    },
+    "S1.3": {
+      "cross": 0.0,
+      "straight": 2.3
+    },
+    "S2.1": {
+      "cross": 0.0,
+      "straight": 4.1
+    },
+    "S2.2": {
+      "cross": 0.0,
+      "straight": 2.1
+    },
+    "S3.1": {
+      "cross": 0.7,
+      "straight": 2.3
+    },
+    "S3.2": {
+      "cross": 0.7,
+      "straight": 2.4
+    },
+    "S4.1": {
+      "cross": 0.0,
+      "straight": 2.2
+    },
+    "S4.2": {
+      "cross": 0.7,
+      "straight": 2.4
+    },
+    "S5.1": {
+      "cross": 0.9,
+      "straight": 2.5
+    },
+    "S5.2": {
+      "cross": 0.0,
+      "straight": 2.3
+    },
+    "S5.3": {
+      "cross": 0.0,
+      "straight": 2.4
+    }
+  },
+  "current_density_per_v": {
+    "0": 10.07,
+    "1": 10.42,
+    "12": 9.679,
+    "13": 10.01,
+    "14": 10.34,
+    "15": 11.27,
+    "2": 10.78,
+    "3": 10.89,
+    "4": 11.2,
+    "5": 10.99,
+    "6": 11.32,
+    "7": 10.86
+  },
+  "default_heater_resistance_ohm": 250.0,
+  "dry_run": false,
+  "heater_device": {
+    "0": "mzi3",
+    "1": "mzi2",
+    "12": "mzi12",
+    "13": "mzi11",
+    "14": "mzi10",
+    "15": "mzi8",
+    "2": "mzi1",
+    "3": "mzi5",
+    "4": "mzi4",
+    "5": "mzi7",
+    "6": "mzi6",
+    "7": "mzi9"
+  },
+  "heater_resistance_ohm": {
+    "0": 121.5,
+    "1": 121.5,
+    "12": 121.5,
+    "13": 121.5,
+    "14": 121.5,
+    "15": 121.5,
+    "2": 121.5,
+    "3": 121.5,
+    "4": 121.5,
+    "5": 121.5,
+    "6": 121.5,
+    "7": 121.5
+  },
+  "imported_heaters": {
+    "mzi1": {
+      "j_peak_per_v": 10.78,
+      "r_heater_ohm": 121.5,
+      "r_total_ohm": 157.4
+    },
+    "mzi10": {
+      "j_peak_per_v": 10.34,
+      "r_heater_ohm": 121.5,
+      "r_total_ohm": 164.0
+    },
+    "mzi11": {
+      "j_peak_per_v": 10.01,
+      "r_heater_ohm": 121.5,
+      "r_total_ohm": 169.4
+    },
+    "mzi12": {
+      "j_peak_per_v": 9.679,
+      "r_heater_ohm": 121.5,
+      "r_total_ohm": 175.2
+    },
+    "mzi2": {
+      "j_peak_per_v": 10.42,
+      "r_heater_ohm": 121.5,
+      "r_total_ohm": 162.8
+    },
+    "mzi3": {
+      "j_peak_per_v": 10.07,
+      "r_heater_ohm": 121.5,
+      "r_total_ohm": 168.3
+    },
+    "mzi4": {
+      "j_peak_per_v": 11.2,
+      "r_heater_ohm": 121.5,
+      "r_total_ohm": 151.3
+    },
+    "mzi5": {
+      "j_peak_per_v": 10.89,
+      "r_heater_ohm": 121.5,
+      "r_total_ohm": 155.7
+    },
+    "mzi6": {
+      "j_peak_per_v": 11.32,
+      "r_heater_ohm": 121.5,
+      "r_total_ohm": 149.7
+    },
+    "mzi7": {
+      "j_peak_per_v": 10.99,
+      "r_heater_ohm": 121.5,
+      "r_total_ohm": 154.3
+    },
+    "mzi8": {
+      "j_peak_per_v": 11.27,
+      "r_heater_ohm": 121.5,
+      "r_total_ohm": 150.5
+    },
+    "mzi9": {
+      "j_peak_per_v": 10.86,
+      "r_heater_ohm": 121.5,
+      "r_total_ohm": 156.1
+    }
+  },
+  "mapping": {
+    "S1.1": 2,
+    "S1.2": 1,
+    "S1.3": 0,
+    "S2.1": 4,
+    "S2.2": 3,
+    "S3.1": 6,
+    "S3.2": 5,
+    "S4.1": 15,
+    "S4.2": 7,
+    "S5.1": 14,
+    "S5.2": 13,
+    "S5.3": 12
+  },
+  "port": "COM4",
+  "total_resistance_ohm": {
+    "0": 168.3,
+    "1": 162.8,
+    "12": 175.2,
+    "13": 169.4,
+    "14": 164.0,
+    "15": 150.5,
+    "2": 157.4,
+    "3": 155.7,
+    "4": 151.3,
+    "5": 154.3,
+    "6": 149.7,
+    "7": 156.1
+  },
+  "voltage": {
+    "S1.1": 0.0,
+    "S1.2": 3.0,
+    "S1.3": 0.0,
+    "S2.1": 3.5,
+    "S2.2": 3.0,
+    "S3.1": 0.5,
+    "S3.2": 1.0,
+    "S4.1": 2.2,
+    "S4.2": 3.2,
+    "S5.1": 2.65,
+    "S5.2": 0.0,
+    "S5.3": 0.5
+  }
+}

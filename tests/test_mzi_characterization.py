@@ -16,7 +16,8 @@ from benes.measurements.mzi_characterization import (LIGHT_POLL_S, MARK_DISTANT,
                                                      OSALineDetector,
                                                      PowerMeterDetector, Reading, SweepPoint, apply_background,
                                                      crosstalk_marks, dbm_to_mw, evaluate_screen,
-                                                     extract_calibration, fit_mzi_response, path_contamination,
+                                                     extract_calibration, fit_mzi_response,
+                                                     fitted_extremes, path_contamination,
                                                      phase_shift_from_power,
                                                      run_calibration, run_crosstalk, save_calibration,
                                                      save_crosstalk, scan_with_detector)
@@ -67,6 +68,23 @@ class FitTests(unittest.TestCase):
         # Bright when bar: the brightest point is bar, the darkest cross.
         self.assertEqual((result.bar.voltage, result.cross.voltage), (0, 3))
         self.assertAlmostEqual(result.extinction_db, 20, places=1)
+
+    def test_null_is_the_darkest_point_near_the_fitted_one_and_the_peak_the_nearest(self):
+        # The fit puts the null at x = 1.3, between points 1 and 2, but the true null is at 2.
+        fit = MZIFit(0.0, 1.0, 10.0, math.pi - 1.3 * math.pi / 10, 0.0, "mW")
+        xs = [0, 1, 2, 3, 6, 11, 12, 13]
+        powers = [0.05, 0.004, 0.0001, 0.02, 0.4, 0.999, 0.998, 0.9995]
+        bright, dark = fitted_extremes(fit, xs, [SweepPoint(x, power) for x, power in zip(xs, powers)])
+        self.assertEqual((dark.voltage, bright.voltage), (2, 11))
+
+    def test_without_a_fit_dark_ties_are_judged_in_db(self):
+        probe = Probe("S1.1", 0, 4, False, (), 1)
+        # Three points are too few to fit. 0 V is 6 dB above the null at 2 V: within 2 % of
+        # the swing, but not within 1 dB.
+        points = [SweepPoint(0, 0.004), SweepPoint(1, 1.0), SweepPoint(2, 0.001)]
+        result = extract_calibration(probe, points, [0, 1, 4], min_extinction_db=3)
+        self.assertIsNone(result.fit)
+        self.assertEqual((result.cross.voltage, result.bar.voltage), (2, 1))
 
     def test_a_flat_response_is_rejected(self):
         probe = Probe("S1.1", 0, 4, True, (), 1)

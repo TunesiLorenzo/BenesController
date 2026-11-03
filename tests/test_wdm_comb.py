@@ -7,8 +7,8 @@ import unittest
 from pathlib import Path
 
 from benes.hardware.osa_output_switch import OSAOutputSwitch
-from benes.measurements.wdm_comb import (LinePower, WDMOutputResult, WDMPlan,
-                                         acquire_averaged_spectrum, average_spectra, evaluate_configuration,
+from benes.measurements.osa_reading import acquire_averaged_spectrum, average_spectra, osa_reader
+from benes.measurements.wdm_comb import (LinePower, WDMOutputResult, WDMPlan, evaluate_configuration,
                                          line_power, normalized_assignment, parse_comb_lines,
                                          power_ratio_db, routed_wavelengths, save_configuration_evaluation,
                                          save_wdm_scan, scan_outputs,
@@ -32,9 +32,11 @@ class WDMPlanTests(unittest.TestCase):
             self.assertEqual(reloaded.settings["settle_s"], 5)
             self.assertEqual(reloaded.load_preset("C-band A")["1"], 1550.12)
             self.assertIsNone(reloaded.assignment["2"])
-            self.assertEqual(reloaded.settings["evaluation_sweeps"], 10)
-            plan.configure({"1": 1550.12}, 0.3, 5, evaluation_sweeps="5")
-            self.assertEqual(WDMPlan(path).settings["evaluation_sweeps"], 5)
+            self.assertEqual(reloaded.settings["osa_sweeps"], 1)
+            plan.configure({"1": 1550.12}, 0.3, 5, osa_sweeps="5")
+            self.assertEqual(WDMPlan(path).settings["osa_sweeps"], 5)
+            self.assertEqual(plan.set_osa_sweeps("3"), 3)
+            self.assertEqual(WDMPlan(path).settings["osa_sweeps"], 3)
             reloaded.delete_preset("C-band A")
             self.assertEqual(WDMPlan(path).settings["presets"], {})
 
@@ -53,8 +55,14 @@ class WDMPlanTests(unittest.TestCase):
                 plan.configure({}, 0.2, -1)
             with self.assertRaisesRegex(ValueError, "window"):
                 plan.configure({}, 0, 1)
-            with self.assertRaisesRegex(ValueError, "Evaluation sweeps"):
-                plan.configure({}, 0.2, 1, evaluation_sweeps="2.5")
+            with self.assertRaisesRegex(ValueError, "OSA sweeps per reading"):
+                plan.configure({}, 0.2, 1, osa_sweeps="2.5")
+
+    def test_an_older_plan_keeps_its_evaluation_sweeps_as_the_shared_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plan.json"
+            path.write_text(json.dumps({"evaluation_sweeps": 3}), encoding="utf-8")
+            self.assertEqual(WDMPlan(path).settings["osa_sweeps"], 3)
 
     def test_routed_wavelengths_follow_the_permutation(self):
         routed = routed_wavelengths(MAPPING, normalized_assignment(PLAN))
@@ -87,6 +95,14 @@ class SpectrumAveragingTests(unittest.TestCase):
         self.assertEqual(progress, [(1, 3), (2, 3), (3, 3)])
         self.assertEqual(wave, [1550.0])
         self.assertAlmostEqual(power[0], 10 * math.log10((0.1 + 0.01 + 0.1) / 3))
+
+    def test_reader_simulates_per_output_and_averages_the_shared_count(self):
+        read = osa_reader(None, 0, 2, simulated=lambda output: ([1550.0], [-10.0 - output]))
+        progress = []
+        wave, power = read(3, lambda index, total: progress.append(index))
+        self.assertEqual((wave, power, progress), ([1550.0], [-13.0], [1, 2]))
+        with self.assertRaisesRegex(ValueError, "1 to 16"):
+            osa_reader(None, 0, 17)
 
     def test_rejects_misaligned_sweep_grids(self):
         with self.assertRaisesRegex(ValueError, "wavelength grid"):

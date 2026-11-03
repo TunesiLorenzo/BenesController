@@ -9,8 +9,8 @@
     "6": 1552.64
   },
   "comb_lines": [],
-  "evaluation_sweeps": 10,
   "half_window_nm": 0.2,
+  "osa_sweeps": 1,
   "presets": {},
   "settle_s": 0.0
 }

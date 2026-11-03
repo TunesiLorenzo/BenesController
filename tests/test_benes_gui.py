@@ -6,6 +6,7 @@ from unittest.mock import patch
 from benes.gui.app import BenesApp
 from benes.gui.calibration import CalibrationMixin
 from benes.gui.crosstalk import CrosstalkMixin
+from benes.gui.dataset import estimated_time_left
 from benes.core.network import BenesNetwork
 from benes.hardware.power_meter import PowerReading
 from benes.measurements.arduino_hp_range import BNCReference
@@ -115,6 +116,9 @@ class ActivityProgressTests(unittest.TestCase):
         BenesApp.update_activity(app, "evaluation", 20, detail="Output 2, sweep 10/10")
         self.assertEqual(app.activity_bar.options["value"], 20)
         self.assertEqual(text.value, "Output 2, sweep 10/10")
+        BenesApp.update_activity(app, "evaluation", time_left="1:30:00")
+        BenesApp.update_activity(app, "evaluation", detail="Output 3, sweep 1/10")
+        self.assertEqual(text.value, "Output 3, sweep 1/10  ·  Est. time left: 1:30:00")
         BenesApp.begin_activity(app, "read", "Reading power")
         self.assertEqual(app.activity_bar.options["mode"], "indeterminate")
         BenesApp.finish_activity(app, "read", "Power read complete")
@@ -122,6 +126,11 @@ class ActivityProgressTests(unittest.TestCase):
         self.assertEqual(app.activity_bar.options["value"], 20)
         BenesApp.finish_activity(app, "evaluation", "Evaluation complete")
         self.assertEqual(text.value, "Evaluation complete")
+
+    def test_dataset_time_left_uses_completed_configuration_rate(self):
+        self.assertEqual(estimated_time_left(120, 0, 10), "calculating...")
+        self.assertEqual(estimated_time_left(120, 2, 10), "0:08:00")
+        self.assertEqual(estimated_time_left(120, 10, 10), "0:00:00")
 
 
 class PathProgressTests(unittest.TestCase):
@@ -172,14 +181,13 @@ class PathProgressTests(unittest.TestCase):
                               after=lambda delay, callback: callback())
         wave = [1549 + index * 0.01 for index in range(1400)]
 
-        def spectrum(host, port, fresh_sweeps):
-            center = 1549 + selected[-1]
+        def read(output):
+            center = 1549 + output
             return wave, [-60 + 40 * math.exp(-((value - center) / 0.03) ** 2)
                           + 50 * math.exp(-((value - 1561) / 0.03) ** 2) for value in wave]
 
         traces = []
-        with patch("benes.gui.calibration.osa.get_spectrum", side_effect=spectrum):
-            wavelengths = CalibrationMixin.detect_laser_channels_from_outputs(app, "osa", 1, traces)
+        wavelengths = CalibrationMixin.detect_laser_channels_from_outputs(app, read, traces)
         self.assertEqual(selected, list(range(1, 7)))
         self.assertEqual(wavelengths, [1555, 1554, 1553, 1552, 1551, 1550])
         self.assertEqual(len(traces), 6)

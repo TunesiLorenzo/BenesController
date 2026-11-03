@@ -3,6 +3,7 @@
 import csv
 import json
 import math
+from datetime import datetime
 from functools import lru_cache
 from itertools import permutations, product
 from pathlib import Path
@@ -148,3 +149,40 @@ def load_target_summary(folder):
                      float(measured["window_mean_dbm"]) if measured["window_mean_dbm"] else None,
                      share))
     return permutation, rows
+
+
+def load_total_power_history(root):
+    """Time series of each input line summed over all six output ports.
+
+    Peak powers are stored in dBm, so sum them as mW before converting back.
+    Incomplete or simulated scans are excluded from the physical time series.
+    """
+    history = {input_port: [] for input_port in range(1, 7)}
+    for path in (Path(root) / "Measurements").glob("*/wdm_scan.json"):
+        try:
+            scan = json.loads(path.read_text(encoding="utf-8"))
+            if scan.get("simulated_osa"):
+                continue
+            stamp = datetime.fromisoformat(scan["started_at"])
+            if stamp.tzinfo is None:
+                continue
+            assignment = scan["assignment"]
+            outputs = scan["outputs"]
+            if len(outputs) != 6 or {int(item["output"]) for item in outputs} != set(range(1, 7)):
+                continue
+            for input_port in history:
+                wavelength = assignment.get(str(input_port))
+                if wavelength is None:
+                    continue
+                lines = [item.get("lines", {}).get(str(input_port)) for item in outputs]
+                if any(line is None or line.get("peak_dbm") is None for line in lines):
+                    continue
+                powers = [float(line["peak_dbm"]) for line in lines]
+                total_mw = math.fsum(10 ** (power / 10) for power in powers)
+                if total_mw > 0 and math.isfinite(total_mw):
+                    history[input_port].append((stamp, float(wavelength), 10 * math.log10(total_mw)))
+        except (OSError, ValueError, KeyError, TypeError, OverflowError, json.JSONDecodeError):
+            continue
+    for points in history.values():
+        points.sort(key=lambda item: item[0])
+    return history

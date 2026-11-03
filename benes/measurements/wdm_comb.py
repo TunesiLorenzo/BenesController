@@ -22,6 +22,7 @@ from typing import Callable
 
 from benes.hardware.osa import trim_spurious_tail
 from benes.hardware.osa_output_switch import fiber_number
+from benes.measurements.osa_reading import validate_sweeps
 from benes.measurements.spectrum_export import write_spectra
 from benes.paths import app_dir
 
@@ -91,7 +92,8 @@ class WDMPlan:
             "comb_lines": [],
             "half_window_nm": 0.2,
             "settle_s": 0.0,
-            "evaluation_sweeps": 10,
+            # Traces averaged per OSA reading, by every measurement (``osa_reading``).
+            "osa_sweeps": 1,
         }
 
     def _load(self) -> dict:
@@ -101,12 +103,15 @@ class WDMPlan:
         try:
             stored = json.loads(self.config_path.read_text(encoding="utf-8"))
             candidate = {**settings, **{name: stored[name] for name in settings if name in stored}}
+            if "osa_sweeps" not in stored and "evaluation_sweeps" in stored:
+                # Before it applied to every reading, the count only set Evaluate Configuration.
+                candidate["osa_sweeps"] = stored["evaluation_sweeps"]
             candidate["assignment"] = normalized_assignment(candidate["assignment"])
             candidate["comb_lines"] = parse_comb_lines(" ".join(map(str, candidate["comb_lines"])))
             candidate["presets"] = {str(name): normalized_assignment(value)
                                     for name, value in dict(candidate["presets"]).items()}
             self._validate_scan(candidate["half_window_nm"], candidate["settle_s"])
-            candidate["evaluation_sweeps"] = self._validate_evaluation_sweeps(candidate["evaluation_sweeps"])
+            candidate["osa_sweeps"] = validate_sweeps(candidate["osa_sweeps"])
             settings = candidate
         except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
             # A damaged plan must not prevent the controller from starting.
@@ -122,16 +127,6 @@ class WDMPlan:
             raise ValueError("Settling delay must be between 0 and 600 seconds")
         return half_window_nm, settle_s
 
-    @staticmethod
-    def _validate_evaluation_sweeps(value) -> int:
-        try:
-            count = int(value)
-        except (TypeError, ValueError) as error:
-            raise ValueError("Evaluation sweeps must be a whole number from 1 to 16") from error
-        if str(value).strip() != str(count) or not 1 <= count <= 16:
-            raise ValueError("Evaluation sweeps must be a whole number from 1 to 16")
-        return count
-
     def save(self) -> None:
         temporary = self.config_path.with_suffix(self.config_path.suffix + ".tmp")
         temporary.write_text(json.dumps(self.settings, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -141,15 +136,20 @@ class WDMPlan:
     def assignment(self) -> dict:
         return self.settings["assignment"]
 
-    def configure(self, assignment: dict, half_window_nm, settle_s, comb_lines="",
-                  evaluation_sweeps=None) -> None:
+    def configure(self, assignment: dict, half_window_nm, settle_s, comb_lines="", osa_sweeps=None) -> None:
         assignment = normalized_assignment(assignment)
         half_window_nm, settle_s = self._validate_scan(half_window_nm, settle_s)
-        evaluation_sweeps = self._validate_evaluation_sweeps(
-            self.settings["evaluation_sweeps"] if evaluation_sweeps is None else evaluation_sweeps)
+        osa_sweeps = validate_sweeps(self.settings["osa_sweeps"] if osa_sweeps is None else osa_sweeps)
         self.settings.update(assignment=assignment, half_window_nm=half_window_nm, settle_s=settle_s,
-                             comb_lines=parse_comb_lines(comb_lines), evaluation_sweeps=evaluation_sweeps)
+                             comb_lines=parse_comb_lines(comb_lines), osa_sweeps=osa_sweeps)
         self.save()
+
+    def set_osa_sweeps(self, value) -> int:
+        count = validate_sweeps(value)
+        if count != self.settings["osa_sweeps"]:
+            self.settings["osa_sweeps"] = count
+            self.save()
+        return count
 
     def save_preset(self, name: str) -> None:
         name = str(name).strip()
@@ -281,37 +281,6 @@ def evaluate_configuration(results: list[WDMOutputResult], mapping, assignment: 
 def power_ratio_db(fraction: float | None) -> float | None:
     """Express a positive linear power fraction relative to its total in dB."""
     return None if fraction is None or fraction <= 0 else 10 * math.log10(fraction)
-
-
-def average_spectra(spectra) -> tuple[list[float], list[float]]:
-    """Average matching OSA traces as linear power, then return dBm samples."""
-    traces = list(spectra)
-    if not traces:
-        raise ValueError("No OSA spectra were acquired for averaging")
-    wavelengths = list(traces[0][0])
-    if not wavelengths or any(len(wave) != len(wavelengths) or len(power) != len(wavelengths)
-                              for wave, power in traces):
-        raise ValueError("OSA sweeps have different trace lengths")
-    for wave, _ in traces[1:]:
-        if any(not math.isclose(first, later, rel_tol=0, abs_tol=1e-6)
-               for first, later in zip(wavelengths, wave)):
-            raise ValueError("OSA wavelength grid changed between sweeps")
-    averaged = [10 * math.log10(math.fsum(10 ** (power[index] / 10) for _, power in traces) / len(traces))
-                for index in range(len(wavelengths))]
-    return wavelengths, averaged
-
-
-def acquire_averaged_spectrum(fetch: Callable[[int], tuple], count: int,
-                              first_fresh_sweeps: int = 2,
-                              on_sweep: Callable[[int, int], None] | None = None) -> tuple[list[float], list[float]]:
-    """Acquire complete sweeps after an output change, then average their power."""
-    count = WDMPlan._validate_evaluation_sweeps(count)
-    spectra = []
-    for index in range(1, count + 1):
-        spectra.append(fetch(first_fresh_sweeps if index == 1 else 1))
-        if on_sweep is not None:
-            on_sweep(index, count)
-    return average_spectra(spectra) if count > 1 else spectra[0]
 
 
 def simulated_comb_spectrum(assignment: dict, routed_input: int, points: int = 4001) -> tuple[list, list]:

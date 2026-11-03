@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from benes.measurements.mzi_characterization import MZIFit, fit_mzi_response
+from benes.measurements.mzi_characterization import FIT_TRUST_FRACTION, MZIFit, fit_mzi_response
 
 
 CROSS_COLOR = "#2a78d6"
@@ -37,8 +37,6 @@ DATA_COLOR = "#52514e"
 FLAG_COLOR = "#e34948"
 LOW_EXTINCTION_DB = 20.0
 PHASE_TOLERANCE_DEG = 10.0
-# The calibration only trusts its fit below this rms / amplitude.
-FIT_TRUST_FRACTION = 0.05
 LEAKAGE_FLOOR_DB = -60.0
 
 

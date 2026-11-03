@@ -2,9 +2,6 @@
 
 from tkinter import ttk
 
-# Completed OSA sweeps to wait for after moving the output switch: the first may
-# have begun before the move, the second lies wholly after it.
-POST_SWITCH_SWEEPS = 2
 # Smallest plot area before the tab scrolls instead of squeezing the figure further.
 PLOT_MIN_SIZE = {"width": 480, "height": 320}
 

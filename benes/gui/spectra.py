@@ -5,9 +5,10 @@ import tkinter as tk
 from datetime import datetime
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from benes.gui.theme import PLOT_MIN_SIZE, POST_SWITCH_SWEEPS, WDM_MARKER_GID
+from benes.gui.theme import PLOT_MIN_SIZE, WDM_MARKER_GID
 from benes.hardware import osa
 from benes.hardware.osa_output_switch import fiber_number
+from benes.measurements.osa_reading import osa_reader
 from benes.measurements.spectrum_export import write_spectra
 
 
@@ -26,6 +27,17 @@ class SpectraMixin:
             raise ValueError("Enter a valid OSA host and port in Hardware")
         return host, port, simulate
 
+    def osa_reader(self, simulated=None):
+        """``read(output=None, on_sweep=None)`` as every measurement takes an OSA reading.
+
+        Two fresh sweeps, then the shared sweeps per reading averaged (``osa_reading``).
+        ``simulated(output)`` stands in for the OSA in Simulate mode. Call on the Tk thread:
+        it validates the connection fields and saves a changed sweep count.
+        """
+        host, port, simulate = self.osa_connection()
+        sweeps = self.wdm_plan.set_osa_sweeps(self.osa_sweeps_var.get())
+        return osa_reader(None if simulate else host, port, sweeps, simulated)
+
     def set_osa_reading(self, reading: bool):
         state = "disabled" if reading else "normal"
         self.osa_button.configure(state=state)
@@ -40,7 +52,7 @@ class SpectraMixin:
 
     def start_osa_read(self, output=None):
         try:
-            host, port, simulate = self.osa_connection()
+            read = self.osa_reader()
             if output is not None:
                 output = int(output)
                 if not self.osa_output_switch.connected:
@@ -56,8 +68,7 @@ class SpectraMixin:
             try:
                 if output is not None:
                     self.osa_output_switch.select_output(output)
-                data = osa.simulated_spectrum() if simulate else osa.get_spectrum(
-                    host, port, fresh_sweeps=0 if output is None else POST_SWITCH_SWEEPS)
+                data = read(output)
             except Exception as error:
                 self.after(0, lambda error=error: self.osa_failed(str(error)))
             else:
@@ -81,7 +92,7 @@ class SpectraMixin:
 
     def read_all_osa_outputs(self):
         try:
-            host, port, simulate = self.osa_connection()
+            read = self.osa_reader()
             if not self.osa_output_switch.connected:
                 raise RuntimeError("Connect the OSA output switch first (dry run is available)")
             outputs = self.osa_output_switch.mapped_outputs()
@@ -99,8 +110,7 @@ class SpectraMixin:
             try:
                 for output in outputs:
                     self.osa_output_switch.select_output(output)
-                    spectrum = osa.simulated_spectrum() if simulate else osa.get_spectrum(
-                        host, port, fresh_sweeps=POST_SWITCH_SWEEPS)
+                    spectrum = read(output)
                     spectra.append((output, spectrum))
                     self.after(0, lambda o=output, i=len(spectra): self.update_activity(
                         "osa_read", i, detail=f"OSA output {o} read ({i}/{len(outputs)})"))

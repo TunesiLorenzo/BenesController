@@ -5,11 +5,10 @@ import tkinter as tk
 from datetime import datetime
 from tkinter import messagebox, ttk
 
-from benes.gui.theme import BG, PANEL, PLOT_MIN_SIZE, POST_SWITCH_SWEEPS, TEXT, WDM_COLORS, WIRE
-from benes.hardware import osa
+from benes.gui.theme import BG, PANEL, PLOT_MIN_SIZE, TEXT, WDM_COLORS, WIRE
 from benes.hardware.osa_output_switch import OUTPUTS, fiber_number
 from benes.measurements.dataset_registry import save_measurement
-from benes.measurements.wdm_comb import (INPUTS, acquire_averaged_spectrum, create_wdm_folder,
+from benes.measurements.wdm_comb import (INPUTS, create_wdm_folder,
                                          evaluate_configuration,
                                          power_ratio_db, routed_wavelengths,
                                          save_configuration_evaluation, save_wdm_scan, scan_outputs,
@@ -55,7 +54,7 @@ class WDMMixin:
     def save_wdm_plan(self, quiet=False):
         try:
             self.wdm_plan.configure(self.wdm_assignment(), self.wdm_window_var.get(), self.wdm_settle_var.get(),
-                                    self.wdm_comb_var.get(), self.wdm_evaluation_sweeps_var.get())
+                                    self.wdm_comb_var.get(), self.osa_sweeps_var.get())
         except (OSError, ValueError) as error:
             if not quiet:
                 messagebox.showerror("WDM plan", str(error), parent=self)
@@ -92,7 +91,9 @@ class WDMMixin:
                 raise ValueError("Save a wavelength for every input before evaluating the configuration")
             if not any(wavelength is not None for wavelength in assignment.values()):
                 raise ValueError("Assign a comb wavelength to at least one input")
-            host, port, simulate = self.osa_connection()
+            simulate = self.osa_dry_run_var.get()
+            routed = routed_wavelengths(self.network.mapping(), assignment)
+            read_osa = self.osa_reader(lambda output: simulated_comb_spectrum(assignment, routed[output][0]))
             if not switch.connected:
                 raise RuntimeError("Connect the OSA output switch first (dry run is available)")
             if outputs is None:
@@ -113,9 +114,8 @@ class WDMMixin:
 
         mapping = self.network.mapping()
         permutation = self.active_dataset_permutation()
-        routed = routed_wavelengths(mapping, assignment)
         settings = self.wdm_plan.settings
-        evaluation_sweeps = settings["evaluation_sweeps"] if evaluation else 1
+        sweeps = settings["osa_sweeps"]
         comment = self.dataset_comment_var.get()
         context = {
             "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -124,7 +124,7 @@ class WDMMixin:
             "wavelength_plan": settings["active_preset"],
             "half_window_nm": settings["half_window_nm"],
             "settle_s": settings["settle_s"],
-            "averaged_sweeps_per_output": evaluation_sweeps,
+            "averaged_sweeps_per_output": sweeps,
             "jdsu_switch_settle_s": switch.settings["settle_s"],
             "jdsu_channel_map": dict(switch.settings["channel_map"]),
             "switch_states": {name: "cross" if crossed else "bar" for name, crossed in self.network.states.items()},
@@ -143,17 +143,11 @@ class WDMMixin:
                            self.update_activity("wdm", (oi - 1) * c + i,
                                                 detail=f"{'Evaluating' if evaluation else 'Scanning'} output "
                                                        f"{o} ({oi}/{len(outputs)}), sweep {i}/{c}"))
-            if simulate:
-                return acquire_averaged_spectrum(
-                    lambda _: simulated_comb_spectrum(assignment, routed[output][0]),
-                    evaluation_sweeps, POST_SWITCH_SWEEPS, on_sweep)
-            return acquire_averaged_spectrum(
-                lambda fresh: osa.get_spectrum(host, port, fresh_sweeps=fresh),
-                evaluation_sweeps, POST_SWITCH_SWEEPS, on_sweep)
+            return read_osa(output, on_sweep)
 
         self.wdm_running = True
         self.begin_activity("wdm", "Evaluating configuration" if evaluation else "WDM output scan",
-                            len(outputs) * evaluation_sweeps + 1)
+                            len(outputs) * sweeps + 1)
         self.wdm_stop_event = threading.Event()
         if hasattr(self, "wdm_start_button"):
             self.wdm_start_button.configure(state="disabled")
@@ -164,7 +158,7 @@ class WDMMixin:
         self.set_osa_reading(True)
         self.wdm_status_var.set(("Evaluating" if evaluation else "Scanning") +
                                 f" outputs {', '.join(map(str, outputs))}"
-                                + (f" ({evaluation_sweeps} sweeps/output)" if evaluation else "") + "...")
+                                + (f" ({sweeps} sweeps/output)" if sweeps > 1 else "") + "...")
         stop_event = self.wdm_stop_event
 
         markers = [(wavelength, WDM_COLORS[int(port) - 1], f"In {port} · {wavelength:g} nm")

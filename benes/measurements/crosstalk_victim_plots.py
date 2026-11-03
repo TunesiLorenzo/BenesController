@@ -30,7 +30,7 @@ from typing import Sequence
 
 from benes.measurements.crosstalk_results import PLOT_X_POWER, PLOT_X_VOLTAGE, plot_x_values
 from benes.measurements.mzi_characterization import (EXTREME_TIE_FRACTION, MZIFit, SweepPoint, draw_phase_shifts,
-                                                     fitted_extremes, mw_to_dbm, quadrature_point)
+                                                     fit_trusted, fitted_extremes, mw_to_dbm, quadrature_point)
 
 BRIGHT_SUFFIX = " (victim bright)"
 
@@ -196,7 +196,7 @@ def operating_points(run: MatrixRun, probe: VictimProbe) -> tuple[SweepPoint | N
         bias = quadrature_point(SimpleNamespace(name=probe.victim, fit=fit, points=probe.points), xs)
     else:
         bias = None
-    if fit is not None and fit.amplitude > 0 and fit.rms < 0.05 * fit.amplitude:
+    if fit_trusted(fit):
         bright = fitted_extremes(fit, xs, probe.points)[0]
     else:
         high, low = max(p.power for p in measured), min(p.power for p in measured)

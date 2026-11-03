@@ -10,15 +10,16 @@ import threading
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from benes.gui.theme import (ACCENT, BG, CAL_STATUS, CHECK_SHORT, OSA_COLOR, PANEL, PLOT_MIN_SIZE,
-                             POST_SWITCH_SWEEPS, TEXT, VERDICT_ORDER, WDM_COLORS, WIRE, ZERO_VOLT_COLOR)
+                             TEXT, VERDICT_ORDER, WDM_COLORS, WIRE, ZERO_VOLT_COLOR)
 from benes.gui.widgets import VerticalScrolledFrame
 from benes.hardware import osa
 from benes.hardware.laser_bank import LaserBank, SimulatedLaserController
 from benes.hardware.osa_output_switch import OUTPUTS, fiber_number
 from benes.hardware.power_meter import RANGE_TRACKING_OFF
+from benes.measurements.calibration_analysis import CalibrationAnalysisError, find_calibration_files
 from benes.measurements.calibration_scan import scan_voltages
 from benes.measurements.crosstalk_results import PLOT_X_POWER, PLOT_X_VOLTAGE, plot_x_values
 from benes.measurements.arduino_hp_range import (ArduinoHPRangeSweep, BNC_CLIP_ADC, FLOOR_MIN_ADC,
@@ -32,6 +33,7 @@ from benes.measurements.mzi_characterization import (OSALineDetector, PowerMeter
 from benes.measurements.mzi_probing import plan_calibration
 from benes.measurements.power_route_check import (plan_route_checks, run_power_route_check,
                                                    save_power_route_check)
+from benes.measurements.recalibrate import recalibrate
 from benes.measurements.wdm_comb import INPUTS
 from benes.paths import app_dir
 
@@ -122,6 +124,9 @@ class CalibrationMixin:
         self.cal_all_button = ttk.Button(calibrate, text="Calibrate all visible MZIs", style="Accent.TButton",
                                          command=self.start_complete_calibration)
         self.cal_all_button.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.cal_reextract_button = ttk.Button(calibrate, text="Re-extract saved calibration…",
+                                               command=self.reextract_saved_calibration)
+        self.cal_reextract_button.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
         checks = ttk.LabelFrame(controls, text="State checks", padding=10)
         checks.pack(fill="x", pady=(12, 0))
@@ -414,7 +419,8 @@ class CalibrationMixin:
                 raise RuntimeError("Wait for the MZI calibration to finish")
             if self.osa_button.instate(["disabled"]):
                 raise RuntimeError("Wait for the current OSA trace read to finish")
-            host, port, simulate = self.osa_connection()
+            simulate = self.osa_dry_run_var.get()
+            read = self.osa_reader()
             self.calibration_plot_support()
         except (ImportError, RuntimeError, ValueError) as error:
             messagebox.showerror("Laser-channel detection unavailable", str(error), parent=self)
@@ -430,9 +436,9 @@ class CalibrationMixin:
             try:
                 switch = self.osa_output_switch
                 if not simulate and switch.connected and len(switch.mapped_outputs()) == len(INPUTS):
-                    wavelengths = self.detect_laser_channels_from_outputs(host, port, traces)
+                    wavelengths = self.detect_laser_channels_from_outputs(read, traces)
                 else:
-                    wave, power = osa.simulated_spectrum() if simulate else osa.get_spectrum(host, port)
+                    wave, power = read()
                     wave, power = osa.trim_spurious_tail(wave, power)
                     traces.append(("OSA trace", wave, power))
                     wavelengths = osa.find_laser_wavelengths(
@@ -445,7 +451,7 @@ class CalibrationMixin:
 
         threading.Thread(target=acquire, daemon=True).start()
 
-    def detect_laser_channels_from_outputs(self, host, port, traces):
+    def detect_laser_channels_from_outputs(self, read, traces):
         """Read all mapped outputs and detect one dominant wavelength per output."""
         switch = self.osa_output_switch
         outputs = switch.mapped_outputs()
@@ -458,7 +464,7 @@ class CalibrationMixin:
                     "laser_detection", i - 1, total=len(outputs) + 1,
                     detail=f"Detecting lasers: reading output {o} ({i}/{len(outputs)})"))
             switch.select_output(output)
-            wave, power = osa.get_spectrum(host, port, fresh_sweeps=POST_SWITCH_SWEEPS)
+            wave, power = read(output)
             wave, power = osa.trim_spurious_tail(wave, power)
             traces.append((f"Out {output} (fiber {fiber_number(output)})", wave, power))
             if hasattr(self, "update_activity"):
@@ -540,6 +546,70 @@ class CalibrationMixin:
             raise ValueError("The pass margin must be between 0 and 60 dB")
         return voltages, settle_ms / 1000, pass_db
 
+    def reextract_saved_calibration(self):
+        """Pick cross/bar again from a saved run's sweeps with the current extraction, then offer to apply."""
+        if self.measurement_busy():
+            messagebox.showinfo("Measurement running", "Wait for the current measurement to finish.", parent=self)
+            return
+        folder = filedialog.askdirectory(parent=self, title="Saved MZI calibration folder",
+                                         initialdir=app_dir() / "Results")
+        if not folder:
+            return
+        files = find_calibration_files(folder)
+        try:
+            if len(files) != 1:
+                raise CalibrationAnalysisError(f"Expected one mzi_calibration.json under {folder}, "
+                                               f"found {len(files)}")
+            results = recalibrate(files[0])
+        except (OSError, CalibrationAnalysisError) as error:
+            messagebox.showerror("Re-extraction failed", str(error), parent=self)
+            return
+        current = self.controller.settings["calibration"]
+        window = tk.Toplevel(self)
+        window.title(f"Re-extract {files[0].parent.name}")
+        self.fit_dialog_to_screen(window, preferred_width=720, preferred_height=420)
+        columns = (("mzi", "MZI"), ("cross_now", "Cross now [V]"), ("cross_new", "Cross new [V]"),
+                   ("bar_now", "Bar now [V]"), ("bar_new", "Bar new [V]"), ("method", "Placed by"))
+        table = ttk.Treeview(window, columns=[key for key, _ in columns], show="headings", height=len(results))
+        for key, heading in columns:
+            table.heading(key, text=heading)
+            table.column(key, width=150 if key == "method" else 100, anchor="center")
+        fmt = lambda value: "—" if value is None else f"{value:.2f}"
+        changed = []
+        for result in results:
+            now = current[result.name]
+            differs = result.cross is not None and (result.cross, result.bar) != (now["cross"], now["straight"])
+            if differs:
+                changed.append(result)
+            table.insert("", "end", values=(result.name + (" *" if differs else ""), fmt(now["cross"]),
+                                            fmt(result.cross), fmt(now["straight"]), fmt(result.bar),
+                                            result.method))
+        table.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+        ttk.Label(window, wraplength=680, text=(
+            "* differs from the voltages in use. \"fit\": the fit picked the first fringe, the null is the darkest "
+            "point near it. \"raw\": no usable fit, extremes from the points. Apply saves the new voltages and "
+            "re-sends the Routing tab's switch states.")).pack(anchor="w", padx=10)
+
+        def apply():
+            try:
+                for result in changed:
+                    self.controller.set_calibration(result.name, result.bar, result.cross)
+                if self.controller.connected:
+                    self.apply_calibration()
+                else:
+                    self.show_calibrated_voltages()
+            except (OSError, RuntimeError, ValueError) as error:
+                messagebox.showerror("Re-extraction not applied", str(error), parent=window)
+                return
+            self.update_hardware_status(f"Re-extracted calibration applied to {len(changed)} MZI(s)")
+            window.destroy()
+
+        buttons = ttk.Frame(window)
+        buttons.pack(fill="x", padx=10, pady=10)
+        ttk.Button(buttons, text="Close", command=window.destroy).pack(side="right")
+        ttk.Button(buttons, text=f"Apply {len(changed)} change(s)", style="Accent.TButton", command=apply,
+                   state="normal" if changed else "disabled").pack(side="right", padx=(0, 8))
+
     def measurement_busy(self):
         return (self.mzi_calibration_running or self.crosstalk_running or self.wdm_running or
                 self.dataset_batch_running or getattr(self, "route_optimizer_running", False))
@@ -550,7 +620,7 @@ class CalibrationMixin:
             raise RuntimeError("Wait for the current measurement to finish")
         if self.osa_button.instate(["disabled"]):
             raise RuntimeError("Wait for the current OSA read to finish")
-        host, port, simulate = self.osa_connection()
+        simulate = self.osa_dry_run_var.get()
         if not self.controller.connected:
             raise RuntimeError("Connect the voltage board first (Hardware)")
         if self.controller.settings["dry_run"] != simulate:
@@ -565,12 +635,9 @@ class CalibrationMixin:
         if not wavelengths:
             raise ValueError("Assign a comb wavelength to each laser input in the WDM comb tab")
         half_window = self.wdm_plan.settings["half_window_nm"]
-        if simulate:
-            chip = SimulatedChip(self.network, lambda name: self.controller.applied_voltages.get(name, 0.0),
-                                 wavelengths)
-            return chip.spectrum, wavelengths, half_window, True
-        return (lambda output: osa.get_spectrum(host, port, fresh_sweeps=POST_SWITCH_SWEEPS),
-                wavelengths, half_window, False)
+        chip = SimulatedChip(self.network, lambda name: self.controller.applied_voltages.get(name, 0.0),
+                             wavelengths) if simulate else None
+        return self.osa_reader(None if chip is None else chip.spectrum), wavelengths, half_window, simulate
 
     def require_jdsu(self):
         switch = self.osa_output_switch
@@ -597,6 +664,7 @@ class CalibrationMixin:
                     "context": {"detection": DETECT_OSA,
                                 "laser_wavelengths_nm": {str(row + 1): value for row, value in wavelengths.items()},
                                 "line_half_window_nm": half_window, "simulated": simulate,
+                                "osa_sweeps_per_reading": self.wdm_plan.settings["osa_sweeps"],
                                 "jdsu_channel_map": dict(switch.settings["channel_map"])}}
 
         if self.measurement_busy():
@@ -1137,7 +1205,7 @@ class CalibrationMixin:
     def set_calibration_controls(self, running):
         state = "disabled" if running else "normal"
         for button in (self.cal_single_button, self.cal_all_button, self.cal_alignment_button,
-                       self.cal_routed_button, self.cal_power_route_button):
+                       self.cal_routed_button, self.cal_power_route_button, self.cal_reextract_button):
             button.configure(state=state)
         self.cal_stop_button.configure(state="normal" if running else "disabled")
         for tab in (self.route_tab, self.hardware_tab, self.crosstalk_tab, self.dataset_tab):
