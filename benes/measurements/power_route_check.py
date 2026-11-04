@@ -92,7 +92,7 @@ def run_power_route_check(controller, lasers, selector, read_power, network, set
     voltages = dict.fromkeys(network.switches, None)
     primary_error = None
     try:
-        if hasattr(selector, "sweep_timing") and not selector.settings["dry_run"]:
+        if hasattr(selector, "sweep_timing"):
             timing = selector.sweep_timing(repeats=2)
             if on_timing is not None:
                 on_timing(timing)

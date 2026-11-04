@@ -62,7 +62,6 @@ class HardwareMixin:
         ttk.Entry(hardware, textvariable=self.port_var, width=9).pack(side="left")
         ttk.Label(hardware, text="Baud").pack(side="left", padx=(10, 4))
         ttk.Entry(hardware, textvariable=self.baud_var, width=8).pack(side="left")
-        ttk.Checkbutton(hardware, text="Dry run", variable=self.dry_run_var).pack(side="left", padx=10)
         ttk.Button(hardware, text="Connect", command=self.connect_board).pack(side="left")
         ttk.Button(hardware, text="Disconnect", command=self.disconnect_board).pack(side="left", padx=6)
         ttk.Button(hardware, text="MZI ↔ pin mapping / calibration…", command=self.show_mapping).pack(side="left", padx=10)
@@ -79,7 +78,6 @@ class HardwareMixin:
         ttk.Label(osa_controls, text="Sweeps per reading").pack(side="left", padx=(10, 4))
         ttk.Entry(osa_controls, textvariable=self.osa_sweeps_var, width=4).pack(side="left")
         ttk.Combobox(osa_controls, textvariable=self.osa_plot_mode, values=("Overlay", "New window"), state="readonly", width=11).pack(side="left", padx=10)
-        ttk.Checkbutton(osa_controls, text="Simulate", variable=self.osa_dry_run_var).pack(side="left")
         self.osa_button = ttk.Button(osa_controls, text="Read trace", style="Accent.TButton", command=self.read_spectrum)
         self.osa_button.pack(side="left", padx=8)
 
@@ -559,16 +557,15 @@ class HardwareMixin:
 
     def connect_board(self):
         try:
-            self.controller.configure_connection(self.port_var.get(), self.baud_var.get(), self.dry_run_var.get())
+            self.controller.configure_connection(self.port_var.get(), self.baud_var.get())
             self.controller.connect()
             self.controller.apply_calibrated_states(self.network.states)
         except (OSError, RuntimeError, ValueError) as error:
             messagebox.showerror("Board connection failed", str(error), parent=self)
             return
         self.zero_volt_switches.clear()
-        mode = "dry run" if self.controller.settings["dry_run"] else self.controller.settings["port"]
         self.show_calibrated_voltages()
-        self.update_hardware_status(f"Connected: {mode}")
+        self.update_hardware_status(f"Connected: {self.controller.settings['port']}")
 
     def disconnect_board(self):
         self.controller.disconnect()
@@ -606,8 +603,7 @@ class HardwareMixin:
     def save_osa_output_switch_settings(self):
         try:
             self.osa_output_switch.configure(
-                self.osa_switch_resource_var.get(), self.osa_switch_dry_run_var.get(),
-                self.osa_switch_settle_var.get(), self.osa_switch_channel_map(),
+                self.osa_switch_resource_var.get(), self.osa_switch_settle_var.get(), self.osa_switch_channel_map(),
             )
         except Exception as error:
             # Changing the resource or dry-run mode reconnects, which can raise PyVISA errors.
@@ -622,13 +618,13 @@ class HardwareMixin:
     def prepare_board(self):
         if self.controller.connected:
             return None
-        self.controller.configure_connection(self.port_var.get(), self.baud_var.get(), self.dry_run_var.get())
+        self.controller.configure_connection(self.port_var.get(), self.baud_var.get())
 
         def connect():
             # As the Connect button: the saved voltages, then the calibrated states.
             self.controller.connect()
             self.controller.apply_calibrated_states(self.network.states)
-            return "dry run" if self.controller.settings["dry_run"] else self.controller.settings["port"]
+            return self.controller.settings["port"]
 
         def done():
             self.zero_volt_switches.clear()
@@ -701,8 +697,6 @@ class HardwareMixin:
         return connect, done
 
     def prepare_osa(self):
-        if self.osa_dry_run_var.get():
-            return None
         host, port = self.osa_host_var.get().strip(), int(self.osa_port_var.get())
 
         def connect():
@@ -750,8 +744,6 @@ class HardwareMixin:
                 jobs.append((key, *job))
             elif self.device_connected_now(key):
                 self.set_device_status(key, "connected", True)
-            elif key == "osa":
-                self.set_device_status(key, "simulated (Simulate is ticked)")
         if not jobs:
             self.report_device_failures(failures)
             return
@@ -814,8 +806,7 @@ class HardwareMixin:
             # PyVISA raises its own error types for GPIB faults.
             messagebox.showerror("OSA output switch", str(error), parent=self)
             return
-        mode = "dry run" if self.osa_output_switch.settings["dry_run"] else self.osa_output_switch.settings["resource"]
-        self.osa_switch_status_var.set(f"OSA output switch connected: {mode}")
+        self.osa_switch_status_var.set(f"OSA output switch connected: {self.osa_output_switch.settings['resource']}")
         self.osa_output_chosen(self.osa_switch_output_var)
 
     def disconnect_osa_output_switch(self):
@@ -895,11 +886,9 @@ class HardwareMixin:
         ttk.Combobox(body, textvariable=self.osa_switch_settle_var,
                      values=("0", "0.25", "0.5", "1", "3"), width=8).grid(
             row=3, column=1, sticky="w", padx=(12, 0), pady=4)
-        ttk.Checkbutton(body, text="Dry run", variable=self.osa_switch_dry_run_var).grid(
-            row=4, column=1, sticky="w", padx=(12, 0), pady=(4, 0))
 
         mapping = ttk.LabelFrame(body, text="Output fiber → JDSU channel", padding=(14, 8))
-        mapping.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(16, 0))
+        mapping.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(16, 0))
         channels = ("—",) + tuple(map(str, JDSU_CHANNELS))
         for row, output in enumerate(OUTPUTS):
             ttk.Label(mapping, text=f"Output {output} · Fiber {fiber_number(output)}").grid(
@@ -921,7 +910,7 @@ class HardwareMixin:
             if not self.save_osa_output_switch_settings():
                 return
             switch = self.osa_output_switch
-            if not switch.connected or switch.settings["dry_run"]:
+            if not switch.connected:
                 timing_status.set("Connect the physical JDSU switch first.")
                 return
             timing_button.configure(state="disabled")

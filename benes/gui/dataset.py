@@ -20,7 +20,7 @@ from benes.measurements.dataset_view import (format_transmission_share, load_out
 from benes.measurements.spectrum_export import write_spectra
 from benes.measurements.wdm_comb import (INPUTS, create_wdm_folder, evaluate_configuration,
                                          power_ratio_db, routed_wavelengths, save_wdm_scan, scan_outputs,
-                                         simulated_comb_spectrum)
+                                         )
 from benes.paths import app_dir
 
 
@@ -346,13 +346,11 @@ class DatasetMixin:
                 raise ValueError("Save a wavelength for every input before filling the dataset")
             if self.osa_button.instate(["disabled"]):
                 raise RuntimeError("Wait for the current OSA trace read to finish")
-            simulate = self.osa_dry_run_var.get()
             routed_now = {}
-            read_osa = self.osa_reader(lambda output: simulated_comb_spectrum(assignment, routed_now[output][0]))
+            simulate = False
+            read_osa = self.osa_reader()
             if not self.controller.connected:
                 raise RuntimeError("Connect the voltage board before filling the dataset")
-            if self.controller.settings["dry_run"] != simulate:
-                raise RuntimeError("Use the physical voltage board with the real OSA, or dry-run board with OSA Simulate")
             switch = self.osa_output_switch
             if not switch.connected:
                 raise RuntimeError("Connect the OSA output switch before filling the dataset")

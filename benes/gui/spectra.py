@@ -17,26 +17,24 @@ class SpectraMixin:
 
     def osa_connection(self):
         """Return OSA connection settings after validating the visible fields."""
-        simulate = self.osa_dry_run_var.get()
         host = self.osa_host_var.get().strip()
         try:
-            port = int(self.osa_port_var.get()) if not simulate else 0
+            port = int(self.osa_port_var.get())
         except ValueError as error:
             raise ValueError("Enter an OSA port from 1 to 65535") from error
-        if not simulate and (not host or not 1 <= port <= 65535):
+        if not host or not 1 <= port <= 65535:
             raise ValueError("Enter a valid OSA host and port in Hardware")
-        return host, port, simulate
+        return host, port
 
-    def osa_reader(self, simulated=None):
+    def osa_reader(self):
         """``read(output=None, on_sweep=None)`` as every measurement takes an OSA reading.
 
         Two fresh sweeps, then the shared sweeps per reading averaged (``osa_reading``).
-        ``simulated(output)`` stands in for the OSA in Simulate mode. Call on the Tk thread:
-        it validates the connection fields and saves a changed sweep count.
+        Call on the Tk thread: it validates connection fields and saves a changed sweep count.
         """
-        host, port, simulate = self.osa_connection()
+        host, port = self.osa_connection()
         sweeps = self.wdm_plan.set_osa_sweeps(self.osa_sweeps_var.get())
-        return osa_reader(None if simulate else host, port, sweeps, simulated)
+        return osa_reader(host, port, sweeps)
 
     def set_osa_reading(self, reading: bool):
         state = "disabled" if reading else "normal"

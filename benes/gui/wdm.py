@@ -12,7 +12,7 @@ from benes.measurements.wdm_comb import (INPUTS, create_wdm_folder,
                                          evaluate_configuration,
                                          power_ratio_db, routed_wavelengths,
                                          save_configuration_evaluation, save_wdm_scan, scan_outputs,
-                                         simulated_comb_spectrum)
+                                         )
 from benes.paths import app_dir
 
 
@@ -91,11 +91,11 @@ class WDMMixin:
                 raise ValueError("Save a wavelength for every input before evaluating the configuration")
             if not any(wavelength is not None for wavelength in assignment.values()):
                 raise ValueError("Assign a comb wavelength to at least one input")
-            simulate = self.osa_dry_run_var.get()
             routed = routed_wavelengths(self.network.mapping(), assignment)
-            read_osa = self.osa_reader(lambda output: simulated_comb_spectrum(assignment, routed[output][0]))
+            simulate = False
+            read_osa = self.osa_reader()
             if not switch.connected:
-                raise RuntimeError("Connect the OSA output switch first (dry run is available)")
+                raise RuntimeError("Connect the OSA output switch first")
             if outputs is None:
                 outputs = [output for output, variable in self.wdm_output_vars.items() if variable.get()]
             else:
@@ -133,7 +133,6 @@ class WDMMixin:
                 for name in self.network.states
             },
             "simulated_osa": simulate,
-            "dry_run_switch": switch.settings["dry_run"],
         }
 
         def read(output):

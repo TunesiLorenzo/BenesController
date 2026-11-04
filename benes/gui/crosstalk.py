@@ -663,7 +663,7 @@ class CrosstalkMixin:
             settle_ms = float(fields["Settle [ms]"].get())
             if not 0 <= settle_ms <= 10000:
                 raise ValueError("Settling time must be between 0 and 10000 ms")
-            if not self.controller.connected or self.controller.settings["dry_run"]:
+            if not self.controller.connected:
                 raise RuntimeError("Connect the physical voltage board first")
             if self.power_meter_method():
                 setup = self.detection_setup()

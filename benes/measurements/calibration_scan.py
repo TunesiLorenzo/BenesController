@@ -79,7 +79,7 @@ def scan_voltages(start: float, stop: float, step: float) -> list[float]:
 def scan_switch(controller, power_meter, name: str, voltages: list[float], settle_s: float,
                 on_point=None) -> list[ScanPoint]:
     """Sweep one mapped switch and restore its previous voltage on exit."""
-    if not controller.connected or controller.settings["dry_run"]:
+    if not controller.connected:
         raise RuntimeError("Connect the physical voltage board before scanning")
     if not power_meter.connected:
         raise RuntimeError("Connect the Arduino power meter before scanning")
@@ -125,7 +125,7 @@ def scan_switches_with_reader(controller, names: list[str], voltages: list[float
     """Scan switches in order with a measurement reader; reset all to 0 V."""
     if not names:
         raise ValueError("Select at least one switch")
-    if not controller.connected or controller.settings["dry_run"]:
+    if not controller.connected:
         raise RuntimeError("Connect the physical voltage board before scanning")
     if not math.isfinite(settle_s) or settle_s < 0:
         raise ValueError("Settling time must be a nonnegative number")

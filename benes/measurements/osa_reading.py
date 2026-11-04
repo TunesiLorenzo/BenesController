@@ -74,19 +74,15 @@ def acquire_averaged_spectrum(fetch: Callable[[int], tuple], count: int,
     return average_spectra(spectra) if count > 1 else spectra[0]
 
 
-def osa_reader(host, port, sweeps, simulated=None):
+def osa_reader(host, port, sweeps):
     """``read(output=None, on_sweep=None)`` returning one averaged (wave, power) trace.
 
-    ``simulated(output)`` stands in for the OSA in Simulate mode (``host`` None); without it
-    the generic simulated trace is used. ``output`` is only passed on to ``simulated``.
+    ``host`` and ``port`` identify the physical OSA.
     """
     sweeps = validate_sweeps(sweeps)
 
     def read(output=None, on_sweep=None):
-        if host is None:
-            fetch = (lambda fresh: simulated(output)) if simulated else (lambda fresh: osa.simulated_spectrum())
-        else:
-            fetch = lambda fresh: osa.get_spectrum(host, port, fresh_sweeps=fresh)
+        fetch = lambda fresh: osa.get_spectrum(host, port, fresh_sweeps=fresh)
         return acquire_averaged_spectrum(fetch, sweeps, FRESH_SWEEPS, on_sweep)
 
     return read

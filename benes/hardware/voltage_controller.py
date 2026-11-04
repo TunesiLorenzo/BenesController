@@ -53,7 +53,6 @@ class BenesVoltageController:
         return {
             "port": DEFAULT_PORT,
             "baud": DEFAULT_BAUD,
-            "dry_run": False,
             "mapping": {name: pins[index] if index < len(pins) else None
                         for index, name in enumerate(self.switch_names)},
             "voltage": {name: 0.0 for name in self.switch_names},
@@ -78,7 +77,6 @@ class BenesVoltageController:
             stored = json.loads(self.config_path.read_text(encoding="utf-8"))
             settings["port"] = str(stored.get("port", settings["port"]))
             settings["baud"] = int(stored.get("baud", settings["baud"]))
-            settings["dry_run"] = bool(stored.get("dry_run", settings["dry_run"]))
             for name in self.switch_names:
                 pin = stored.get("mapping", {}).get(name, settings["mapping"][name])
                 settings["mapping"][name] = self._validate_pin(pin, allow_none=True)
@@ -221,13 +219,13 @@ class BenesVoltageController:
     def connected(self) -> bool:
         return self.board is not None
 
-    def configure_connection(self, port: str, baud: object, dry_run: bool) -> None:
+    def configure_connection(self, port: str, baud: object) -> None:
         baud = int(baud)
         if not port.strip():
             raise ValueError("Enter a serial port, for example COM4")
         if baud <= 0:
             raise ValueError("Baud rate must be positive")
-        self.settings.update(port=port.strip(), baud=baud, dry_run=bool(dry_run))
+        self.settings.update(port=port.strip(), baud=baud)
         self.save()
 
     def set_mapping(self, mapping: dict[str, int | None]) -> None:
@@ -270,7 +268,7 @@ class BenesVoltageController:
         self._check_voltage(name, voltage)
         serial = getattr(self.board, "serial", None)
         if serial is None:
-            # Dry-run or test boards: keep their own pacing and logging.
+            # Test boards without a serial handle keep their own pacing and logging.
             self.board.send(pin, voltage)
             target_time = time.perf_counter()
             self.board.send(mirror_pin, voltage)
@@ -316,7 +314,6 @@ class BenesVoltageController:
         self.board = factory(
             port=self.settings["port"],
             baud=self.settings["baud"],
-            dry_run=self.settings["dry_run"],
         )
         try:
             self.send_configured_voltages()

@@ -16,7 +16,7 @@ from benes.gui.theme import (ACCENT, BG, CAL_STATUS, CHECK_SHORT, OSA_COLOR, PAN
                              TEXT, VERDICT_ORDER, WDM_COLORS, WIRE, ZERO_VOLT_COLOR)
 from benes.gui.widgets import VerticalScrolledFrame
 from benes.hardware import osa
-from benes.hardware.laser_bank import LaserBank, SimulatedLaserController
+from benes.hardware.laser_bank import LaserBank
 from benes.hardware.osa_output_switch import OUTPUTS, fiber_number
 from benes.hardware.power_meter import RANGE_TRACKING_OFF
 from benes.measurements.calibration_analysis import CalibrationAnalysisError, find_calibration_files
@@ -24,7 +24,7 @@ from benes.measurements.calibration_scan import scan_voltages
 from benes.measurements.crosstalk_results import PLOT_X_POWER, PLOT_X_VOLTAGE, plot_x_values
 from benes.measurements.arduino_hp_range import (ArduinoHPRangeSweep, BNC_CLIP_ADC, FLOOR_MIN_ADC,
                                                  DEFAULT_RANGE_SETTLE_S)
-from benes.measurements.laser_calibration import (DEFAULT_PASS_DB, CalibrationStopped, SimulatedChip,
+from benes.measurements.laser_calibration import (DEFAULT_PASS_DB, CalibrationStopped,
                                                   check_alignment, check_calibrated_states,
                                                   create_calibration_folder, reference_states, reset_all,
                                                   save_state_checks, strongest_input, wavelengths_from_assignment)
@@ -419,7 +419,6 @@ class CalibrationMixin:
                 raise RuntimeError("Wait for the MZI calibration to finish")
             if self.osa_button.instate(["disabled"]):
                 raise RuntimeError("Wait for the current OSA trace read to finish")
-            simulate = self.osa_dry_run_var.get()
             read = self.osa_reader()
             self.calibration_plot_support()
         except (ImportError, RuntimeError, ValueError) as error:
@@ -435,7 +434,7 @@ class CalibrationMixin:
             traces = []
             try:
                 switch = self.osa_output_switch
-                if not simulate and switch.connected and len(switch.mapped_outputs()) == len(INPUTS):
+                if switch.connected and len(switch.mapped_outputs()) == len(INPUTS):
                     wavelengths = self.detect_laser_channels_from_outputs(read, traces)
                 else:
                     wave, power = read()
@@ -620,12 +619,8 @@ class CalibrationMixin:
             raise RuntimeError("Wait for the current measurement to finish")
         if self.osa_button.instate(["disabled"]):
             raise RuntimeError("Wait for the current OSA read to finish")
-        simulate = self.osa_dry_run_var.get()
         if not self.controller.connected:
             raise RuntimeError("Connect the voltage board first (Hardware)")
-        if self.controller.settings["dry_run"] != simulate:
-            raise RuntimeError("Use the physical voltage board with the real OSA, or a dry-run board with "
-                               "OSA Simulate for a rehearsal")
         self.require_jdsu()
         try:
             self.save_wdm_plan(quiet=True)
@@ -635,14 +630,12 @@ class CalibrationMixin:
         if not wavelengths:
             raise ValueError("Assign a comb wavelength to each laser input in the WDM comb tab")
         half_window = self.wdm_plan.settings["half_window_nm"]
-        chip = SimulatedChip(self.network, lambda name: self.controller.applied_voltages.get(name, 0.0),
-                             wavelengths) if simulate else None
-        return self.osa_reader(None if chip is None else chip.spectrum), wavelengths, half_window, simulate
+        return self.osa_reader(), wavelengths, half_window, False
 
     def require_jdsu(self):
         switch = self.osa_output_switch
         if not switch.connected:
-            raise RuntimeError("Connect the OSA output switch first (dry run is available in Selector setup)")
+            raise RuntimeError("Connect the OSA output switch first")
         for output in OUTPUTS:
             switch.channel_for(output)
 
@@ -671,7 +664,7 @@ class CalibrationMixin:
             raise RuntimeError("Wait for the current measurement to finish")
         if not self.controller.connected:
             raise RuntimeError("Connect the voltage board first (Hardware)")
-        simulate = self.controller.settings["dry_run"]
+        simulate = False
         self.laser_bank.configure({port: variable.get() for port, variable in self.laser_slot_vars.items()},
                                   self.laser_settle_var.get())
         slots = dict(self.laser_bank.settings["slots"])

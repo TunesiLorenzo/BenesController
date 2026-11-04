@@ -302,7 +302,7 @@ class MappingMixin:
             if str(self.controller.settings["mapping"][name]) != pin_var.get():
                 messagebox.showerror("Save mapping first", "Save this pin mapping before scanning its power response.", parent=window)
                 return
-            if not self.controller.connected or self.controller.settings["dry_run"] or not self.power_meter.connected:
+            if not self.controller.connected or not self.power_meter.connected:
                 messagebox.showerror("Hardware not connected", "Connect the physical voltage board and Arduino power meter before scanning.", parent=window)
                 return
             if self.bnc_reference is None or self.hp_meter_session is None or self.hp_meter_busy:

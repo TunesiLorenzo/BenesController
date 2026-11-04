@@ -53,8 +53,6 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
         self.newport_controller = NewportLaserController()
         self.newport_window = None
         self.laser_bank = LaserBank(self.newport_controller)
-        # The lab always drives the real JDSU; Dry run stays available in Selector setup.
-        self.osa_output_switch.settings["dry_run"] = False
         self.wdm_plan = WDMPlan()
         self.wdm_running = False
         self.wdm_stop_event = None
@@ -90,7 +88,6 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
         self.osa_output_var = tk.StringVar(value="None")
         self.port_var = tk.StringVar(value=self.controller.settings["port"])
         self.baud_var = tk.StringVar(value=str(self.controller.settings["baud"]))
-        self.dry_run_var = tk.BooleanVar(value=self.controller.settings["dry_run"])
         self.voltage_vars = {
             name: tk.StringVar(value=f"{value:.2f}")
             for name, value in self.controller.settings["voltage"].items()
@@ -98,14 +95,12 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
         self.switch_voltage_entries = {}
         self.osa_host_var = tk.StringVar(value="192.168.0.200")
         self.osa_port_var = tk.StringVar(value="8002")
-        self.osa_dry_run_var = tk.BooleanVar(value=False)
         self.osa_sweeps_var = tk.StringVar(value=str(self.wdm_plan.settings["osa_sweeps"]))
         self.osa_plot_mode = tk.StringVar(value="Overlay")
         self.osa_axes = None
         self.trace_count = 0
         self.osa_trace_records = []
         self.osa_switch_resource_var = tk.StringVar(value=self.osa_output_switch.settings["resource"])
-        self.osa_switch_dry_run_var = tk.BooleanVar(value=self.osa_output_switch.settings["dry_run"])
         self.osa_switch_settle_var = tk.StringVar(value=str(self.osa_output_switch.settings["settle_s"]))
         channel_map = self.osa_output_switch.settings["channel_map"]
         self.osa_switch_channel_vars = {

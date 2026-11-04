@@ -41,7 +41,6 @@ class OSAOutputSwitch:
         self._lock = threading.RLock()
         self.manager = None
         self.instrument = None
-        self._dry_run_connected = False
         # Output routed during this connection; unknown until the first selection.
         self.routed_output = None
         self.settings = self._load()
@@ -50,7 +49,6 @@ class OSAOutputSwitch:
     def _defaults() -> dict:
         return {
             "resource": "GPIB0::25::INSTR",
-            "dry_run": True,
             "settle_s": 0.25,
             "timeout_s": 5.0,
             "channel_map": {str(output): output for output in OUTPUTS},
@@ -116,20 +114,18 @@ class OSAOutputSwitch:
 
     @property
     def connected(self) -> bool:
-        return self.instrument is not None or self._dry_run_connected
+        return self.instrument is not None
 
-    def configure(self, resource: object, dry_run: bool, settle_s: object, channel_map: dict) -> None:
-        """Validate and persist settings, reconnecting if the resource or dry-run mode changed."""
+    def configure(self, resource: object, settle_s: object, channel_map: dict) -> None:
+        """Validate and persist settings, reconnecting if the VISA resource changes."""
         settings = {
             **self.settings,
             "resource": str(resource).strip(),
-            "dry_run": bool(dry_run),
             "settle_s": float(settle_s),
             "channel_map": self._normalized_map(channel_map),
         }
         self._validate(settings)
-        reconnect = self.connected and (settings["resource"], settings["dry_run"]) != (
-            self.settings["resource"], self.settings["dry_run"])
+        reconnect = self.connected and settings["resource"] != self.settings["resource"]
         if reconnect:
             self.disconnect()
         self.settings = settings
@@ -154,9 +150,6 @@ class OSAOutputSwitch:
         if self.connected:
             return
         self.routed_output = None
-        if self.settings["dry_run"]:
-            self._dry_run_connected = True
-            return
         factory = self._resource_manager_factory or self._load_resource_manager_factory()
         manager = factory()
         try:
@@ -197,7 +190,6 @@ class OSAOutputSwitch:
                         self.manager.close()
                 finally:
                     self.instrument = self.manager = None
-                    self._dry_run_connected = False
                     self.routed_output = None
 
     def _close_channel(self, channel: int) -> None:
@@ -222,8 +214,7 @@ class OSAOutputSwitch:
         with self._lock:
             if not self.connected:
                 raise RuntimeError("Connect the OSA output switch first")
-            if not self.settings["dry_run"]:
-                self._close_channel(channel)
+            self._close_channel(channel)
             self.routed_output = output
             self.settings["selected_output"] = output
             self.save()
@@ -239,7 +230,7 @@ class OSAOutputSwitch:
         for output in outputs:
             self.channel_for(output)
         with self._lock:
-            if not self.connected or self.settings["dry_run"]:
+            if not self.connected:
                 raise RuntimeError("Connect the physical JDSU switch to time its output sweep")
             previous = self.routed_output
             previous_channel = int(self.instrument.query("CLOSE?").strip()) if previous is None else None
