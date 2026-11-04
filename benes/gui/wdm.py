@@ -132,7 +132,6 @@ class WDMMixin:
                 name: self.controller.applied_voltages.get(name, self.controller.settings["voltage"].get(name))
                 for name in self.network.states
             },
-            "simulated_osa": simulate,
         }
 
         def read(output):

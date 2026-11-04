@@ -140,12 +140,6 @@ def scale_curve(raw, xoff, xscale, yoff, yscale):
             [yoff + yscale * value for value in raw])
 
 
-def simulated_spectrum(points=4001):
-    xoff, xscale = 181.692, (239.834 - 181.692) / (points - 1)
-    raw = [round(-6000 + 4500 * math.exp(-((index - points * 0.2) / 40) ** 2)) for index in range(points)]
-    return scale_curve(raw, xoff, xscale, 0.0, 0.01)
-
-
 def wait_for_fresh_trace(fetch, needed, max_wait_s=30.0, baseline=None, poll_s=0.1,
                          clock=time.monotonic, sleep=time.sleep):
     """Return the curve buffer once it has been republished ``needed`` times.

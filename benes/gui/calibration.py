@@ -689,20 +689,6 @@ class CalibrationMixin:
                                       rescan_points=rescan_points,
                                       finish_curve_points=finish_curve_points)
 
-        if simulate:
-            def open_simulated():
-                chip = SimulatedChip(self.network, lambda name: self.controller.applied_voltages.get(name, 0.0), {})
-                lasers = LaserBank(SimulatedLaserController(chip, slots), self.laser_bank.config_path,
-                                   sleep=lambda seconds: None)
-
-                def read_power():
-                    return dbm_to_mw(chip.meter_dbm(switch.routed_output if via_jdsu else fixed + 1))
-
-                return detector(read_power, lasers, "mW", "Simulated power meter"), lambda: None
-
-            return {"open": open_simulated, "simulate": True, "unit": "mW", "osa": None,
-                    "inputs": inputs, "outputs": outputs, "context": context}
-
         if not self.newport_controller.connected:
             raise RuntimeError("Connect the Newport laser controller in Hardware → Newport lasers first")
         if self.newport_panel.busy:

@@ -140,33 +140,3 @@ class LaserBank:
         self.lit = None
         if errors:
             raise RuntimeError("Could not restore the Newport lasers: " + "; ".join(errors))
-
-
-class SimulatedLaserController:
-    """Dry-run Newport 9016: every slot holds a laser with its TEC on, all lasers start lit.
-
-    Switching a laser lights or darkens the chip input its slot feeds.
-    """
-
-    connected = True
-
-    def __init__(self, chip, slots: dict[int, int]):
-        from benes.hardware.newport_laser import SLOT_COUNT, ModuleState
-
-        self._state = ModuleState
-        self.chip = chip
-        self.input_for_slot = {slot: port - 1 for port, slot in slots.items()}
-        self.modules = [ModuleState("SIM LDD/TEC", slot in self.input_for_slot, True)
-                        for slot in range(1, SLOT_COUNT + 1)]
-        chip.lit = set(self.input_for_slot.values())
-
-    def read_states(self):
-        return list(self.modules)
-
-    def set_output(self, slot, kind, enabled):
-        old = self.modules[slot - 1]
-        self.modules[slot - 1] = self._state(old.model, enabled, old.tec)
-        source = self.input_for_slot.get(slot)
-        if source is not None:
-            (self.chip.lit.add if enabled else self.chip.lit.discard)(source)
-        return enabled

@@ -291,21 +291,6 @@ def power_ratio_db(fraction: float | None) -> float | None:
     return None if fraction is None or fraction <= 0 else 10 * math.log10(fraction)
 
 
-def simulated_comb_spectrum(assignment: dict, routed_input: int, points: int = 4001) -> tuple[list, list]:
-    """Dry-run trace: the routed line at -10 dBm, the other comb lines leaking at -45 dBm."""
-    lines = [(wavelength, -10.0 if int(port) == routed_input else -45.0)
-             for port, wavelength in assignment.items() if wavelength is not None]
-    centers = [wavelength for wavelength, _ in lines] or [1550.0]
-    start, stop = min(centers) - 2, max(centers) + 2
-    wave = [start + index * (stop - start) / (points - 1) for index in range(points)]
-    power = []
-    for wavelength in wave:
-        total_mw = 1e-7 + sum(10 ** (peak / 10) / (1 + ((wavelength - center) / 0.02) ** 2)
-                              for center, peak in lines)
-        power.append(10 * math.log10(total_mw))
-    return wave, power
-
-
 def scan_outputs(switch, read_spectrum: Callable[[int], tuple], outputs, mapping, assignment: dict,
                  half_window_nm: float, settle_s: float,
                  on_result: Callable[[WDMOutputResult, int, int], None] | None = None,

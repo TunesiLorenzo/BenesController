@@ -455,7 +455,7 @@ class DatasetMixin:
                         "permutation": list(permutation), "assignment": assignment,
                         "half_window_nm": settings["half_window_nm"], "settle_s": settings["settle_s"],
                         "switch_states": {name: "cross" if crossed else "bar" for name, crossed in states.items()},
-                        "simulated_osa": simulate, "batch_scope": scope,
+                        "batch_scope": scope,
                     }
                     folder = create_wdm_folder(app_dir())
                     files = save_wdm_scan(folder, results, context, comment)
