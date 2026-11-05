@@ -740,7 +740,7 @@ def save_calibration(folder: Path, context: dict, results: dict[str, MZISweep]) 
             heading = ["mzi", "voltage_v", "initial_mean_adc", "initial_range_dbm",
                        f"initial_power_{unit}", "final_mean_adc", "final_range_dbm",
                        f"adjusted_power_{unit}", "range_steps" if adaptive else "rescans", "range_limit"]
-            writer.writerow(heading + (["range_error"] if adaptive else
+            writer.writerow(heading + (["range_error", "measurement_source", "gpib_dbm"] if adaptive else
                                        ["measurement_source", "gpib_dbm"]))
             for name, item in results.items():
                 for point, record_point in zip(item.points, range_points.get(name, [])):
@@ -751,7 +751,9 @@ def save_calibration(folder: Path, context: dict, results: dict[str, MZISweep]) 
                            record_point["final_raw_adc"], record_point["range_dbm"],
                            point.power, record_point.get("range_steps", 0) if adaptive
                            else record_point["rescans"], record_point.get("range_limit") or ""]
-                    writer.writerow(row + [record_point.get("range_error") or ""] if adaptive else row +
+                    writer.writerow(row + [record_point.get("range_error") or "",
+                                           record_point.get("measurement_source", "Arduino"),
+                                           record_point.get("gpib_dbm")] if adaptive else row +
                                     [record_point.get("measurement_source", "Arduino"),
                                      record_point.get("gpib_dbm")])
         files.append("mzi_hp_bnc_points.csv")
@@ -784,6 +786,13 @@ def save_calibration(folder: Path, context: dict, results: dict[str, MZISweep]) 
         else:
             axis.plot([point.voltage for point in item.points], values, ".-", label=f"In {item.probe.input + 1}")
         if bnc_reference and point_ranges and len(point_ranges) == len(item.points):
+            gpib_points = [(point.voltage, mw_to_dbm(point.power))
+                           for point, record in zip(item.points, point_ranges)
+                           if point.power is not None
+                           and record.get("measurement_source") == "HP GPIB autorange"]
+            if gpib_points:
+                axis.plot(*zip(*gpib_points), marker="s", linestyle="None", color="tab:blue",
+                          label="HP GPIB autorange")
             floor_points = [(point.voltage, mw_to_dbm(initial_power(1.0, record["range_dbm"])))
                             for point, record in zip(item.points, point_ranges)
                             if point.power is None and record.get("range_limit") == "low"]

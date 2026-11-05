@@ -146,6 +146,7 @@ class WDMMixin:
         self.wdm_running = True
         self.begin_activity("wdm", "Evaluating configuration" if evaluation else "WDM output scan",
                             len(outputs) * sweeps + 1)
+        self.remember_bench("wdm")
         self.wdm_stop_event = threading.Event()
         if hasattr(self, "wdm_start_button"):
             self.wdm_start_button.configure(state="disabled")
@@ -211,6 +212,7 @@ class WDMMixin:
         if hasattr(self, "evaluate_button"):
             self.evaluate_button.configure(state="normal")
         self.set_osa_reading(False)
+        self.power_down_after("wdm")
         if results:
             self.osa_switch_status_var.set(f"OSA sampling output {results[-1].output} after the WDM scan")
             self.osa_output_var.set(str(results[-1].output))

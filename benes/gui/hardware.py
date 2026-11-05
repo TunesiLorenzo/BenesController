@@ -11,6 +11,7 @@ from tkinter import messagebox, ttk
 
 from benes.core.heater_setup import BREAK_CURRENT_DENSITY, SAFE_CURRENT_DENSITY
 from benes.gui.theme import ACCENT, BG
+from benes.hardware import osa
 from benes.hardware.hp8152a import RANGES_DBM, validate_stream_rate
 from benes.hardware.osa_output_switch import JDSU_CHANNELS, OUTPUTS, fiber_number
 from benes.hardware.power_meter import RANGE_TRACKING_LABELS, RANGE_TRACKING_OFF
@@ -80,6 +81,46 @@ class HardwareMixin:
         ttk.Combobox(osa_controls, textvariable=self.osa_plot_mode, values=("Overlay", "New window"), state="readonly", width=11).pack(side="left", padx=10)
         self.osa_button = ttk.Button(osa_controls, text="Read trace", style="Accent.TButton", command=self.read_spectrum)
         self.osa_button.pack(side="left", padx=8)
+
+        acquisition = ttk.LabelFrame(osa_page, text="OSA acquisition settings", padding=(18, 12))
+        acquisition.pack(fill="x", pady=(12, 0))
+        for column, (label, variable, values) in enumerate((
+                ("Acquisition", self.osa_mode_var, tuple(osa.MODES)),
+                ("Resolution", self.osa_resolution_var, osa.RESOLUTIONS),
+                ("High sensitivity", self.osa_sensitivity_var, osa.SENSITIVITIES),
+                ("OSA averaging", self.osa_averaging_var, osa.AVERAGING))):
+            ttk.Label(acquisition, text=label).grid(row=0, column=2 * column, sticky="w", padx=(0 if column == 0 else 14, 4))
+            ttk.Combobox(acquisition, textvariable=variable, values=values, state="readonly", width=11).grid(
+                row=0, column=2 * column + 1, sticky="w")
+        ttk.Label(acquisition, text="Range [nm]").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        span = ttk.Frame(acquisition)
+        span.grid(row=1, column=1, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Entry(span, textvariable=self.osa_start_nm_var, width=9).pack(side="left")
+        ttk.Label(span, text="to").pack(side="left", padx=4)
+        ttk.Entry(span, textvariable=self.osa_end_nm_var, width=9).pack(side="left")
+        buttons = ttk.Frame(acquisition)
+        buttons.grid(row=1, column=4, columnspan=4, sticky="e", pady=(10, 0))
+        self.osa_settings_buttons = (
+            ttk.Button(buttons, text="Read from OSA", command=self.read_osa_settings),
+            ttk.Button(buttons, text="Apply to OSA", style="Accent.TButton", command=self.apply_osa_settings),
+            ttk.Button(buttons, text="Time a reading", command=self.time_osa_reading))
+        for button in self.osa_settings_buttons:
+            button.pack(side="left", padx=(6, 0))
+        ttk.Label(acquisition, text=("Single makes each reading start one sweep after the change and wait for it, "
+                                     "instead of waiting out two continuous sweeps. A narrower range, lower "
+                                     "sensitivity and no OSA averaging sweep faster; Time a reading measures it."),
+                  foreground="#9baec6", wraplength=760).grid(row=2, column=0, columnspan=8, sticky="w", pady=(10, 0))
+        ttk.Label(acquisition, textvariable=self.osa_settings_status_var, wraplength=760).grid(
+            row=3, column=0, columnspan=8, sticky="w", pady=(6, 0))
+
+        live_controls = ttk.LabelFrame(osa_page, text="Live OSA fluctuation recording", padding=(18, 10))
+        live_controls.pack(fill="x", pady=(12, 0))
+        self.osa_live_button = ttk.Button(live_controls, text="Record overlay…", command=self.start_osa_live)
+        self.osa_live_button.pack(side="left")
+        self.osa_live_stop_button = ttk.Button(live_controls, text="Stop", command=self.stop_osa_live, state="disabled")
+        self.osa_live_stop_button.pack(side="left", padx=8)
+        ttk.Label(live_controls, text="Saves every spectrum to CSV; the plot shows the latest 20 traces.",
+                  foreground="#9baec6").pack(side="left", padx=8)
 
         osa_router = ttk.LabelFrame(osa_page, text="OSA output switch", padding=(18, 12))
         osa_router.pack(fill="x", pady=(12, 0))

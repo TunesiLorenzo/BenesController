@@ -186,7 +186,18 @@ def _visibility_hint(network, name, inputs) -> str:
     return f"put the detector on output {' or '.join(map(str, outputs))}"
 
 
-def plan_calibration(network, names=None, inputs=None, outputs=None, known=()) -> CalibrationPlan:
+def alternative_probe(candidates, primary: Probe) -> Probe:
+    """The probe sharing neither input laser nor output fiber with ``primary``, else the least shared.
+
+    The same bright state is preferred, so the two sweeps show the same fringe shape.
+    """
+    return min(candidates, key=lambda probe: (
+        (probe.input == primary.input) + (probe.output == primary.output),
+        probe.bright_crossed != primary.bright_crossed, probe.input, probe.output))
+
+
+def plan_calibration(network, names=None, inputs=None, outputs=None, known=(),
+                     alternative=False) -> CalibrationPlan:
     """Order MZI calibrations so each one is visible when its turn comes.
 
     Rounds calibrate every MZI visible with the MZIs known so far; each round
@@ -195,6 +206,9 @@ def plan_calibration(network, names=None, inputs=None, outputs=None, known=()) -
     calibration would choose. Within each input, output-side MZIs run first;
     this keeps earlier calibration biases comparable while allowing the JDSU
     to move to the output each MZI actually needs.
+
+    ``alternative`` swaps each choice for ``alternative_probe``: another laser
+    and output fiber through the same MZI, to check a calibration's consistency.
     """
     names = list(network.switches if names is None else names)
     inputs = tuple(range(network.size) if inputs is None else inputs)
@@ -213,6 +227,8 @@ def plan_calibration(network, names=None, inputs=None, outputs=None, known=()) -
         # route with another MZI can pick a weak physical output branch.
         chosen = {name: min(candidates, key=lambda probe: (probe.input, probe.output))
                   for name, candidates in found.items()}
+        if alternative:
+            chosen = {name: alternative_probe(found[name], probe) for name, probe in chosen.items()}
         steps.extend(sorted(chosen.values(), key=lambda probe: (
             probe.input, -network.switches[probe.name][0], probe.output, probe.name)))
         known |= set(chosen)

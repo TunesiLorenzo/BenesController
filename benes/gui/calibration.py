@@ -33,6 +33,7 @@ from benes.measurements.mzi_characterization import (OSALineDetector, PowerMeter
 from benes.measurements.mzi_probing import plan_calibration
 from benes.measurements.power_route_check import (plan_route_checks, run_power_route_check,
                                                    save_power_route_check)
+from benes.measurements.calibration_compare import AGREE_RAD, compare_runs, load_run, table_rows, write_comparison
 from benes.measurements.recalibrate import recalibrate
 from benes.measurements.wdm_comb import INPUTS
 from benes.paths import app_dir
@@ -40,6 +41,8 @@ from benes.paths import app_dir
 LASER_DETECTION_RANGE_NM = (1550.0, 1560.0)
 DETECT_OSA = "OSA · all lasers on"
 DETECT_POWER_METER = "Power meter · one laser at a time"
+PATHS_PRIMARY = "Primary"
+PATHS_ALTERNATIVE = "Alternative"
 METER_HP = "HP 8152A"
 METER_ARDUINO = "Arduino"
 METER_ARDUINO_HP = "Arduino + HP BNC"
@@ -96,7 +99,8 @@ class CalibrationMixin:
             ttk.Entry(sweep, textvariable=variable, width=9).grid(row=row, column=1, sticky="w", padx=(10, 0), pady=2)
             self.cal_fields[label] = variable
         ttk.Label(sweep, foreground="#9baec6", wraplength=320, text=(
-            "Each point waits the settle time; the OSA then waits for two fresh sweeps. The pass margin "
+            "Each point waits the settle time; the OSA then takes one sweep started after it (Single "
+            "acquisition) or waits for two fresh sweeps (Continuous). The pass margin "
             "grades the OSA state checks.")).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         calibrate = ttk.LabelFrame(controls, text="Calibrate", padding=10)
@@ -121,12 +125,24 @@ class CalibrationMixin:
         self.cal_verify_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(calibrate, text="Then check all-cross and all-bar (OSA)", variable=self.cal_verify_var).grid(
             row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(calibrate, text="Probe paths").grid(row=6, column=0, sticky="w", pady=(6, 0))
+        self.cal_paths_var = tk.StringVar(value=PATHS_PRIMARY)
+        paths_box = ttk.Combobox(calibrate, textvariable=self.cal_paths_var, values=(PATHS_PRIMARY, PATHS_ALTERNATIVE),
+                                 state="readonly", width=12)
+        paths_box.grid(row=6, column=1, sticky="w", padx=(10, 0), pady=(6, 0))
+        paths_box.bind("<<ComboboxSelected>>", lambda event: self.update_calibration_plan())
+        ttk.Label(calibrate, foreground="#9baec6", wraplength=320, text=(
+            "Alternative probes each MZI through another laser and output fiber and does not save its "
+            "voltages; compare it with a primary run below.")).grid(row=7, column=0, columnspan=2, sticky="w")
         self.cal_all_button = ttk.Button(calibrate, text="Calibrate all visible MZIs", style="Accent.TButton",
                                          command=self.start_complete_calibration)
-        self.cal_all_button.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.cal_all_button.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.cal_reextract_button = ttk.Button(calibrate, text="Re-extract saved calibration…",
                                                command=self.reextract_saved_calibration)
-        self.cal_reextract_button.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.cal_reextract_button.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.cal_compare_button = ttk.Button(calibrate, text="Compare two calibrations…",
+                                             command=self.compare_saved_calibrations)
+        self.cal_compare_button.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
         checks = ttk.LabelFrame(controls, text="State checks", padding=10)
         checks.pack(fill="x", pady=(12, 0))
@@ -372,7 +388,7 @@ class CalibrationMixin:
             return
         inputs, outputs = self.detection_ports()
         self.cal_plan = plan_calibration(self.network, inputs=inputs, outputs=outputs,
-                                         known=self.calibrated_switches())
+                                         known=self.calibrated_switches(), alternative=self.alternative_paths())
         for name, row in self.cal_rows.items():
             probe = self.cal_plan.probe_for(name)
             row["probe"] = (probe.describe() if probe is not None else
@@ -420,6 +436,7 @@ class CalibrationMixin:
             if self.osa_button.instate(["disabled"]):
                 raise RuntimeError("Wait for the current OSA trace read to finish")
             read = self.osa_reader()
+            self.require_osa_lasers()
             self.calibration_plot_support()
         except (ImportError, RuntimeError, ValueError) as error:
             messagebox.showerror("Laser-channel detection unavailable", str(error), parent=self)
@@ -433,6 +450,7 @@ class CalibrationMixin:
         def acquire():
             traces = []
             try:
+                self.light_osa_lasers()
                 switch = self.osa_output_switch
                 if switch.connected and len(switch.mapped_outputs()) == len(INPUTS):
                     wavelengths = self.detect_laser_channels_from_outputs(read, traces)
@@ -585,8 +603,10 @@ class CalibrationMixin:
                                             result.method))
         table.pack(fill="both", expand=True, padx=10, pady=(10, 4))
         ttk.Label(window, wraplength=680, text=(
-            "* differs from the voltages in use. \"fit\": the fit picked the first fringe, the null is the darkest "
-            "point near it. \"raw\": no usable fit, extremes from the points. Apply saves the new voltages and "
+            "* differs from the voltages in use. \"fit\": the fit picked the first bright fringe; "
+            "the dark state uses the lowest-voltage point within 1 dB of the measured minimum. "
+            "\"raw\": no usable fit, extremes from the points. "
+            "Apply saves the new voltages and "
             "re-sends the Routing tab's switch states.")).pack(anchor="w", padx=10)
 
         def apply():
@@ -609,6 +629,49 @@ class CalibrationMixin:
         ttk.Button(buttons, text=f"Apply {len(changed)} change(s)", style="Accent.TButton", command=apply,
                    state="normal" if changed else "disabled").pack(side="right", padx=(0, 8))
 
+    def compare_saved_calibrations(self):
+        """Pick two saved calibrations and compare each MZI's cross and bar, by voltage and by phase."""
+        folders = []
+        for title in ("First calibration (e.g. primary paths)", "Second calibration (e.g. alternative paths)"):
+            folder = filedialog.askdirectory(parent=self, title=title, initialdir=app_dir() / "Results")
+            if not folder:
+                return
+            folders.append(folder)
+        try:
+            first, second = (load_run(folder) for folder in folders)
+            step_v = max(first.step_v, second.step_v)
+            rows = table_rows(compare_runs(first, second), step_v)
+            saved = write_comparison(second.folder / "calibration_comparison.csv", first, second, rows)
+        except (OSError, CalibrationAnalysisError) as error:
+            messagebox.showerror("Comparison failed", str(error), parent=self)
+            return
+        window = tk.Toplevel(self)
+        window.title(f"Compare {first.folder.name} with {second.folder.name}")
+        self.fit_dialog_to_screen(window, preferred_width=1100, preferred_height=440)
+        columns = (("mzi", "MZI", 60), ("first_path", "First path", 110), ("second_path", "Second path", 110),
+                   ("cross", "Cross [V]", 110), ("cross_phase", "Δφ cross [rad]", 100), ("cross_verdict", "Cross", 130),
+                   ("bar", "Bar [V]", 110), ("bar_phase", "Δφ bar [rad]", 100), ("bar_verdict", "Bar", 130),
+                   ("p_pi", "Pπ [V²]", 110))
+        table = ttk.Treeview(window, columns=[key for key, *_ in columns], show="headings", height=len(rows))
+        for key, heading, width in columns:
+            table.heading(key, text=heading)
+            table.column(key, width=width, anchor="center")
+        pair = lambda row, key: f"{row[key + '_first_v'] or '—'} / {row[key + '_second_v'] or '—'}"
+        for row in rows:
+            table.insert("", "end", values=(
+                row["mzi"], row["first_path"], row["second_path"],
+                pair(row, "cross"), row["cross_phase_rad"] or "—", row["cross_verdict"],
+                pair(row, "bar"), row["bar_phase_rad"] or "—", row["bar_verdict"],
+                f"{row['p_pi_first_v2'] or '—'} / {row['p_pi_second_v2'] or '—'}"))
+        table.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+        differ = sum(row[f"{state}_verdict"].startswith("differ") for row in rows for state in ("cross", "bar"))
+        ttk.Label(window, wraplength=1060, text=(
+            f"{differ} of {2 * len(rows)} states differ. Δφ is the heater phase between the two voltages, from the "
+            f"fitted fringe: within {AGREE_RAD:g} rad (under about −20 dB leakage) they set the same state, even a fringe "
+            f"period apart. Within one step ({step_v:g} V) they agree outright. Pπ is the V² for a π phase and should "
+            f"not depend on the path. Saved {saved}.")).pack(anchor="w", padx=10)
+        ttk.Button(window, text="Close", command=window.destroy).pack(side="right", padx=10, pady=10)
+
     def measurement_busy(self):
         return (self.mzi_calibration_running or self.crosstalk_running or self.wdm_running or
                 self.dataset_batch_running or getattr(self, "route_optimizer_running", False))
@@ -622,6 +685,7 @@ class CalibrationMixin:
         if not self.controller.connected:
             raise RuntimeError("Connect the voltage board first (Hardware)")
         self.require_jdsu()
+        self.require_osa_lasers()
         try:
             self.save_wdm_plan(quiet=True)
         except OSError as error:
@@ -631,6 +695,20 @@ class CalibrationMixin:
             raise ValueError("Assign a comb wavelength to each laser input in the WDM comb tab")
         half_window = self.wdm_plan.settings["half_window_nm"]
         return self.osa_reader(), wavelengths, half_window, False
+
+    def require_osa_lasers(self):
+        """The OSA method reads all six lasers at once, so ``light_osa_lasers`` must be able to turn them on."""
+        if not self.newport_controller.connected:
+            raise RuntimeError("Connect the Newport laser controller in Hardware → Newport lasers first")
+        if self.newport_panel.busy:
+            raise RuntimeError("Wait for the Newport command to finish")
+
+    def light_osa_lasers(self):
+        """On the worker thread: turn on every mapped laser that is off; the ones already on are left alone."""
+        switched = self.laser_bank.light_all()
+        if switched:
+            status = f"Turned on the laser(s) for input {', '.join(map(str, switched))}."
+            self.after(0, lambda: (self.cal_status_var.set(status), self.newport_panel.refresh_view(status)))
 
     def require_jdsu(self):
         switch = self.osa_output_switch
@@ -1055,7 +1133,16 @@ class CalibrationMixin:
     def start_complete_calibration(self):
         self.start_calibration(list(self.network.switches), "complete", True, self.cal_verify_var.get())
 
+    def alternative_paths(self):
+        return self.cal_paths_var.get() == PATHS_ALTERNATIVE
+
     def start_calibration(self, names, kind, save, verify):
+        # Only the run over every MZI turns the bench off at its end; the lasers stay on between routines.
+        complete = kind == "complete"
+        alternative = self.alternative_paths()
+        if alternative:
+            # A consistency run: its voltages are compared, not used.
+            kind, save, verify = f"{kind}_alternative", False, False
         try:
             if self.mzi_calibration_running:
                 raise RuntimeError("A calibration is already running")
@@ -1063,7 +1150,7 @@ class CalibrationMixin:
             voltages, settle_s, pass_db = self.calibration_settings()
             # A single sweep keeps the other MZIs' saved voltages; a full run re-plans as it goes.
             plan = plan_calibration(self.network, names, setup["inputs"], setup["outputs"],
-                                    known=self.calibrated_switches())
+                                    known=self.calibrated_switches(), alternative=alternative)
             if not plan.steps:
                 hidden = "; ".join(f"{name}: {reason}" for name, reason in plan.unreachable.items())
                 raise ValueError(f"No selected MZI is visible with this detection. {hidden}")
@@ -1080,6 +1167,7 @@ class CalibrationMixin:
             "kind": kind, **setup["context"],
             "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "comment": self.cal_comment_var.get().strip(), "unit": setup["unit"], "saved_voltages": save,
+            "probe_paths": PATHS_ALTERNATIVE if alternative else PATHS_PRIMARY,
             "voltages_v": list(voltages), "settle_s": settle_s,
             "background": "MZIs off the probe cross at 0 V, or held at a calibrated bar where the plan says",
             "not_visible": plan.unreachable,
@@ -1106,6 +1194,8 @@ class CalibrationMixin:
         self.cal_mzi_progress_var.set(f"MZIs completed: 0/{len(plan.steps)}")
         self.cal_sweep_progress.configure(maximum=len(voltages), value=0)
         self.cal_sweep_progress_var.set(f"Sweep points completed: 0/{len(voltages)}")
+        if complete:
+            self.remember_bench("calibration")
         self.set_calibration_controls(True)
         self.claim_detection(setup, True)
         for name in names:
@@ -1117,6 +1207,8 @@ class CalibrationMixin:
         def worker():
             error, stopped, folder, save_error = None, False, None, None
             try:
+                if setup["osa"] is not None:
+                    self.light_osa_lasers()
                 detector, close = setup["open"]()
                 try:
                     run_calibration(self.controller, detector, self.network, plan.steps, voltages, settle_s, save,
@@ -1156,13 +1248,13 @@ class CalibrationMixin:
                         save_state_checks(folder, record, checks, pass_db)
                 except Exception as failure:
                     save_error = str(failure)
-            self.after(0, lambda: self.finish_calibration(setup, error, stopped, folder, save_error))
+            self.after(0, lambda: self.finish_calibration(setup, error, stopped, folder, save_error, complete))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def finish_calibration(self, setup, error, stopped, folder, save_error):
+    def finish_calibration(self, setup, error, stopped, folder, save_error, complete=False):
         self.claim_detection(setup, False)
-        self.finish_mzi_job(error, stopped, folder, save_error, leaves_zero=True)
+        self.finish_mzi_job(error, stopped, folder, save_error, leaves_zero=True, power_down=complete)
         self.update_calibration_plan()
 
     def calibration_plot_support(self):
@@ -1184,7 +1276,8 @@ class CalibrationMixin:
     def set_calibration_controls(self, running):
         state = "disabled" if running else "normal"
         for button in (self.cal_single_button, self.cal_all_button, self.cal_alignment_button,
-                       self.cal_routed_button, self.cal_power_route_button, self.cal_reextract_button):
+                       self.cal_routed_button, self.cal_power_route_button, self.cal_reextract_button,
+                       self.cal_compare_button):
             button.configure(state=state)
         self.cal_stop_button.configure(state="normal" if running else "disabled")
         for tab in (self.route_tab, self.hardware_tab, self.crosstalk_tab, self.dataset_tab):
@@ -1238,6 +1331,7 @@ class CalibrationMixin:
         def worker():
             error, stopped, folder, save_error = None, False, None, None
             try:
+                self.light_osa_lasers()
                 job(hooks)
             except CalibrationStopped:
                 stopped = True
@@ -1254,7 +1348,7 @@ class CalibrationMixin:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def finish_mzi_job(self, error, stopped, folder, save_error, leaves_zero):
+    def finish_mzi_job(self, error, stopped, folder, save_error, leaves_zero, power_down=False):
         self.mzi_calibration_running = False
         self.finish_activity("calibration", "Calibration failed" if error or save_error else
                              "Calibration stopped" if stopped else "Calibration complete")
@@ -1276,6 +1370,8 @@ class CalibrationMixin:
         else:
             self.zero_volt_switches.clear()
             self.show_calibrated_voltages()
+        if power_down:
+            self.power_down_after("calibration")
         routed = self.osa_output_switch.routed_output
         if routed is not None:
             self.osa_output_var.set(str(routed))
@@ -1508,6 +1604,14 @@ class CalibrationMixin:
         points = plot["points"]
         xs, label = self.calibration_x(name, [item.voltage for item in points])
         plot["power_line"].set_data(xs, [self.plotted_power(item.power) for item in points])
+        gpib_line = plot.get("gpib_line")
+        if gpib_line is not None:
+            records = ((self.cal_hp_bnc_context or {}).get("point_ranges") or {}).get(name, [])
+            gpib_line.set_data(
+                [x for x, record in zip(xs, records)
+                 if record.get("measurement_source") == "HP GPIB autorange"],
+                [self.plotted_power(point.power) for point, record in zip(points, records)
+                 if record.get("measurement_source") == "HP GPIB autorange"])
         floor_line = plot.get("floor_line")
         if floor_line is not None:
             hp_bnc = self.cal_hp_bnc_context or {}
@@ -1575,10 +1679,12 @@ class CalibrationMixin:
         power_line, = lines_axis.plot([], [], marker=".", linewidth=1.4, color=WDM_COLORS[probe.input],
                                       label=("Initial HP range" if self.cal_hp_bnc_overlay else
                                              f"In {probe.input + 1} (arrives if {state})"))
-        floor_line = None
+        floor_line = gpib_line = None
         if self.cal_hp_bnc_context is not None:
             floor_line, = lines_axis.plot([], [], marker="v", linestyle="None", color="#d97706",
                                           label="Below Arduino ADC floor (limit shown)")
+            gpib_line, = lines_axis.plot([], [], marker="s", linestyle="None", color="#3b82f6",
+                                         label="HP GPIB autorange")
         reconstructed_line = None
         if self.cal_hp_bnc_overlay:
             reconstructed_line, = lines_axis.plot([], [], marker=".", linewidth=1.4,
@@ -1609,6 +1715,7 @@ class CalibrationMixin:
         canvas.get_tk_widget().pack(fill="both", expand=True)
         self.cal_plot_items[probe.name] = {"tab": tab, "canvas": canvas, "axes": axes, "power_line": power_line,
                                            "floor_line": floor_line,
+                                           "gpib_line": gpib_line,
                                            "reconstructed_line": reconstructed_line, "reconstructed_points": [],
                                            "reference_line": reference_line, "contrast_line": contrast_line,
                                            "points": [], "result": None, "markers": []}

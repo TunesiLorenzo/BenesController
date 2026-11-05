@@ -74,6 +74,23 @@ class HP8152ATests(unittest.TestCase):
         self.assertEqual(caught.exception.actual_range_dbm, -10)
         meter.disconnect()
 
+    def test_autorange_read_restores_fixed_bnc_range(self):
+        class RangeInstrument(FakeInstrument):
+            def write(self, command):
+                super().write(command)
+                if command.startswith("CH1;AR0;RNG 1,"):
+                    self.settings["RNG? 1"] = command.split(",", 1)[1].removesuffix("DBM")
+
+        instrument = RangeInstrument(readings=("-68.0",))
+        meter = HP8152A(resource_manager_factory=lambda: FakeManager(instrument), sleep=lambda _: None)
+        meter.connect()
+        meter.set_fixed_analog_range(1, -50)
+        self.assertEqual(meter.read_dbm_autorange_then_restore(1, -50), -68.0)
+        self.assertEqual(instrument.writes[-4:], ["CH1;AR1", "CSB", "TRG",
+                                                 "CH1;AR0;RNG 1,-50DBM"])
+        self.assertEqual(meter.read_range_dbm(1), -50)
+        meter.disconnect()
+
     def test_triggered_read_uses_gpib_status_and_restores_previous_settings(self):
         instrument = FakeInstrument()
         manager = FakeManager(instrument)

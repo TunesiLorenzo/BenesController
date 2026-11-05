@@ -13,7 +13,9 @@ from typing import Callable
 
 from benes.hardware import osa
 
-# The first new sweep may have started before the change; the second lies wholly after it.
+# Sweeping continuously, the first new sweep may have started before the change; the second
+# lies wholly after it. In single mode (Hardware -> OSA) each read starts one sweep, so
+# get_spectrum waits for that one instead.
 FRESH_SWEEPS = 2
 MAX_SWEEPS = 16
 

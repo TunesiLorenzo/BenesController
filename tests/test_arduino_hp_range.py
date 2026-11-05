@@ -138,23 +138,62 @@ class ArduinoHPRangeTests(unittest.TestCase):
         self.assertIn((1, -40), hp.commands)
         self.assertEqual(controller.drives, [("S2.1", v) for v in range(5)])
 
-    def test_known_81521b_stops_at_minus_50_without_requesting_minus_60(self):
+    def test_rejected_lower_bnc_range_uses_hp_autorange_for_weak_points(self):
+        class LimitedHP(FakeHP):
+            def __init__(self):
+                super().__init__(-50)
+                self.gpib_reads = []
+
+            def read_head_id(self, channel):
+                return "HP 81521B"
+
+            def set_fixed_analog_range(self, channel, range_dbm):
+                if range_dbm == -60:
+                    raise HPRangeUnavailable(-60, self.range_dbm)
+                super().set_fixed_analog_range(channel, range_dbm)
+
+            def read_dbm_autorange_then_restore(self, channel, fixed_range_dbm, settle_s):
+                self.gpib_reads.append((channel, fixed_range_dbm))
+                return -68.0
+
+        hp, _, _, reader, points, _ = self.make_scan(
+            {0: 0.00001, 1: 0.1, 2: 0.00002}, hp=LimitedHP())
+        self.assertEqual(hp.gpib_reads, [(1, -50), (1, -50)])
+        self.assertAlmostEqual(points[0].power, 10 ** (-68 / 10))
+        self.assertAlmostEqual(points[2].power, 10 ** (-68 / 10))
+        self.assertEqual(reader.history["S2.1"][0]["measurement_source"], "HP GPIB autorange")
+        self.assertEqual(reader.history["S2.1"][0]["gpib_dbm"], -68.0)
+        self.assertEqual(reader.history["S2.1"][1]["measurement_source"], "Arduino")
+
+    def test_known_81521b_steps_below_minus_50_until_readable(self):
         class Head81521B(FakeHP):
             def read_head_id(self, channel):
                 return "HEWLETT PACKARD,81521B,2827G01846,0"
 
-            def set_fixed_analog_range(self, channel, range_dbm):
-                if range_dbm < -50:
-                    raise AssertionError("The 81521B has no -60 dBm fixed range")
-                super().set_fixed_analog_range(channel, range_dbm)
+        hp, _, _, reader, points, _ = self.make_scan(
+            {0: 0.00004, 1: 0.0001, 2: 0.001}, hp=Head81521B(-50))
+        self.assertEqual(reader.minimum_range_dbm, -80)
+        for point, expected in zip(points, (0.04, 0.1, 1.0)):
+            self.assertAlmostEqual(point.power, expected)
+        self.assertEqual([row["range_limit"] for row in reader.history["S2.1"]], [None] * 3)
+        self.assertEqual(reader.history["S2.1"][0]["range_steps"], 3)
+        self.assertEqual(reader.history["S2.1"][0]["range_dbm"], -80)
+        self.assertIn((1, -60), hp.commands)
+        self.assertIn((1, -70), hp.commands)
+        self.assertIn((1, -80), hp.commands)
+
+    def test_known_81521b_reports_floor_only_after_reaching_minus_80(self):
+        class Head81521B(FakeHP):
+            def read_head_id(self, channel):
+                return "HP 81521B"
 
         hp, _, _, reader, points, _ = self.make_scan(
-            {0: 0.004, 1: 0.1, 2: 0.02}, hp=Head81521B(-50))
-        self.assertEqual(reader.minimum_range_dbm, -50)
-        self.assertEqual([point.power for point in points], [4.0, 100.0, 20.0])
+            {0: 1e-8, 1: 0.0001, 2: 0.001}, hp=Head81521B(-50))
+        self.assertIsNone(points[0].power)
+        self.assertEqual(reader.history["S2.1"][0]["range_dbm"], -80)
         self.assertEqual(reader.history["S2.1"][0]["range_limit"], "low")
-        self.assertIn("lowest fixed range", reader.history["S2.1"][0]["range_error"])
-        self.assertNotIn((1, -60), hp.commands)
+        self.assertIn("-80", reader.history["S2.1"][0]["range_error"])
+        self.assertNotIn((1, -90), hp.commands)
 
     def test_curve_without_two_usable_points_is_rejected(self):
         hp = FakeHP(-90)

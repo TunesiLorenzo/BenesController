@@ -24,14 +24,14 @@ class RecalibrateTests(unittest.TestCase):
                     "input": 1, "output": 5, "bright_state": "bar",
                     "cross_voltage_v": 0.0, "bar_voltage_v": 4.1}}}), encoding="utf-8")
             [result] = recalibrate(folder / "mzi_calibration.json")
-            self.assertEqual((result.cross, result.bar, result.method), (0.8, 2.3, "fit"))
+            self.assertEqual((result.cross, result.bar, result.method), (0.7, 2.3, "fit"))
 
             config = folder / "benes_voltage_config.json"
             config.write_text("{}", encoding="utf-8")
             backup = apply([result], config)
             self.assertEqual(backup.read_text(encoding="utf-8"), "{}")
             saved = json.loads(config.read_text(encoding="utf-8"))["calibration"]["S1.1"]
-            self.assertEqual(saved, {"straight": 2.3, "cross": 0.8})
+            self.assertEqual(saved, {"straight": 2.3, "cross": 0.7})
 
 
 if __name__ == "__main__":

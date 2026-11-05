@@ -298,6 +298,7 @@ class CrosstalkMixin:
         self.active_scan_kind = "Crosstalk matrix"
         self.crosstalk_stop_event = stop_event = threading.Event()
         self.begin_activity("crosstalk", f"Crosstalk matrix: {plan.pair_count} pairs", total)
+        self.remember_bench("crosstalk")
         self.set_crosstalk_matrix_controls(True)
         self.claim_detection(setup, True)
         self.crosstalk_plan_var.set(self.describe_crosstalk_plan(plan))
@@ -374,7 +375,7 @@ class CrosstalkMixin:
         self.zero_volt_switches = set(self.network.switches)
         for name in self.network.switches:
             self.voltage_vars[name].set("0.00")
-        self.refresh(keep_selection=True)
+        self.power_down_after("crosstalk")
         detail = f"{len(run.pairs)} pair(s) measured"
         if run.screens:
             detail += f", {len(run.static_pairs)} of {len(run.screens)} pretested pair(s) did not move"
@@ -724,6 +725,7 @@ class CrosstalkMixin:
             self.claim_detection(setup, True)
         self.begin_activity("crosstalk", f"Thermal crosstalk: scanning {len(names)} switches",
                             len(names) * len(voltages) + 1)
+        self.remember_bench("crosstalk")
         self.crosstalk_data = {}
         self.crosstalk_data_source = None
         self.crosstalk_data_unit = None
@@ -829,6 +831,7 @@ class CrosstalkMixin:
         self.set_tab_state(self.hardware_tab, "normal")
         if data:
             self.crosstalk_export_button.configure(state="normal")
+        self.power_down_after("crosstalk")
         if scan_error:
             self.crosstalk_status.set(f"{self.active_scan_kind} stopped: {scan_error}. Results: {folder}")
             messagebox.showerror(f"{self.active_scan_kind} failed", scan_error, parent=self)

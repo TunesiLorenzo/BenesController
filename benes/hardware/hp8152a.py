@@ -250,6 +250,21 @@ class HP8152A:
         power = self._read_value(timeout_s)
         return None if power <= -900 else power
 
+    def read_dbm_autorange_then_restore(self, channel, fixed_range_dbm, settle_s=0.3):
+        """Measure a weak point with HP autoranging, then restore the BNC range."""
+        with self._io_lock:
+            if not self.connected:
+                raise RuntimeError("Connect the HP 8152A before reading power")
+            if channel not in (1, 2) or fixed_range_dbm not in RANGES_DBM:
+                raise ValueError("Choose a valid HP channel and fixed range")
+            self.instrument.write(f"CH{channel};AR1")
+            try:
+                self._sleep(settle_s)
+                power = self._read_value_unlocked()
+                return None if power <= -900 else power
+            finally:
+                self._set_fixed_analog_range_unlocked(channel, fixed_range_dbm)
+
     def _read_value(self, timeout_s=10):
         with self._io_lock:
             return self._read_value_unlocked(timeout_s)

@@ -4,6 +4,7 @@ import math
 import socket
 import statistics
 import time
+from dataclasses import dataclass
 
 
 C = 299792458
@@ -161,40 +162,209 @@ def wait_for_fresh_trace(fetch, needed, max_wait_s=30.0, baseline=None, poll_s=0
     return buffer
 
 
+class OSASession:
+    """One remote-control connection: LF-terminated ASCII commands, one reply line per query."""
+
+    def __init__(self, host, port, timeout=10):
+        self.timeout = timeout
+        self.connection = socket.create_connection((host, port), timeout=timeout)
+        self.stream = self.connection.makefile("rwb")
+        self.write("*REM")
+        self.identity = self.query("*IDN?")
+
+    def write(self, command):
+        self.stream.write(command.encode("ascii") + b"\n")
+        self.stream.flush()
+
+    def query(self, command):
+        self.write(command)
+        reply = self.stream.readline()
+        if not reply.endswith(b"\n"):
+            raise OSError(f"OSA closed the connection during {command}")
+        return reply.decode("ascii").strip()
+
+    def close(self):
+        self.connection.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
+def single_mode(session) -> bool:
+    """``OSASetup:MODe 1``: each ``KEY START`` runs one acquisition, then the OSA stops."""
+    return session.query("OSASetup:MODe?").strip() == "1"
+
+
+def wait_until_stopped(session, max_wait_s, clock=time.monotonic):
+    """``STAT:WEAcq?`` until the running acquisition ends, in calls shorter than the socket timeout."""
+    deadline = clock() + max_wait_s
+    while True:
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise TimeoutError(f"The OSA acquisition did not finish within {max_wait_s:g} s")
+        chunk = max(1, min(int(remaining), int(session.timeout) - 1))
+        if session.query(f"STAT:WEAcq? {chunk}").strip() == "STOPPED":
+            return
+
+
+def single_acquisition(session, max_wait_s=30.0, start_wait_s=2.0, clock=time.monotonic, sleep=time.sleep):
+    """Start one acquisition and return its buffer: it lies wholly after this call.
+
+    An acquisition already running may have started before the last change, so it
+    is let finish and discarded. The status, not a changed buffer, shows the new one
+    ran: with no light above the floor two sweeps return identical buffers. The lab
+    OSA reports IN_PROGRESS 0.1-0.25 s after ``KEY START`` and sweeps for about 2 s.
+    """
+    if session.query("STAT:ACQ?") != "STOPPED":
+        wait_until_stopped(session, max_wait_s, clock)
+    session.write("KEY START")
+    deadline = clock() + start_wait_s
+    while session.query("STAT:ACQ?") != "IN_PROGRESS":
+        if clock() >= deadline:
+            raise TimeoutError(f"The OSA did not start a single acquisition within {start_wait_s:g} s")
+        sleep(0.02)
+    wait_until_stopped(session, max_wait_s, clock)
+    return session.query(":CUR:BUFF?")
+
+
 def get_spectrum(host="192.168.0.200", port=8002, timeout=10, curve=1, fresh_sweeps=0, max_wait_s=30.0):
     """Download a trace; ``fresh_sweeps`` waits for that many sweeps to complete first.
 
-    After moving the output switch use ``fresh_sweeps=2``: the first new sweep
-    may have started before the move, the second lies wholly after it.  When the
-    OSA was stopped, the sweep this call starts is already wholly fresh, so one
-    is enough, and the stale buffer from before the start is never returned.
+    In single mode (``OSASetup:MODe 1``) the call starts one acquisition and waits
+    for it, which is wholly fresh, so ``fresh_sweeps`` is not needed. Sweeping
+    continuously, after moving the output switch use ``fresh_sweeps=2``: the first
+    new sweep may have started before the move, the second lies wholly after it.
+    When the continuous OSA was stopped, the sweep this call starts is already
+    wholly fresh, so one is enough, and the stale buffer is never returned.
     """
-    with socket.create_connection((host, port), timeout=timeout) as connection:
-        stream = connection.makefile("rwb")
-
-        def write(command):
-            stream.write(command.encode("ascii") + b"\n")
-            stream.flush()
-
-        def query(command):
-            write(command)
-            reply = stream.readline()
-            if not reply.endswith(b"\n"):
-                raise OSError(f"OSA closed the connection during {command}")
-            return reply.decode("ascii").strip()
-
-        write("*REM")
-        query("*IDN?")
-        write(f":CUR:SELECT {curve}")
-        query(":CUR:SIZE?")
-        started = query("STAT:ACQ?") == "STOPPED"
-        if started:
+    with OSASession(host, port, timeout) as session:
+        session.write(f":CUR:SELECT {curve}")
+        session.query(":CUR:SIZE?")
+        if single_mode(session):
+            buffer = single_acquisition(session, max_wait_s)
+        elif session.query("STAT:ACQ?") == "STOPPED":
             # Capture the stale buffer first so the new sweep is recognised.
-            stale = query(":CUR:BUFF?")
-            write("KEY START")
-            buffer = wait_for_fresh_trace(lambda: query(":CUR:BUFF?"), 1, max_wait_s, baseline=stale)
+            stale = session.query(":CUR:BUFF?")
+            session.write("KEY START")
+            buffer = wait_for_fresh_trace(lambda: session.query(":CUR:BUFF?"), 1, max_wait_s, baseline=stale)
         else:
-            buffer = wait_for_fresh_trace(lambda: query(":CUR:BUFF?"), fresh_sweeps, max_wait_s)
+            buffer = wait_for_fresh_trace(lambda: session.query(":CUR:BUFF?"), fresh_sweeps, max_wait_s)
         raw = parse_curve(buffer)
-        xoff, xscale, yoff, yscale = (float(query(f":CUR:{name}?")) for name in ("XOFF", "XSCale", "YOFF", "YSCale"))
+        xoff, xscale, yoff, yscale = (float(session.query(f":CUR:{name}?"))
+                                      for name in ("XOFF", "XSCale", "YOFF", "YSCale"))
     return scale_curve(raw, xoff, xscale, yoff, yscale)
+
+
+# Acquisition settings (Programming the MTS/T-BERD rev 007, ch. 5, "OSASetup").
+MODES = {"Continuous": "0", "Single": "1"}
+RESOLUTIONS = ("FULL", "R01nm", "R02nm", "R03nm", "R04nm", "R05nm")
+SENSITIVITIES = ("AUTO", "NO", "YES")
+AVERAGING = ("NO", "LOW", "MEDium", "HIGH")
+# Manual start/end range; the OSA takes it in THz, start (short wavelength) above end.
+MANUAL_RANGE = "SEManual"
+RANGE_NM = (1260.0, 1650.0)
+
+
+@dataclass
+class OSASettings:
+    mode: str           # a key of MODES, or the raw reply for another mode
+    resolution: str
+    sensitivity: str
+    averaging: str
+    range_preset: str
+    start_nm: float     # the manual range, shortest wavelength first
+    end_nm: float
+    points: int
+
+
+def _keyword(reply, choices):
+    """Map the firmware's abbreviated reply (``AUT``, ``SEM``) back to its keyword."""
+    reply = reply.strip().upper()
+    for choice in choices:
+        if choice.upper().startswith(reply) or reply.startswith(choice.upper()):
+            return choice
+    return reply
+
+
+def _thz(nm):
+    return C / nm / 1000
+
+
+def read_settings(session) -> OSASettings:
+    mode = session.query("OSASetup:MODe?").strip()
+    return OSASettings(
+        mode=next((name for name, value in MODES.items() if value == mode), mode),
+        resolution=_keyword(session.query("OSASetup:RESO?"), RESOLUTIONS),
+        sensitivity=_keyword(session.query("OSASetup:HSEns?"), SENSITIVITIES),
+        averaging=_keyword(session.query("OSASetup:AVG?"), AVERAGING),
+        range_preset=_keyword(session.query("OSASetup:SEAcq?"), (MANUAL_RANGE,)),
+        start_nm=_thz(float(session.query("OSASetup:MSAcq?"))),
+        end_nm=_thz(float(session.query("OSASetup:MEAcq?"))),
+        points=int(session.query(":CUR:SIZE?")))
+
+
+def validate_settings(mode, resolution, sensitivity, averaging, start_nm, end_nm):
+    if mode not in MODES:
+        raise ValueError(f"OSA acquisition must be one of {', '.join(MODES)}")
+    for value, choices, name in ((resolution, RESOLUTIONS, "resolution"), (sensitivity, SENSITIVITIES, "sensitivity"),
+                                 (averaging, AVERAGING, "averaging")):
+        if value not in choices:
+            raise ValueError(f"OSA {name} must be one of {', '.join(choices)}")
+    try:
+        start_nm, end_nm = float(start_nm), float(end_nm)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Enter the OSA range start and end in nm") from error
+    if not RANGE_NM[0] <= start_nm < end_nm <= RANGE_NM[1]:
+        raise ValueError(f"The OSA range must run from low to high within {RANGE_NM[0]:g}–{RANGE_NM[1]:g} nm")
+    if _thz(start_nm) - _thz(end_nm) < 0.1:
+        raise ValueError("The OSA range must span at least 0.1 THz (about 0.8 nm at 1550 nm)")
+    return mode, resolution, sensitivity, averaging, start_nm, end_nm
+
+
+def apply_settings(session, mode, resolution, sensitivity, averaging, start_nm, end_nm,
+                   max_wait_s=30.0, clock=time.monotonic, sleep=time.sleep) -> OSASettings:
+    """Stop the acquisition, write the settings, read them back; continuous mode restarts.
+
+    Raises if any setting reads back different, so a value the module rejects is caught.
+    """
+    mode, resolution, sensitivity, averaging, start_nm, end_nm = validate_settings(
+        mode, resolution, sensitivity, averaging, start_nm, end_nm)
+    if session.query("STAT:ACQ?") != "STOPPED":
+        if single_mode(session):
+            wait_until_stopped(session, max_wait_s, clock)
+        else:
+            session.write("KEY START")  # Toggles the running acquisition off.
+            deadline = clock() + max_wait_s
+            while session.query("STAT:ACQ?") != "STOPPED":
+                if clock() >= deadline:
+                    raise TimeoutError("The OSA did not stop its acquisition")
+                sleep(0.1)
+    start_thz, end_thz = round(_thz(start_nm), 3), round(_thz(end_nm), 3)
+    session.write(f"OSASetup:MODe {MODES[mode]}")
+    session.write(f"OSASetup:RESO {resolution}")
+    session.write(f"OSASetup:HSEns {sensitivity}")
+    session.write(f"OSASetup:AVG {averaging}")
+    session.write(f"OSASetup:SEAcq {MANUAL_RANGE}")
+    # Start must stay above end at every step, so move first whichever keeps them apart.
+    if start_thz > float(session.query("OSASetup:MEAcq?")):
+        session.write(f"OSASetup:MSAcq {start_thz:.3f}")
+        session.write(f"OSASetup:MEAcq {end_thz:.3f}")
+    else:
+        session.write(f"OSASetup:MEAcq {end_thz:.3f}")
+        session.write(f"OSASetup:MSAcq {start_thz:.3f}")
+    settings = read_settings(session)
+    wrong = [name for name, wanted, got in (
+        ("acquisition", mode, settings.mode), ("resolution", resolution, settings.resolution),
+        ("sensitivity", sensitivity, settings.sensitivity), ("averaging", averaging, settings.averaging),
+        ("range", MANUAL_RANGE, settings.range_preset)) if wanted != got]
+    if not (math.isclose(_thz(settings.start_nm), start_thz, abs_tol=0.002)
+            and math.isclose(_thz(settings.end_nm), end_thz, abs_tol=0.002)):
+        wrong.append("range start/end")
+    if wrong:
+        raise ValueError(f"The OSA did not accept the {', '.join(wrong)} setting; read back: {settings}")
+    if mode == "Continuous":
+        session.write("KEY START")
+    return settings

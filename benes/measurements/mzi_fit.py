@@ -288,9 +288,11 @@ def extract_calibration(probe, points, xs, unit="mW", x_unit="mW",
         raise ValueError(f"{probe.name}: only {extinction:.1f} dB change at output {probe.output + 1}; "
                          f"check that input {probe.input + 1} is lit and the detector is on that output")
     if fit_trusted(fit):
-        bright, dark = fitted_extremes(fit, xs, points)
+        bright, _ = fitted_extremes(fit, xs, points)
     else:
         bright = _extreme(measured, value, True, bright_tie)
-        dark = _extreme(measured, value, False, dark_tie)
+    # The fitted first null may be shallower than a later measured null. Search
+    # every measured point, preferring lower voltage only among near-equal minima.
+    dark = _extreme(measured, value, False, dark_tie)
     cross, bar = (bright, dark) if probe.bright_crossed else (dark, bright)
     return MZISweep(probe, points, cross, bar, extinction, fit, unit)

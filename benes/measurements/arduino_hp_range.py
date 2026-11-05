@@ -84,13 +84,15 @@ class ArduinoHPRangeSweep:
             # Older firmware may not answer IDN?; readback still guards every
             # attempted range and repeated refusals are cached below.
             self.head_id = ""
-        self.minimum_range_dbm = -50 if "81521B" in self.head_id.upper() else RANGES_DBM[0]
+        # The 81521B measures down to -80 dBm. Probe each lower fixed range
+        # and let the HP readback decide whether this particular head accepts it.
+        self.minimum_range_dbm = -80 if "81521B" in self.head_id.upper() else RANGES_DBM[0]
         self.reference_range_dbm = (hp.read_range_dbm(channel) if start_range_dbm is None
                                     else start_range_dbm)
         if self.reference_range_dbm not in RANGES_DBM:
             raise ValueError("Choose a valid initial HP 8152A range")
         if self.reference_range_dbm < self.minimum_range_dbm:
-            raise ValueError(f"The HP 81521B lowest fixed range is {self.minimum_range_dbm} dBm")
+            raise ValueError(f"The HP 81521B specified measurement floor is {self.minimum_range_dbm} dBm")
         self.range_dbm = self.reference_range_dbm
         self.point_records = []
         self.history = {}
@@ -144,8 +146,8 @@ class ArduinoHPRangeSweep:
             target = self._next_range(raw, self.range_dbm)
             if target is None:
                 limit = "high" if raw >= self.high_adc else "low"
-                if limit == "low" and self.minimum_range_dbm == -50:
-                    range_error = "HP 81521B lowest fixed range is -50 dBm"
+                if limit == "low" and self.range_dbm == self.minimum_range_dbm:
+                    range_error = f"Reached the {self.minimum_range_dbm} dBm range with ADC below {self.low_adc:g}"
                 break
             if target in visited:
                 limit = "unstable"
@@ -173,7 +175,20 @@ class ArduinoHPRangeSweep:
                 break
             self._range_refusals.pop(range_pair, None)
             steps += 1
-        if limit in ("high", "unstable"):
+        gpib_dbm = None
+        measurement_source = "Arduino"
+        if limit == "low" and range_error is not None:
+            try:
+                gpib_dbm = self.hp.read_dbm_autorange_then_restore(self.channel, self.range_dbm,
+                                                                      self.range_settle_s)
+            except Exception as error:
+                range_error = f"{range_error}; HP GPIB autorange read failed: {error}"
+            else:
+                if gpib_dbm is not None:
+                    measurement_source = "HP GPIB autorange"
+        if measurement_source == "HP GPIB autorange":
+            value = 10 ** (gpib_dbm / 10)
+        elif limit in ("high", "unstable"):
             # A clipped reading only gives a lower bound, so it cannot enter the fit.
             value = None
         elif limit == "low" and raw < FLOOR_MIN_ADC:
@@ -188,7 +203,8 @@ class ArduinoHPRangeSweep:
             "final_raw_adc": raw, "range_dbm": self.range_dbm,
             "range_steps": steps, "range_limit": limit, "range_error": range_error,
             "corrected_power": value,
-            "measurement_source": "Arduino",
+            "measurement_source": measurement_source,
+            "gpib_dbm": gpib_dbm,
         })
         return value
 
@@ -202,7 +218,8 @@ class ArduinoHPRangeSweep:
         ]
         # Floor-limited readings are kept for the fit but do not make a curve usable.
         usable = sum(point.power is not None and math.isfinite(point.power)
-                     and point.power > 0 and record["range_limit"] is None
+                     and point.power > 0 and (record["range_limit"] is None
+                                              or record["measurement_source"] == "HP GPIB autorange")
                      for point, record in zip(points, self.point_records))
         if usable < 2:
             raise ValueError(

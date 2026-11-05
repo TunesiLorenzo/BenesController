@@ -34,6 +34,8 @@ The JDSU switch is what makes every output reachable from a single detector: clo
 
 Every OSA reading, in every tab (trace reads, laser detection, MZI calibration, crosstalk scans and matrix, the voltage optimizer, WDM scans, Evaluate Configuration and dataset batches), is taken the same way: it waits for two complete sweeps after the last change, so the trace lies wholly after a JDSU move or heater step, then averages **Sweeps per reading** (Hardware → OSA, 1–16, default 1) in linear power. More sweeps reduce noise and multiply the time of every reading.
 
+**OSA acquisition settings** (Hardware → OSA & output switch) read and write the instrument's own setup over the network (commands from VIAVI *Programming the MTS/T-BERD* rev 007, ch. 5; see `docs/OSA_REMOTE_GUIDE.md`). **Read from OSA** fills in acquisition mode, resolution, high sensitivity, OSA averaging and the manual wavelength range; **Apply to OSA** stops the acquisition, writes them, reads each one back and reports any the module refused. With **Single** acquisition each reading starts one sweep after the change and waits for it (`STAT:WEAcq?`), about one sweep per reading instead of up to two; **Continuous** restarts free-running sweeps and keeps the two-sweep wait. A narrower range, lower sensitivity and no OSA averaging also shorten a sweep, but check the noise floor stays below the weakest leak line you measure. **Time a reading** takes three readings exactly as the measurements do, on the output routed now, and reports the seconds per reading.
+
 To diagnose a rejected low range remotely, turn off the lasers, then use
 **Hardware → HP 8152A meter → Test -60 dBm range**. It tries separate 10 dB
 steps and shows the connected optical head ID, requested and reported ranges,
@@ -77,7 +79,7 @@ The window has seven tabs, ordered by workflow, and a status strip under the tit
 
 | Tab | What you do there | Key controls |
 | --- | --- | --- |
-| Routing | Pick routes, set MZI states, route full permutations, evaluate a configuration | Route explorer diagram, **X / = / 0** per MZI, **Route permutation**, **Shuffle**, **Apply path (drive bar/cross)**, **Evaluate Configuration**, **Optimize voltages** |
+| Routing | Pick routes, set MZI states, route full permutations, evaluate a configuration | Route explorer diagram, **X / = / 0** per MZI, **Route permutation**, **Shuffle**, **Apply path (drive bar/cross)**, **Evaluate Configuration**, **Optimize voltages**, **All off / Restore previous routing + lasers** |
 | Hardware | Connect instruments (tried automatically at startup); **Devices** status list; sub-tabs Voltage board, OSA & output switch, Arduino meter, HP 8152A meter, Newport lasers (laser current and TEC per slot) | **Connect all**, **Connect**, **Dry run**, **Simulate**, **Selector setup…**, **Route + read**, **Read all outputs**, **Start stream**, **MZI ↔ pin mapping / calibration…**, Newport **Set**, **Turn ON / OFF**, **ALL CURRENT OFF**, **Detach** |
 | MZI calibration | Find each MZI's bar and cross voltages; check states | **Detection**, **Sweep selected MZI**, **Calibrate all visible MZIs**, **Alignment check (all 0 V)**, **Check routed states**, **Check all routes with power meter**, **Detect six lasers** |
 | Thermal crosstalk | Manual voltage scans per switch and the automatic κ matrix | **Scan selected switches**, **Plan**, **Run matrix**, **X axis**, **Open results…** |
@@ -95,7 +97,19 @@ The window has seven tabs, ordered by workflow, and a status strip under the tit
 - **Optimize voltages** fine-tunes the MZIs on the lit paths around their present voltages. It reads with the detection chosen in MZI calibration → Detection. With **OSA**, every laser stays on, the JDSU brings each MZI's leak output to the OSA, and the tuned input's own WDM line there is minimized; it needs the OSA, the JDSU and a wavelength for each tuned input, but no power meter. With **Power meter**, it reads the Arduino through the HP BNC output (connect both and set the BNC dBm reference first). With an input selected, only that input's path is tuned. With **None**, every input is tuned in turn (with the power meter, lit one at a time through the Newport) and each MZI is tuned once. Each MZI is bracketed by ±0.15 V, moved to the vertex of a parabola through the three readings, and the bracket narrows to 0.03 V. A move counts only when the reading improves beyond the noise. An MZI stays within 0.5 V of its start and inside 0–5 V and the safe current density, and the whole search takes about 8–16 readings per MZI.
   - With the meter on the JDSU common (MZI calibration → Detection), each MZI is tuned for the **least light at its leak output**, where its unused port sends the light. That minimum is sharp, so it fixes extinction that the routed power hardly shows. The routed power is read before and after each path.
   - With the meter fixed on one output, only the input routed there can be tuned, and only for the **most routed power**.
-  - The new voltages stay applied. Afterwards you are asked whether to save them as the calibrated cross/bar voltages. **Stop optimizer** returns the MZI being tuned to its start voltage and keeps those already finished.
+  - The new voltages are applied when it finishes. You are asked whether to save them as the calibrated cross/bar voltages, then the bench is turned off (see below) and **Restore** brings the optimized voltages back. **Stop optimizer** returns the MZI being tuned to its start voltage and keeps those already finished.
+
+### Bench off after every scan
+
+A scan left alone must not keep heaters hot or lasers lit. When any of these ends, finished, stopped or failed, every MZI is set to 0 V and every Newport laser current is turned off (TECs stay on): MZI calibration and its state and power-route checks, the crosstalk scan and matrix, the WDM scan and **Evaluate Configuration**, the dataset batch and **Optimize voltages**. The status strip adds "MZIs at 0 V, lasers off", and anything that does not confirm off is listed in a warning.
+
+The button at the top right of the Routing tab toggles the bench:
+
+- **All off (MZIs 0 V, lasers off)** does the same by hand.
+- **Restore previous routing + lasers** sends back the routing from before the last scan, or before you pressed **All off**, and turns the lasers that were on back on. An MZI that was at its calibrated cross or bar voltage gets that state's present calibration, so a calibration run in between is used; any other voltage is sent as it was. A laser whose TEC is off stays off.
+- A scan started from the all-off state keeps the earlier routing for **Restore**. If you changed MZIs or lasers after **All off**, **Restore** asks first whether to restore or to turn the present ones off.
+
+The single-MZI scan in the pin-mapping dialog is short and interactive, so it leaves the bench as it is.
 
 ### Heater safety limits
 
@@ -138,14 +152,16 @@ mean is below the low limit (default 7) or at/above the high limit (default
 75), the heater stays at that voltage while GPIB changes the fixed HP range by
 10 dB, waits 0.3 s, and Arduino measures again. The scan then moves forward.
 Keep the high limit below 86 counts, where the HP BNC output clips; a clipped
-reading is dropped, and a reading below the window on the lowest range the HP
-accepts is kept but flagged `low`, unless it is under 1 count.
+reading is dropped. If the HP refuses a lower fixed range, the software reads
+that point directly over GPIB with HP autoranging, then restores the BNC range.
+The saved range CSV marks these points as `HP GPIB autorange`. If that read is
+also unavailable, the point remains flagged `low` and is dropped below 1 count.
 
 With any power meter, each curve starts by re-reading its first voltage until
 two readings agree within 10 % (up to 25 reads, 0.2 s apart). A Newport laser
 can start emitting after its settle time has passed; without this check the
 first point would be read in the dark. Accepted points are converted with the saved BNC
-reference and shown in dBm. No later voltage pass or GPIB power reading is used.
+reference and shown in dBm. No later voltage pass is used.
 
 ### What is evaluated
 
@@ -156,10 +172,12 @@ T(x) = \text{offset} + A\,\frac{1 + \cos\left(\pi x / x_\pi + \varphi_0\right)}{
 $$
 
 - $x$ is heater power in mW, $x = I^2 R_\text{heater}$ with $I = V / R_\text{total}$, or $x = V^2$ when the resistance is unknown.
-- Usable fit (RMS under 15% of $A$): the fit picks the first fringe, so a sweep past $2\pi$ never takes the second extreme. The bright extreme is the measured point nearest the fitted maximum, since its flat top hides the peak in the reading noise. The dark extreme is the darkest measured point within $\pm\pi/4$ of the fitted null: one cos² over the whole sweep places a null only to about a step, and a step off a null costs many dB.
-- No usable fit: the extremes come from the data, the two-line contrast for the OSA or the power for a meter. Bright points within 2% of the swing, and dark points within 1 dB of the darkest, resolve to the lowest voltage.
+- Usable fit (RMS under 15% of $A$): the bright extreme is the measured point nearest the first fitted maximum, since its flat top hides the peak in the reading noise. The dark extreme is searched across the full sweep, even when it belongs to a later fringe.
+- No usable fit: the extremes come from the data, using two-line contrast for the OSA or power for a meter. Bright points within 2% of the swing resolve to the lowest voltage. With either method, dark points within 1 dB of the measured minimum resolve to the lowest voltage.
 
 To apply a change in this extraction to a saved run without measuring again, press **Re-extract saved calibration…** in MZI calibration and pick the run's folder. A table shows the voltages in use beside the re-extracted ones; **Apply** saves the changed ones and re-sends the Routing states. Outside the app, `python -m benes.measurements.recalibrate <calibration folder>` prints the same table, and `--apply` writes it into `benes_voltage_config.json` after saving a timestamped `.bak` copy (close the app first, since it rewrites that file from memory).
+
+To check a calibration's consistency, set **Probe paths** to **Alternative** and run **Calibrate all visible MZIs** again. Each MZI is then probed through another laser and another output fiber than the primary plan uses (with all six OSA lines, every MZI gets one sharing neither, with the same bright state and every other heater at 0 V). An alternative run saves its sweeps in a `*_alternative` folder but never changes the calibrated voltages. **Compare two calibrations…** asks for the primary folder, then the alternative one, and lists for each MZI both paths, both cross and bar voltages, the heater phase between them (Δφ, from the fitted fringe) and both fitted Pπ. Within one voltage step the states agree; within 0.2 rad of phase (under about −20 dB leakage) they set the same state, even a fringe period apart; otherwise they differ. Pπ is a heater property and should match whichever path probed it. The table is saved as `calibration_comparison.csv` in the second folder; `python -m benes.measurements.calibration_compare <first folder> <second folder>` does the same outside the app. To adopt the alternative voltages, use **Re-extract saved calibration…** on its folder and **Apply**.
 - Fewer than 3 dB of change rejects the MZI; usually the wrong input is lit or the detector is on the wrong output.
 - Every MZI returns to 0 V at the end, also after **Stop** or an error.
 

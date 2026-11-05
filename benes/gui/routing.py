@@ -79,6 +79,7 @@ class RoutingMixin:
         self.optimize_button.pack(side="left", padx=(0, 12))
         self.route_optimizer_running = False
         self.route_optimizer_stop = None
+        self.build_bench_toggle(controls).pack(side="right", padx=(8, 0))
         ttk.Button(controls, text="Reset switches", command=self.reset).pack(side="right")
         ttk.Button(controls, text="Random switches", command=self.randomize).pack(side="right", padx=8)
 
@@ -441,7 +442,12 @@ class RoutingMixin:
             raise ValueError(f"Input {missing[0]} has no WDM wavelength; set it in the WDM comb tab")
         switch = self.osa_output_switch
         light, select_output, read = osa_line_reader(switch, read_spectrum, wavelengths, half_window)
-        return OptimizerSetup(sources, OBJECTIVE_LEAK, "on the OSA", lambda: (read, light, select_output),
+
+        def open_osa():
+            self.light_osa_lasers()
+            return read, light, select_output
+
+        return OptimizerSetup(sources, OBJECTIVE_LEAK, "on the OSA", open_osa,
                               lambda: [], self.set_osa_reading, switch)
 
     def meter_optimizer_setup(self):
@@ -618,6 +624,8 @@ class RoutingMixin:
         if error:
             messagebox.showerror("Voltage optimizer", error, parent=self)
         self.offer_optimized_calibration(switches, zero_before, states_before)
+        # Restore brings the optimized voltages back, or the saved calibration they became.
+        self.power_down_after("route_optimize", self.bench_snapshot())
 
     @staticmethod
     def describe_optimized_path(path):

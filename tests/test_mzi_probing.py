@@ -42,6 +42,17 @@ class CalibrationPlanTests(unittest.TestCase):
         inputs = [probe.input for probe in plan.steps]
         self.assertEqual(inputs, sorted(inputs))
 
+    def test_alternative_paths_use_another_laser_and_output_for_every_mzi(self):
+        primary = plan_calibration(self.network)
+        alternative = plan_calibration(self.network, alternative=True)
+        self.assertEqual({probe.name for probe in alternative.steps}, set(self.network.switches))
+        for probe in alternative.steps:
+            first = primary.probe_for(probe.name)
+            self.assertNotEqual(probe.input, first.input)
+            self.assertNotEqual(probe.output, first.output)
+            self.assertEqual(probe.bright_crossed, first.bright_crossed)
+            self.assertEqual(probe.biased, ())
+
     def test_complete_uses_the_same_s4_2_probe_as_single_calibration(self):
         for known in ((), tuple(self.network.switches)):
             with self.subTest(known=bool(known)):

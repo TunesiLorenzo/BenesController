@@ -134,6 +134,14 @@ to write every visible trace to CSV. The export dialog asks for an optional
 description, which is included as `# Description:` comment line(s) at the top of
 the file. Plotting needs matplotlib (`python -m pip install matplotlib`).
 
+For a power fluctuation run, use **Hardware → OSA & output switch → Record overlay…**.
+Choose a CSV path, then leave the OSA sampling the same optical input. Each completed
+spectrum is appended to the CSV with a trace number and completion time; the plot
+overlays the latest 20 spectra and the status shows the latest peak power. Press
+**Stop** to finish after the current OSA read. The CSV keeps every trace even when
+older lines leave the plot. This recording uses individual sweeps, independently
+of **Sweeps per reading**.
+
 ### OSA output selector
 
 All six Benes output fibers are patched into a JDSU SC optical switch (GPIB),
@@ -504,10 +512,13 @@ only when that point is inside the ADC window or the optical head cannot accept
 another range. The HP BNC output clips near 86 counts, so the high limit must
 stay below 86; otherwise a saturated plateau never triggers a range change. A
 point still above the window is clipped and excluded from the fit. A point
-still below it on the lowest range the head accepts is kept but flagged
-`low` (or dropped below 1 count, which is noise around zero); at least two
-points inside the window are required. Every accepted point comes from Arduino A0 and is
-converted to mW with the BNC reference, then plotted in dBm.
+still below it when the head refuses a lower fixed range is read directly from
+the HP over GPIB with autoranging, after which the BNC range is restored. The
+saved CSV records `measurement_source` and `gpib_dbm` for these points. If the
+GPIB reading is unavailable, the point remains flagged `low` (and is dropped
+below 1 ADC count). At least two usable Arduino or GPIB points are required.
+Arduino readings use the BNC reference for mW conversion; all powers are
+plotted in dBm.
 `mzi_hp_bnc_points.csv` records the first and final ADC readings, their HP
 ranges, and the number of range steps at each voltage; the calibration JSON
 also notes any range the HP refused.
@@ -564,11 +575,11 @@ their previous states and all MZIs return to 0 V. Results are saved as
 
 Each sweep is fitted with T = offset + A·(1 + cos(π·x/x_π + φ₀))/2. Here x is
 the heater power (V² when the heater resistance is unknown). Power changes
-little near a maximum or a null, so a good fit sets cross and bar: the measured
-points nearest the first maximum and the first null. A sweep that runs past 2π
-therefore never picks the second extreme. When the fit is poor, the extremes
-come from the data: the two-line contrast for the OSA, or the power for a
-meter. Near-equal points then resolve to the lowest voltage. An MZI whose
+little near a maximum or a null. A good fit selects the measured point nearest
+the first bright maximum; the dark state uses the lowest-voltage point within
+1 dB of the measured minimum, even if that null is on a later fringe. When the fit is poor, the bright extreme
+comes from the data: the two-line contrast for the OSA, or the power for a
+meter. Near-equal bright points also resolve to the lowest voltage. An MZI whose
 reading changes by less than 3 dB is rejected. This usually means the wrong
 input is lit or the detector is on the wrong output. Every MZI returns to 0 V at
 the end, also after **Stop** or an error. Runs are saved in the dataset's

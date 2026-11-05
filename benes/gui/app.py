@@ -16,6 +16,7 @@ from benes.hardware.power_meter import ArduinoPowerMeter, RANGE_TRACKING_LABELS
 from benes.hardware.voltage_controller import BenesVoltageController
 from benes.measurements.arduino_hp_range import DEFAULT_HIGH_ADC, DEFAULT_LOW_ADC
 from benes.measurements.wdm_comb import WDMPlan
+from benes.gui.bench import BenchMixin
 from benes.gui.calibration import DETECT_OSA, METER_HP, METER_VIA_JDSU, CalibrationMixin
 from benes.gui.crosstalk import CrosstalkMixin
 from benes.gui.dataset import DatasetMixin
@@ -27,7 +28,7 @@ from benes.gui.wdm import WDMMixin
 from benes.paths import app_dir
 
 
-class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, CrosstalkMixin,
+class BenesApp(BenchMixin, RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, CrosstalkMixin,
                CalibrationMixin, WDMMixin, DatasetMixin, tk.Tk):
     def __init__(self):
         super().__init__()
@@ -96,8 +97,17 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
         self.osa_host_var = tk.StringVar(value="192.168.0.200")
         self.osa_port_var = tk.StringVar(value="8002")
         self.osa_sweeps_var = tk.StringVar(value=str(self.wdm_plan.settings["osa_sweeps"]))
+        # Filled by "Read from OSA"; the instrument keeps its own settings.
+        self.osa_mode_var = tk.StringVar()
+        self.osa_resolution_var = tk.StringVar()
+        self.osa_sensitivity_var = tk.StringVar()
+        self.osa_averaging_var = tk.StringVar()
+        self.osa_start_nm_var = tk.StringVar()
+        self.osa_end_nm_var = tk.StringVar()
+        self.osa_settings_status_var = tk.StringVar(value="Read the OSA settings before changing them.")
         self.osa_plot_mode = tk.StringVar(value="Overlay")
         self.osa_axes = None
+        self.osa_live_stop = None
         self.trace_count = 0
         self.osa_trace_records = []
         self.osa_switch_resource_var = tk.StringVar(value=self.osa_output_switch.settings["resource"])
@@ -266,6 +276,10 @@ class BenesApp(RoutingMixin, HardwareMixin, SpectraMixin, MappingMixin, Crosstal
         return accepted[0]
 
     def close(self):
+        if self.osa_live_stop is not None:
+            self.stop_osa_live()
+            messagebox.showinfo("OSA recording", "Stopping after the current read. Close again when the CSV is complete.", parent=self)
+            return
         if self.hp_meter_busy == "stream":
             self.stop_hp_stream()
             messagebox.showinfo("HP meter stream", "Stopping the HP meter stream. Close again when it has stopped.", parent=self)

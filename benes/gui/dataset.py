@@ -398,6 +398,7 @@ class DatasetMixin:
         comment = self.dataset_comment_var.get()
         self.dataset_batch_running = True
         self.begin_activity("dataset", "Preparing dataset acquisition...", len(configurations) * len(OUTPUTS) + 1)
+        self.remember_bench("dataset")
         self.update_activity("dataset", time_left="calculating...")
         batch_started_at = time.monotonic()
         self.dataset_batch_stop_event = threading.Event()
@@ -784,7 +785,7 @@ class DatasetMixin:
         self.set_osa_reading(False)
         for tab in (self.route_tab, self.hardware_tab, self.calibration_tab, self.crosstalk_tab):
             self.set_tab_state(tab, "normal")
-        self.refresh(keep_selection=True)
+        self.power_down_after("dataset")
         if error:
             self.dataset_status_var.set(f"Dataset batch failed after {saved}/{total} configuration(s): {error}")
             messagebox.showerror("Dataset batch failed", error, parent=self)
