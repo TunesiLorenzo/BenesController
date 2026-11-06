@@ -18,7 +18,6 @@ from benes.gui.widgets import VerticalScrolledFrame
 from benes.hardware import osa
 from benes.hardware.laser_bank import LaserBank
 from benes.hardware.osa_output_switch import OUTPUTS, fiber_number
-from benes.hardware.power_meter import RANGE_TRACKING_OFF
 from benes.measurements.calibration_analysis import CalibrationAnalysisError, find_calibration_files
 from benes.measurements.calibration_scan import scan_voltages
 from benes.measurements.crosstalk_results import PLOT_X_POWER, PLOT_X_VOLTAGE, plot_x_values
@@ -31,6 +30,8 @@ from benes.measurements.laser_calibration import (DEFAULT_PASS_DB, CalibrationSt
 from benes.measurements.mzi_characterization import (OSALineDetector, PowerMeterDetector, dbm_to_mw,
                                                      mw_to_dbm, run_calibration, save_calibration)
 from benes.measurements.mzi_probing import plan_calibration
+from benes.measurements.pm_calibration import (DEFAULT_MAX_ROUNDS, DEFAULT_TOLERANCE_V, run_pm_calibration,
+                                               save_pm_calibration)
 from benes.measurements.power_route_check import (plan_route_checks, run_power_route_check,
                                                    save_power_route_check)
 from benes.measurements.calibration_compare import AGREE_RAD, compare_runs, load_run, table_rows, write_comparison
@@ -44,8 +45,9 @@ DETECT_POWER_METER = "Power meter · one laser at a time"
 PATHS_PRIMARY = "Primary"
 PATHS_ALTERNATIVE = "Alternative"
 METER_HP = "HP 8152A"
-METER_ARDUINO = "Arduino"
 METER_ARDUINO_HP = "Arduino + HP BNC"
+# Reads the HP 8152A like METER_HP; MZI calibration then runs the iterative method of pm_calibration.
+METER_NEW = "Power Meter (New)"
 METER_VIA_JDSU = "JDSU common (any output)"
 
 
@@ -198,6 +200,7 @@ class CalibrationMixin:
         views.add(overlay_page, text="OSA overlay")
         views.add(power_route_page, text="Power routes")
         self.cal_views = views
+        self.cal_matrix_page = matrix_page
         self.cal_overlay_page = overlay_page
         self.cal_sweep_page = sweep_page
         self.cal_power_route_page = power_route_page
@@ -316,7 +319,7 @@ class CalibrationMixin:
         meter.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         ttk.Label(meter, text="Meter").grid(row=0, column=0, sticky="w")
         ttk.Combobox(meter, textvariable=self.detection_meter_var,
-                     values=(METER_HP, METER_ARDUINO, METER_ARDUINO_HP),
+                     values=(METER_HP, METER_ARDUINO_HP, METER_NEW),
                      state="readonly", width=20).grid(row=0, column=1, sticky="w", padx=(10, 0))
         ttk.Label(meter, text="Meter on").grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Combobox(meter, textvariable=self.detection_position_var,
@@ -350,6 +353,22 @@ class CalibrationMixin:
             "Individual ADC samples are integers; their mean can be decimal. HP settings are in "
             "Thermal crosstalk; Arduino settings are in Hardware.")).grid(
             row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        new = ttk.Frame(meter)
+        new.grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.pm_new_rounds_var = tk.StringVar(value=str(DEFAULT_MAX_ROUNDS))
+        self.pm_new_tolerance_var = tk.StringVar(value=f"{DEFAULT_TOLERANCE_V:g}")
+        ttk.Label(new, text="Power Meter (New): max rounds").grid(row=0, column=0, sticky="w")
+        ttk.Entry(new, textvariable=self.pm_new_rounds_var, width=5).grid(row=0, column=1, sticky="w", padx=(6, 0))
+        ttk.Label(new, text="converged at [V]").grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Entry(new, textvariable=self.pm_new_tolerance_var, width=5).grid(row=1, column=1, sticky="w",
+                                                                            padx=(6, 0), pady=(2, 0))
+        ttk.Label(new, foreground="#9baec6", wraplength=320, text=(
+            "Power Meter (New) reads the HP 8152A on the JDSU common port and does not assume 0 V is cross. "
+            "Calibrate all sweeps every MZI with a background chosen so leaked light cannot return after one "
+            "or two leaks, then runs permutation tests (all six inputs, all six outputs) that decide which "
+            "extreme is cross; rounds repeat until no voltage moves by more than the tolerance. The pass "
+            "margin is the margin an input's brightest output needs in a permutation test. Probe paths and "
+            "the OSA state checks do not apply.")).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         def show_meter(*_):
             if self.detection_method_var.get() == DETECT_POWER_METER:
@@ -362,6 +381,9 @@ class CalibrationMixin:
 
     def power_meter_method(self):
         return self.detection_method_var.get() == DETECT_POWER_METER
+
+    def pm_new_method(self):
+        return self.power_meter_method() and self.detection_meter_var.get() == METER_NEW
 
     def detection_ports(self):
         """0-based (inputs, outputs) the chosen detection can light and read."""
@@ -771,7 +793,9 @@ class CalibrationMixin:
             raise RuntimeError("Connect the Newport laser controller in Hardware → Newport lasers first")
         if self.newport_panel.busy:
             raise RuntimeError("Wait for the Newport command to finish")
-        if meter_name == METER_HP:
+        if meter_name == METER_NEW and not via_jdsu:
+            raise ValueError("Power Meter (New) reads every output: set Meter on to the JDSU common port")
+        if meter_name in (METER_HP, METER_NEW):
             if self.hp_meter_busy:
                 raise RuntimeError("Stop the HP meter stream or test first")
             options = self.hp_meter_options()
@@ -779,7 +803,7 @@ class CalibrationMixin:
 
             def open_hp():
                 meter, release = self.acquire_hp_meter(options)
-                return (detector(lambda: dbm_to_mw(meter.read_dbm_or_none()), self.laser_bank, "mW", METER_HP),
+                return (detector(lambda: dbm_to_mw(meter.read_dbm_or_none()), self.laser_bank, "mW", meter_name),
                         release)
 
             return {"open": open_hp, "simulate": False, "unit": "mW", "osa": None, "hp": True,
@@ -840,37 +864,7 @@ class CalibrationMixin:
                     "osa": None, "hp": True, "inputs": inputs, "outputs": outputs,
                     "context": context}
 
-        if self.bnc_reference is None or self.hp_meter_session is None:
-            raise ValueError("Connect the HP 8152A and set the BNC dBm reference in Routing before Arduino calibration")
-        if self.hp_meter_busy:
-            raise RuntimeError("Stop the HP meter stream or test first")
-        options = self.hp_meter_options()
-        channel = 1 if options["channel"] == "A" else 2
-        reference = self.bnc_reference
-        if (reference.resource, reference.channel) != (options["resource"], channel):
-            raise ValueError("Set a new BNC dBm reference for this HP channel")
-        context["bnc_reference"] = reference.record()
-
-        def open_arduino_dbm():
-            hp, release = self.acquire_hp_meter(options, configure=False)
-
-            def read_arduino():
-                for _ in range(3):
-                    range_before = hp.read_range_dbm(channel)
-                    reading = meter.read_current_power(
-                        ceiling_override=meter.full_scale + 1,
-                        range_tracking_mode=RANGE_TRACKING_OFF, ignore_jumps=True)
-                    range_after = hp.read_range_dbm(channel)
-                    if range_before == range_after:
-                        if reading.raw_mean >= meter.ceiling:
-                            raise ValueError("The Arduino detector is above its configured ADC ceiling")
-                        return reference.mw(reading.raw_mean, range_before)
-                raise RuntimeError("HP autorange changed during every Arduino sample; use Arduino + HP BNC")
-
-            return (detector(read_arduino, self.laser_bank, "mW", METER_ARDUINO), release)
-
-        return {"open": open_arduino_dbm, "simulate": False, "unit": "mW", "osa": None,
-                "inputs": inputs, "outputs": outputs, "hp": True, "context": context}
+        raise ValueError(f"Unknown meter: {meter_name}")
 
     def claim_detection(self, setup, claim):
         """Keep the Newport panel and HP meter away from a running measurement."""
@@ -1137,6 +1131,9 @@ class CalibrationMixin:
         return self.cal_paths_var.get() == PATHS_ALTERNATIVE
 
     def start_calibration(self, names, kind, save, verify):
+        if self.pm_new_method():
+            self.start_pm_new_calibration(names, kind, save)
+            return
         # Only the run over every MZI turns the bench off at its end; the lasers stay on between routines.
         complete = kind == "complete"
         alternative = self.alternative_paths()
@@ -1251,6 +1248,175 @@ class CalibrationMixin:
             self.after(0, lambda: self.finish_calibration(setup, error, stopped, folder, save_error, complete))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def start_pm_new_calibration(self, names, kind, save):
+        """Power Meter (New): isolated-background sweeps in rounds, labels from permutation tests."""
+        complete = kind == "complete"
+        try:
+            if self.mzi_calibration_running:
+                raise RuntimeError("A calibration is already running")
+            setup = self.detection_setup()
+            voltages, settle_s, pass_db = self.calibration_settings()
+            rounds = int(self.pm_new_rounds_var.get()) if complete else 1
+            tolerance = float(self.pm_new_tolerance_var.get())
+            if not 1 <= rounds <= 10:
+                raise ValueError("Use 1 to 10 rounds")
+            if not math.isfinite(tolerance) or tolerance <= 0:
+                raise ValueError("The convergence tolerance must be a positive voltage")
+            dataset_root = self.calibration_dataset_root()
+            self.confirm_voltage_sweep(voltages, names=list(names))
+            self.calibration_plot_support()
+        except (ImportError, OSError, RuntimeError, ValueError, tk.TclError) as error:
+            messagebox.showerror("MZI calibration unavailable", str(error), parent=self)
+            return
+        kind = f"{kind}_pm_new"
+        calibration = self.controller.settings["calibration"]
+        start = {name: {"cross": value["cross"], "bar": value["straight"]} for name, value in calibration.items()
+                 if value["cross"] is not None and value["straight"] is not None}
+        self.cal_power_route_preview = False
+        self.cal_power_route_suspects = set()
+        context = {
+            "kind": kind, **setup["context"],
+            "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "comment": self.cal_comment_var.get().strip(), "unit": setup["unit"], "saved_voltages": save,
+            "voltages_v": list(voltages), "settle_s": settle_s, "max_rounds": rounds,
+            "tolerance_v": tolerance, "label_margin_db": pass_db, "label_tests": complete,
+            "background": "isolated: chosen so leaked light needs three leaks to reach the read output; "
+                          "MZIs without voltages held at 0 V and taken as cross",
+            "switch_pins": dict(self.controller.settings["mapping"]),
+            "calibration_before": {name: dict(value) for name, value in calibration.items()},
+        }
+        self.mzi_calibration_running = True
+        self.calibration_stop_event = stop_event = threading.Event()
+        self.cal_pass_db = pass_db
+        self.cal_job_verdicts = {}
+        self.cal_mzi_total = rounds * len(names)
+        self.cal_mzi_finished = 0
+        self.cal_sweep_total = len(voltages)
+        self.cal_unit = setup["unit"]
+        self.cal_arduino_log = False
+        self.cal_reference_lines = False
+        self.cal_hp_bnc_overlay = False
+        self.cal_hp_bnc_context = None
+        self.begin_activity("calibration", f"Power Meter (New): calibrating {len(names)} MZI(s)...",
+                            self.cal_mzi_total * len(voltages) + 1)
+        self.cal_mzi_progress.configure(maximum=self.cal_mzi_total, value=0)
+        self.cal_mzi_progress_var.set(f"Sweeps completed: 0/{self.cal_mzi_total}")
+        self.cal_sweep_progress.configure(maximum=len(voltages), value=0)
+        self.cal_sweep_progress_var.set(f"Sweep points completed: 0/{len(voltages)}")
+        if complete:
+            self.remember_bench("calibration")
+        self.set_calibration_controls(True)
+        self.claim_detection(setup, True)
+        for name in names:
+            self.cal_rows[name]["checks"] = []
+        self.cal_status_var.set(f"Power Meter (New): up to {rounds} round(s) with {self.detection_summary()}...")
+        after = lambda function: lambda *args: self.after(0, lambda: function(*args))
+
+        def worker():
+            error, stopped, folder, save_error, run = None, False, None, None, None
+            from benes.measurements.pm_calibration import PMCalibrationRun
+            run = PMCalibrationRun()
+            try:
+                detector, close = setup["open"]()
+                try:
+                    run_pm_calibration(
+                        self.controller, detector, self.network, voltages, settle_s, start=start, names=list(names),
+                        max_rounds=rounds, tolerance_v=tolerance, label_margin_db=pass_db,
+                        label_tests=complete, save=save, run=run,
+                        on_round=after(self.pm_new_round_started), on_step=after(self.calibration_probe_started),
+                        on_point=after(self.calibration_point),
+                        on_result=after(lambda result: self.calibration_switch_done(result, save)),
+                        on_label_test=after(self.pm_new_label_test), on_labels=after(self.pm_new_labels),
+                        stop_event=stop_event)
+                finally:
+                    close()
+            except CalibrationStopped:
+                stopped = True
+            except Exception as failure:
+                error = str(failure)
+            if run.rounds:
+                status = "stopped" if stopped else "failed" if error else "complete"
+                try:
+                    folder = create_calibration_folder(app_dir(), kind, dataset_root)
+                    save_pm_calibration(folder, {**context, "status": status, "error": error}, run)
+                except Exception as failure:
+                    save_error = str(failure)
+            note = self.pm_new_summary(run)
+            self.after(0, lambda: (self.cal_view.update(note=note),
+                                   self.finish_calibration(setup, error, stopped, folder, save_error, complete)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def pm_new_summary(self, run):
+        if not run.rounds:
+            return "Power Meter (New): no sweep finished"
+        text = (f"Power Meter (New): {len(run.rounds)} round(s), "
+                + ("converged" if run.converged else "not converged")
+                + (f", last change {run.changes[-1]:.2f} V" if run.changes and math.isfinite(run.changes[-1]) else ""))
+        if run.labels:
+            last = run.labels[-1]
+            text += f"; labels {'consistent' if last.consistent else 'INCONSISTENT'}"
+            if last.suspects:
+                text += f"; possibly part-way: {', '.join(last.suspects)}"
+        missing = [name for name in self.network.switches if name not in run.estimates]
+        if missing:
+            text += f"; no voltages for {', '.join(missing)}"
+        if run.warnings:
+            text += f"; {len(run.warnings)} warning(s) in pm_calibration.json"
+        return text
+
+    def pm_new_round_started(self, number, total):
+        self.cal_status_var.set(f"Power Meter (New): round {number}/{total}...")
+        self.update_activity("calibration", detail=f"Power Meter (New): round {number}/{total}")
+
+    def pm_new_label_test(self, test, number):
+        """Show a permutation test: the 6 × 6 dBm matrix, ● where the current labels expect each input."""
+        self.cal_matrix.delete(*self.cal_matrix.get_children())
+        self.cal_matrix_title.set(f"Permutation test {number}")
+        size = self.network.size
+        for output in range(size):
+            cells = []
+            for source in range(size):
+                power = mw_to_dbm(test.powers[source][output])
+                cell = "—" if power is None else f"{power:.1f}"
+                cells.append(f"● {cell}" if test.expected[source] == output else cell)
+            readable = [(test.powers[source][output], source) for source in range(size)
+                        if test.powers[source][output] is not None]
+            strongest = max(readable)[1] if readable else None
+            self.cal_matrix.insert("", "end", values=[f"Out {output + 1}", *cells,
+                                                      "—" if strongest is None else f"In {strongest + 1}"],
+                                   tags=() if strongest is None else (f"input{strongest + 1}",))
+        wrong = [source for source in range(size) if test.clean(source) and test.brightest[source] != test.expected[source]]
+        unclear = [source for source in range(size) if not test.clean(source)]
+        note = (f"Permutation test {number}: {size - len(wrong) - len(unclear)}/{size} inputs where expected"
+                + (f"; elsewhere: {', '.join(f'In {source + 1}' for source in wrong)}" if wrong else "")
+                + (f"; unclear: {', '.join(f'In {source + 1}' for source in unclear)}" if unclear else ""))
+        self.cal_view.update(states=dict(test.states), probe=None, reading=None, lit=set(range(size)),
+                             dominant={test.brightest[source]: source for source in range(size)
+                                       if test.brightest[source] is not None}, note=note)
+        self.cal_status_var.set(note)
+        self.cal_views.select(self.cal_matrix_page)
+        self.draw_calibration_diagram()
+
+    def pm_new_labels(self, result, round_number):
+        for name in result.swapped:
+            row = self.cal_rows[name]
+            row["cross"], row["bar"] = row["bar"], row["cross"]
+            row["checks"] = [entry for entry in row["checks"] if entry[0] != "labels"] + [("labels", "swapped", None)]
+            self.show_calibration_row(name)
+        for name in result.suspects:
+            row = self.cal_rows[name]
+            row["status"] = "partial"
+            row["checks"] = [entry for entry in row["checks"] if entry[0] != "labels"] + [("labels", "part-way?", None)]
+            self.show_calibration_row(name)
+        text = (f"Round {round_number} labels: {len(result.tests)} test(s), "
+                + (f"swapped {', '.join(result.swapped)}" if result.swapped else "no swaps")
+                + ("" if result.consistent else f", {result.mismatches} reading(s) fit no assignment")
+                + (f", unclear inputs point at {', '.join(result.suspects)}" if result.suspects else ""))
+        self.cal_view["note"] = text
+        self.cal_status_var.set(text)
+        self.draw_calibration_diagram()
 
     def finish_calibration(self, setup, error, stopped, folder, save_error, complete=False):
         self.claim_detection(setup, False)
@@ -1570,7 +1736,8 @@ class CalibrationMixin:
         self.update_activity("calibration", self.cal_mzi_finished * self.cal_sweep_total,
                              detail=f"Calibration: {self.cal_mzi_finished}/{self.cal_mzi_total} MZIs complete")
         self.cal_mzi_progress.configure(value=self.cal_mzi_finished)
-        self.cal_mzi_progress_var.set(f"MZIs completed: {self.cal_mzi_finished}/{self.cal_mzi_total}")
+        self.cal_mzi_progress_var.set(f"{'Sweeps' if self.pm_new_method() else 'MZIs'} completed: "
+                                      f"{self.cal_mzi_finished}/{self.cal_mzi_total}")
         name = result.name
         row = self.cal_rows[name]
         row.update(status="calibrated" if saved else "saved" if row["cross"] is not None else "pending",

@@ -267,7 +267,7 @@ Results go to `Results/Crosstalk_matrix/<time>_matrix/`: `crosstalk_matrix.json`
 **Single-switch scan**, at the bottom of the tab's controls, sweeps selected switches one by one along the route chosen in Routing and plots the detector response.
 
 1. In **Route explorer**, choose the input and output.
-2. Choose the detection in the **MZI calibration** tab, the same one the matrix uses: the OSA, or a power meter (**HP 8152A**, **Arduino** or **Arduino + HP BNC**) through the JDSU or on one fixed output.
+2. Choose the detection in the **MZI calibration** tab, the same one the matrix uses: the OSA, or a power meter (**HP 8152A**, **Arduino + HP BNC** or **Power Meter (New)**, which reads the HP 8152A) through the JDSU or on one fixed output.
 3. Select switches (Ctrl/Shift), set limits, step and settle, add a **Comment**.
 4. Optionally press **Test reading and GPIB read rate** (12 triggered readings). The HP filter is 8 Hz off / 2 Hz on, so GPIB rate is not optical bandwidth.
 5. Press **Scan selected switches**. Each switch returns to 0 V after its sweep, also on failure.

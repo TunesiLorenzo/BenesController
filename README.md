@@ -473,9 +473,10 @@ Choose the detection method under **Detection** in the MZI calibration tab:
   reference. Every output is reachable through the JDSU.
 - **Power meter · one laser at a time**: the Newport 9016 lights one input at a
   time, so the meter reading comes only from the probed input. This is much
-  faster than the OSA. Choose **HP 8152A** (GPIB optical readings), **Arduino**
-  (Arduino optical readings), or **Arduino + HP BNC** (Arduino readings with
-  GPIB range control). HP settings are in Thermal crosstalk; Arduino settings
+  faster than the OSA. Choose **HP 8152A** (GPIB optical readings),
+  **Arduino + HP BNC** (Arduino readings with GPIB range control), or
+  **Power Meter (New)** (HP 8152A readings with the iterative calibration
+  below). HP settings are in Thermal crosstalk; Arduino settings
   are in Hardware. The **HP 8152A meter** hardware page has **Connect**
   and **Disconnect** controls; a connected meter is shared with HP streams,
   tests, crosstalk scans, and MZI calibration. Choose where the meter is connected:
@@ -530,10 +531,34 @@ linear mW, dBm, raw ADC, and range information.
 The HP 8152A **XDCR OUT** BNC is linear within one range; adjacent 10 dB
 ranges differ by a factor of ten in analog scale. **Arduino + HP BNC** uses
 the known GPIB range for this conversion and ignores the Arduino jump flag,
-which a real square-wave optical signal can also set. The plain **Arduino**
-option now reads the HP range before and after each Arduino sample and retries
-if it changes; it also requires the BNC dBm reference. Use **Arduino + HP BNC**
+which a real square-wave optical signal can also set. Use **Arduino + HP BNC**
 for adaptive fixed-range Arduino sampling within a single voltage sweep.
+
+### Power Meter (New)
+
+**Power Meter (New)** reads the HP 8152A on the JDSU common port and does not
+assume that 0 V is cross. **Calibrate all visible MZIs** then runs in rounds:
+
+1. Each MZI is swept with every other MZI held at its current cross or bar
+   voltage, in a background chosen from the topology so that light leaking out
+   of the probe route needs at least three leaks to reach the read output. MZIs
+   without voltages yet are held at 0 V and taken as cross. When a sweep shows
+   no fringe, a coarse scan of every lit input and output finds one that does.
+   Cross and bar are the fitted fringe extremes, not the nearest step.
+2. Permutation tests decide which of each MZI's two voltages is cross: a
+   configuration is applied, each input is lit in turn and all six outputs are
+   read. A swapped MZI always moves some input to another output; a few
+   adaptively chosen configurations leave one assignment. An input whose
+   brightest output is not above the next by the **Pass margin** points at an
+   MZI left part-way (about 50/50) and is reported.
+3. Rounds repeat (up to **max rounds**, default 5) until no voltage moves by
+   more than the tolerance (default 0.05 V) and the labels are settled.
+
+Saved voltages start the first round; voltages are saved after every round.
+Results include `pm_calibration.json` (every round, warning and permutation
+test) and `pm_label_tests.csv`. **Sweep selected MZI** runs one isolated sweep
+of that MZI without permutation tests. Validate afterwards with **Check all
+routes with power meter**.
 
 The **Calibrate** box and the **Probe** column of the MZIs table update whenever
 these settings change. They show which MZIs are visible and how each one is
